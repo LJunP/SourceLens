@@ -1,0 +1,57 @@
+server:
+  port: 8080
+
+spring:
+  profiles:
+    active: dev
+  datasource:
+    url: jdbc:mysql://localhost:3307/sourcelens?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: sourcelens
+    password: sourcelens123
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+  redis:
+    host: localhost
+    port: 6379
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/**/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# JWT
+sourcelens:
+  jwt:
+    secret: ${JWT_SECRET:SourceLens-2026-SuperSecretKey-ForDevelopmentOnly-PleaseChangeInProduction}
+    expiration: 86400000
+  analyzer:
+    path: ${ANALYZER_PATH:sourcelens-analyzer}
+    timeout-seconds: 300
+  workspace:
+    base-path: ${SOURCELENS_WORKSPACE:/tmp/sourcelens/repos}
+  encrypt:
+    password: ${ENCRYPT_PASSWORD:SourceLensDefaultPassword2026}
+    salt: ${ENCRYPT_SALT:SourceLensSalt2026}
+
+# OpenAPI
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html

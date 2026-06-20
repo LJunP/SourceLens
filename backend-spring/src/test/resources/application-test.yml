@@ -1,0 +1,38 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:sourcelens_test;DB_CLOSE_DELAY=-1;MODE=MYSQL
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema-test.sql
+  flyway:
+    enabled: false
+  redis:
+    host: localhost
+    port: 6379
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+sourcelens:
+  jwt:
+    secret: TestSecretKey2026-ForUnitTestsOnly-PleaseChange
+    expiration: 86400000
+  analyzer:
+    path: sourcelens-analyzer
+    timeout-seconds: 30
+  workspace:
+    base-path: /tmp/sourcelens/repos
+  encrypt:
+    password: TestPassword2026
+    salt: TestSalt2026
