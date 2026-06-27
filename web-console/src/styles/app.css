@@ -35,6 +35,15 @@ body {
   min-width: 0;
 }
 
+.sl-app-shell .ant-btn-primary:not(:disabled):not(.ant-btn-disabled) {
+  color: #fff;
+}
+
+.sl-app-shell .ant-btn-primary:not(:disabled):not(.ant-btn-disabled) > span,
+.sl-app-shell .ant-btn-primary:not(:disabled):not(.ant-btn-disabled) .anticon {
+  color: inherit;
+}
+
 .sl-sider {
   border-right: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: 8px 0 24px rgba(15, 23, 42, 0.08);
@@ -89,6 +98,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 24px;
+  line-height: normal;
   background: rgba(255, 255, 255, 0.88);
   border-bottom: 1px solid var(--sl-border);
   backdrop-filter: blur(10px);
@@ -109,6 +119,7 @@ body {
   overflow: hidden;
   font-size: 16px;
   font-weight: 760;
+  line-height: 1.25;
   color: var(--sl-text);
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -119,6 +130,7 @@ body {
   margin-top: 2px;
   color: var(--sl-muted);
   font-size: 12px;
+  line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1124,7 +1136,7 @@ body {
   background: #ffe4e6;
 }
 
-.sl-dashboard-command-card span {
+.sl-dashboard-command-card-head span {
   display: block;
   overflow: hidden;
   color: var(--sl-muted);
@@ -1134,7 +1146,7 @@ body {
   white-space: nowrap;
 }
 
-.sl-dashboard-command-card strong {
+.sl-dashboard-command-card-head strong {
   display: block;
   margin-top: 3px;
   overflow: hidden;
@@ -1155,7 +1167,21 @@ body {
 
 .sl-dashboard-command-card .ant-btn {
   justify-self: start;
+  min-height: 36px;
   max-width: 100%;
+  padding-inline: 14px;
+  font-weight: 760;
+}
+
+.sl-dashboard-command-card .ant-btn-primary:not(:disabled):not(.ant-btn-disabled) {
+  border-color: var(--sl-primary);
+  background: var(--sl-primary);
+  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.22);
+}
+
+.sl-dashboard-command-card .ant-btn-primary:not(:disabled):not(.ant-btn-disabled):hover {
+  border-color: var(--sl-primary-dark);
+  background: var(--sl-primary-dark);
 }
 
 .sl-metric-grid {

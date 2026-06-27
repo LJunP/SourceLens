@@ -85,6 +85,12 @@ assert_backend_port_available() {
     return
   fi
 
+  if is_existing_sourcelens_backend_healthy "$port"; then
+    echo "SourceLens backend is already running and healthy at http://localhost:$port"
+    echo "Reusing the existing process instead of starting another backend."
+    exit 0
+  fi
+
   echo "ERROR: backend port $port is already in use." >&2
   echo "$listener" >&2
   echo >&2
@@ -92,6 +98,23 @@ assert_backend_port_available() {
   echo "To stop a stale local backend, first confirm the listener above, then run: lsof -tiTCP:$port -sTCP:LISTEN | xargs kill" >&2
   echo "To start on another port: SERVER_PORT=18080 make backend" >&2
   exit 1
+}
+
+is_existing_sourcelens_backend_healthy() {
+  local port="$1"
+  local base_url="http://127.0.0.1:$port"
+  local health
+  local api_docs
+
+  if ! command -v curl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  health="$(curl -fsS -m 2 "$base_url/actuator/health" 2>/dev/null || true)"
+  [[ "$health" == *'"status":"UP"'* ]] || return 1
+
+  api_docs="$(curl -fsS -m 2 "$base_url/api-docs" 2>/dev/null || true)"
+  [[ "$api_docs" == *'"/api/projects"'* || "$api_docs" == *'"/api/auth/login"'* ]]
 }
 
 load_env_file "$(resolve_path "$ENV_FILE")"
