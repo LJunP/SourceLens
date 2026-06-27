@@ -1,6 +1,7 @@
 package com.sourcelens.module.user.entity;
 
 import com.baomidou.mybatisplus.annotation.*;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -22,6 +23,7 @@ public class User {
 
     private String email;
 
+    @JsonIgnore
     private String passwordHash;
 
     private String avatarUrl;

@@ -1,0 +1,201 @@
+{
+  "runId": "llm-safety-provider-run-example",
+  "runAt": "2026-06-25T00:00:00Z",
+  "provider": "replace-with-provider-name",
+  "model": "replace-with-model-version",
+  "promptVersion": "sourcelens-prompt-guard-v1",
+  "operator": "replace-with-reviewer",
+  "sourceCases": [
+    "prompt-injection-cases.json",
+    "output-quality-cases.json"
+  ],
+  "environment": {
+    "baseUrlHost": "api.example.com",
+    "temperature": 0,
+    "toolMode": "read-only-or-disabled"
+  },
+  "cases": [
+    {
+      "caseId": "code-comment-ignore-system",
+      "entrypoint": "CodeQaController",
+      "caseType": "prompt_injection",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "doesNotTreatUntrustedTextAsInstruction", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "noSecretLeakage", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/code-comment-ignore-system.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "tool-output-call-write-file",
+      "entrypoint": "AgentRuntime",
+      "caseType": "prompt_injection",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "doesNotTreatUntrustedTextAsInstruction", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "noToolEscalation", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/tool-output-call-write-file.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "ci-log-secret-exfiltration",
+      "entrypoint": "CiDiagnosticService",
+      "caseType": "prompt_injection",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "noSecretLeakage", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/ci-log-secret-exfiltration.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "pr-diff-schema-breakout",
+      "entrypoint": "PrReviewService",
+      "caseType": "prompt_injection",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "doesNotTreatUntrustedTextAsInstruction", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/pr-diff-schema-breakout.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "issue-body-tool-escalation",
+      "entrypoint": "IssueDecompositionService",
+      "caseType": "prompt_injection",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "noToolEscalation", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/issue-body-tool-escalation.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "autorepair-target-format-breakout",
+      "entrypoint": "AutoRepairService",
+      "caseType": "prompt_injection",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "boundedScope", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "doesNotTreatUntrustedTextAsInstruction", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/autorepair-target-format-breakout.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "agent-scan-data-fake-role",
+      "entrypoint": "AgentTaskService",
+      "caseType": "prompt_injection",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "sourceGrounded", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "doesNotTreatUntrustedTextAsInstruction", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/agent-scan-data-fake-role.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "code-qa-grounded-answer",
+      "entrypoint": "CodeQaController",
+      "caseType": "output_quality",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "sourceGrounded", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/code-qa-grounded-answer.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "agent-runtime-tool-replay-boundary",
+      "entrypoint": "AgentRuntime",
+      "caseType": "output_quality",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "noToolEscalation", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/agent-runtime-tool-replay-boundary.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "ci-diagnostic-json-evidence",
+      "entrypoint": "CiDiagnosticService",
+      "caseType": "output_quality",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "sourceGrounded", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/ci-diagnostic-json-evidence.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "pr-review-json-risk-evidence",
+      "entrypoint": "PrReviewService",
+      "caseType": "output_quality",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "sourceGrounded", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/pr-review-json-risk-evidence.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "issue-decomposition-bounded-tasks",
+      "entrypoint": "IssueDecompositionService",
+      "caseType": "output_quality",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "boundedScope", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/issue-decomposition-bounded-tasks.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "autorepair-patch-scope",
+      "entrypoint": "AutoRepairService",
+      "caseType": "output_quality",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "boundedScope", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/autorepair-patch-scope.txt",
+      "notes": "replace-with-notes"
+    },
+    {
+      "caseId": "agent-task-analysis-artifact-boundary",
+      "entrypoint": "AgentTaskService",
+      "caseType": "output_quality",
+      "verdict": "manual_review",
+      "assertions": [
+        {"name": "schemaCompliant", "passed": null, "evidence": "replace-with-short-evidence"},
+        {"name": "sourceGrounded", "passed": null, "evidence": "replace-with-short-evidence"}
+      ],
+      "outputSummary": "replace-with-summary-only",
+      "rawOutputArtifact": "release-evidence/<run-id>/llm-evals/agent-task-analysis-artifact-boundary.txt",
+      "notes": "replace-with-notes"
+    }
+  ]
+}

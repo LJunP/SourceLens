@@ -19,6 +19,7 @@ import java.util.List;
 public class JwtAuthFilter extends OncePerRequestFilter {
 
     private final JwtUtil jwtUtil;
+    private final JwtDenylistService jwtDenylistService;
 
     @Override
     protected void doFilterInternal(HttpServletRequest request,
@@ -27,7 +28,7 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         String header = request.getHeader("Authorization");
         if (StringUtils.hasText(header) && header.startsWith("Bearer ")) {
             String token = header.substring(7);
-            if (jwtUtil.isValid(token)) {
+            if (jwtUtil.isValid(token) && !jwtDenylistService.isDenylisted(token)) {
                 Long userId = jwtUtil.getUserId(token);
                 String username = jwtUtil.getUsername(token);
                 var auth = new UsernamePasswordAuthenticationToken(userId, username, List.of());

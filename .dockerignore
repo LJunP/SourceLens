@@ -1,0 +1,21 @@
+.git/
+.github/
+.idea/
+.vscode/
+.DS_Store
+
+**/target/
+**/target 2/
+web-console/node_modules/
+web-console/dist/
+web-console/.vite/
+web-console/tsconfig*.tsbuildinfo
+
+deploy/.env
+.env
+.env.local
+
+*.log
+logs/
+release-evidence/
+bin/

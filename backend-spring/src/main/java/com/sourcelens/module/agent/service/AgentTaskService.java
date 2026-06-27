@@ -6,6 +6,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sourcelens.common.exception.BizException;
+import com.sourcelens.common.security.SensitiveDataSanitizer;
 import com.sourcelens.module.agent.dto.AddStepRequest;
 import com.sourcelens.module.agent.dto.CompleteTaskRequest;
 import com.sourcelens.module.agent.dto.CreateAgentTaskRequest;
@@ -23,6 +24,11 @@ import com.sourcelens.module.analysis.entity.ScanArtifact;
 import com.sourcelens.module.analysis.mapper.CodeRelationMapper;
 import com.sourcelens.module.analysis.mapper.CodeSymbolMapper;
 import com.sourcelens.module.analysis.mapper.ScanArtifactMapper;
+import com.sourcelens.module.artifact.service.ArtifactStorageService;
+import com.sourcelens.module.execution.entity.ExecutionTask;
+import com.sourcelens.module.execution.service.ExecutionTaskService;
+import com.sourcelens.module.scantask.entity.ScanTask;
+import com.sourcelens.module.scantask.mapper.ScanTaskMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.scheduling.annotation.Async;
@@ -37,6 +43,9 @@ import java.util.stream.Collectors;
 @Service
 public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
 
+    private static final int MAX_AGENT_OUTPUT_JSON_LENGTH = 16_000;
+    private static final int MAX_AGENT_ERROR_LENGTH = 4_000;
+
     private final AgentTaskStepMapper stepMapper;
     private final ScanArtifactMapper artifactMapper;
     private final CodeSymbolMapper symbolMapper;
@@ -44,6 +53,9 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
     private final LlmClient llmClient;
     private final LlmConfigService llmConfigService;
     private final ConversationMapper conversationMapper;
+    private final ScanTaskMapper scanTaskMapper;
+    private final ExecutionTaskService executionTaskService;
+    private final ArtifactStorageService artifactStorageService;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final AgentTaskService self;
 
@@ -54,6 +66,9 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
                             LlmClient llmClient,
                             LlmConfigService llmConfigService,
                             ConversationMapper conversationMapper,
+                            ScanTaskMapper scanTaskMapper,
+                            ExecutionTaskService executionTaskService,
+                            ArtifactStorageService artifactStorageService,
                             @Lazy AgentTaskService self) {
         this.stepMapper = stepMapper;
         this.artifactMapper = artifactMapper;
@@ -62,6 +77,9 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         this.llmClient = llmClient;
         this.llmConfigService = llmConfigService;
         this.conversationMapper = conversationMapper;
+        this.scanTaskMapper = scanTaskMapper;
+        this.executionTaskService = executionTaskService;
+        this.artifactStorageService = artifactStorageService;
         this.self = self;
     }
 
@@ -72,11 +90,7 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
      */
     @Transactional
     public AgentTask create(CreateAgentTaskRequest req, Long userId) {
-        // 自动关联最新扫描
-        Long scanTaskId = req.getScanTaskId();
-        if (scanTaskId == null) {
-            scanTaskId = findLatestScanTaskId(req.getProjectId());
-        }
+        Long scanTaskId = resolveCreateScanTaskId(req.getProjectId(), req.getScanTaskId());
 
         AgentTask task = AgentTask.builder()
                 .projectId(req.getProjectId())
@@ -106,33 +120,48 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         // 关联回任务
         task.setConversationId(conv.getId());
         updateById(task);
+        executionTaskService.create(task.getProjectId(), null, "AGENT",
+                "AGENT_TASK", task.getId(), userId);
 
         log.info("创建 Agent 任务: id={}, type={}, title={}, conversationId={}", task.getId(), task.getTaskType(), task.getTitle(), conv.getId());
         return task;
     }
 
     /**
-     * 查找项目最近一次已完成的扫描任务 ID
+     * 查找项目最近一次已完成的扫描任务 ID（按 projectId 过滤，防止跨项目数据污染）
      */
     private Long findLatestScanTaskId(Long projectId) {
-        // 通过 scan_artifacts 表反查最近的 scan_task_id
-        // scan_artifacts 关联 scan_tasks，取最近完成的
         try {
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> results = objectMapper.readValue("[]", List.class);
-            // 使用 MyBatis 原生查询
-            var mapper = getBaseMapper();
-            // 通过 scan_artifacts 关联查找
-            List<ScanArtifact> artifacts = artifactMapper.selectList(
-                    new LambdaQueryWrapper<ScanArtifact>()
-                            .last("ORDER BY id DESC LIMIT 1"));
-            if (!artifacts.isEmpty()) {
-                return artifacts.get(0).getScanTaskId();
+            ScanTask latestTask = scanTaskMapper.selectOne(
+                    new LambdaQueryWrapper<ScanTask>()
+                            .eq(ScanTask::getProjectId, projectId)
+                            .eq(ScanTask::getStatus, "SUCCESS")
+                            .orderByDesc(ScanTask::getCreatedAt)
+                            .last("LIMIT 1"));
+            if (latestTask != null) {
+                return latestTask.getId();
             }
         } catch (Exception e) {
-            log.warn("查找最新扫描失败: {}", e.getMessage());
+            log.warn("查找项目最新扫描任务失败, projectId={}: {}", projectId, e.getMessage());
         }
         return null;
+    }
+
+    private Long resolveCreateScanTaskId(Long projectId, Long requestedScanTaskId) {
+        if (requestedScanTaskId != null) {
+            ScanTask requested = scanTaskMapper.selectById(requestedScanTaskId);
+            if (requested == null || Boolean.TRUE.equals(requested.getDeleted())) {
+                throw BizException.badRequest("指定扫描任务不存在");
+            }
+            if (!projectId.equals(requested.getProjectId())) {
+                throw BizException.badRequest("指定扫描任务不属于当前项目");
+            }
+            if (!"SUCCESS".equals(requested.getStatus())) {
+                throw BizException.badRequest("指定扫描任务尚未成功完成");
+            }
+            return requestedScanTaskId;
+        }
+        return findLatestScanTaskId(projectId);
     }
 
     /**
@@ -176,9 +205,22 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         if (!"PENDING".equals(task.getStatus())) {
             throw BizException.badRequest("任务状态不允许启动: " + task.getStatus());
         }
+        LocalDateTime startedAt = LocalDateTime.now();
+        AgentTask update = new AgentTask();
+        update.setStatus("RUNNING");
+        update.setStartedAt(startedAt);
+        boolean started = update(update, new LambdaQueryWrapper<AgentTask>()
+                .eq(AgentTask::getId, taskId)
+                .eq(AgentTask::getStatus, "PENDING"));
+        if (!started) {
+            throw BizException.badRequest("任务已被启动或状态已变化，请刷新后重试");
+        }
         task.setStatus("RUNNING");
-        task.setStartedAt(LocalDateTime.now());
-        updateById(task);
+        task.setStartedAt(startedAt);
+        ExecutionTask executionTask = executionTaskService.findBySource("AGENT_TASK", taskId);
+        if (executionTask != null) {
+            executionTaskService.markRunning(executionTask.getId(), "agent_analysis");
+        }
 
         // 异步执行真实分析
         self.executeAnalysis(task.getId());
@@ -193,18 +235,25 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
     public void executeAnalysis(Long taskId) {
         AgentTask task = getById(taskId);
         if (task == null) return;
+        ExecutionTask executionTask = executionTaskService.findBySource("AGENT_TASK", taskId);
+        Long executionTaskId = executionTask == null ? null : executionTask.getId();
+        String currentStep = "load_scan_artifacts";
 
         try {
+            assertNotCancelled(taskId, executionTaskId, currentStep);
             Long scanTaskId = task.getScanTaskId();
             String taskType = task.getTaskType();
             Long userId = task.getCreatedBy();
 
             // Step 1: 加载扫描产物
+            startExecutionStep(executionTaskId, currentStep, "加载扫描产物数据");
             AgentTaskStep step1 = addStepInternal(taskId, "ANALYSIS", "load_scan_artifacts",
                     "加载扫描产物数据");
             long start = System.currentTimeMillis();
             Map<String, Object> scanData = loadScanData(scanTaskId);
+            assertNotCancelled(taskId, executionTaskId, currentStep);
             updateStepDone(step1.getId(), Map.of("artifactCount", scanData.size()), System.currentTimeMillis() - start);
+            completeExecutionStep(executionTaskId, currentStep, "扫描产物加载完成, artifactCount=" + scanData.size());
 
             if (scanData.isEmpty()) {
                 throw new IllegalStateException("未找到扫描产物, 请先执行代码扫描");
@@ -215,6 +264,9 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
             boolean useLlm = llmConfig != null;
 
             // Step 3: 规则引擎预分析 (无论是否用 LLM, 都先做结构化分析)
+            currentStep = "rule_engine_analysis";
+            assertNotCancelled(taskId, executionTaskId, currentStep);
+            startExecutionStep(executionTaskId, currentStep, "规则引擎结构化分析");
             AgentTaskStep step3 = addStepInternal(taskId, "ANALYSIS", "rule_engine_analysis",
                     "规则引擎结构化分析");
             start = System.currentTimeMillis();
@@ -224,26 +276,38 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
                 case "CHANGE_IMPACT" -> analyzeChangeImpact(scanData, task.getInputJson());
                 default -> analyzeCustom(scanData, task.getInputJson());
             };
+            assertNotCancelled(taskId, executionTaskId, currentStep);
             updateStepDone(step3.getId(), ruleResult, System.currentTimeMillis() - start);
+            completeExecutionStep(executionTaskId, currentStep, "规则引擎分析完成");
 
             // Step 4: LLM 深度分析 (如果已配置模型)
             String llmAnalysis = null;
             if (useLlm) {
+                currentStep = "llm_deep_analysis";
+                assertNotCancelled(taskId, executionTaskId, currentStep);
+                startExecutionStep(executionTaskId, currentStep, "LLM 深度分析");
                 AgentTaskStep step4 = addStepInternal(taskId, "ANALYSIS", "llm_deep_analysis",
                         "LLM 深度分析 (" + llmConfig.getModelName() + ")");
                 start = System.currentTimeMillis();
                 try {
                     String prompt = buildAnalysisPrompt(taskType, scanData, ruleResult, task.getInputJson());
                     llmAnalysis = llmClient.chat(llmConfig, prompt);
+                    assertNotCancelled(taskId, executionTaskId, currentStep);
                     updateStepDone(step4.getId(), Map.of("model", llmConfig.getModelName(),
                             "responseLength", llmAnalysis.length()), System.currentTimeMillis() - start);
+                    completeExecutionStep(executionTaskId, currentStep,
+                            "LLM 分析完成, responseLength=" + llmAnalysis.length());
                 } catch (Exception e) {
                     log.warn("LLM 分析失败, 回退到规则引擎: {}", e.getMessage());
                     updateStepFailed(step4.getId(), "LLM 调用失败: " + e.getMessage(), System.currentTimeMillis() - start);
+                    failExecutionStep(executionTaskId, currentStep, "LLM 调用失败: " + e.getMessage());
                 }
             }
 
             // Step 5: 生成最终报告
+            currentStep = "generate_report";
+            assertNotCancelled(taskId, executionTaskId, currentStep);
+            startExecutionStep(executionTaskId, currentStep, "生成分析报告");
             AgentTaskStep step5 = addStepInternal(taskId, "OUTPUT", "generate_report",
                     "生成审查报告");
             start = System.currentTimeMillis();
@@ -254,22 +318,32 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
             } else {
                 report.put("analysisMode", useLlm ? "Rule Engine (LLM 调用失败)" : "Rule Engine (未配置 LLM)");
             }
+            assertNotCancelled(taskId, executionTaskId, currentStep);
             updateStepDone(step5.getId(), report, System.currentTimeMillis() - start);
+            completeExecutionStep(executionTaskId, currentStep, "分析报告生成完成");
 
             // 完成任务
+            assertNotCancelled(taskId, executionTaskId, currentStep);
+            String reportJson = toJson(report);
+            storeAgentReportArtifact(task, reportJson);
             task.setStatus("COMPLETED");
             task.setFinishedAt(LocalDateTime.now());
-            task.setOutputJson(toJson(report));
-            task.setSummary(generateSummary(taskType, report));
+            task.setOutputJson(sanitizeOutput(reportJson));
+            task.setSummary(sanitizeError(generateSummary(taskType, report)));
             updateById(task);
+            markExecutionSuccess(executionTaskId, currentStep);
 
             log.info("Agent 任务完成: id={}, type={}, mode={}", taskId, taskType, report.get("analysisMode"));
+        } catch (AgentTaskCancelledException e) {
+            log.info("Agent 任务已取消: id={}, step={}", taskId, currentStep);
         } catch (Exception e) {
             log.error("Agent 任务执行失败: id={}", taskId, e);
             task.setStatus("FAILED");
             task.setFinishedAt(LocalDateTime.now());
-            task.setErrorMessage(e.getMessage());
+            task.setErrorMessage(sanitizeError(e.getMessage()));
             updateById(task);
+            failExecutionStep(executionTaskId, currentStep, e.getMessage());
+            markExecutionFailed(executionTaskId, currentStep, e.getMessage());
         }
     }
 
@@ -288,19 +362,22 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         Object modules = report.get("modules");
 
         StringBuilder ctx = new StringBuilder();
-        ctx.append("你是一个专业的代码架构分析师。以下是项目的扫描数据和规则引擎预分析结果,请进行深度分析。\n\n");
+        ctx.append("你是一个专业的代码架构分析师。以下是项目的扫描数据和规则引擎预分析结果,请进行深度分析。\n");
+        ctx.append(PromptInjectionGuard.systemBoundaryInstructions()).append("\n");
+
+        StringBuilder untrustedData = new StringBuilder();
 
         // 项目信息
-        ctx.append("## 项目概览\n");
-        ctx.append(toJson(overview)).append("\n\n");
-        ctx.append("## 技术栈\n");
-        ctx.append(toJson(techStack)).append("\n\n");
-        ctx.append("## 模块分布\n");
-        ctx.append(toJson(modules)).append("\n\n");
+        untrustedData.append("## 项目概览\n");
+        untrustedData.append(toJson(overview)).append("\n\n");
+        untrustedData.append("## 技术栈\n");
+        untrustedData.append(toJson(techStack)).append("\n\n");
+        untrustedData.append("## 模块分布\n");
+        untrustedData.append(toJson(modules)).append("\n\n");
 
         // 符号摘要 (限制数量避免 token 溢出)
-        ctx.append("## 代码符号 (前 50 个)\n");
-        ctx.append("```json\n");
+        untrustedData.append("## 代码符号 (前 50 个)\n");
+        untrustedData.append("```json\n");
         List<Map<String, Object>> symbolSummary = symbols.stream().limit(50).map(s -> {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("name", s.getName());
@@ -308,11 +385,11 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
             m.put("filePath", s.getFilePath());
             return m;
         }).collect(Collectors.toList());
-        ctx.append(toJson(symbolSummary)).append("\n```\n\n");
+        untrustedData.append(toJson(symbolSummary)).append("\n```\n\n");
 
         // 依赖关系摘要
-        ctx.append("## 依赖关系 (共 ").append(relations.size()).append(" 条, 前 30 条)\n");
-        ctx.append("```json\n");
+        untrustedData.append("## 依赖关系 (共 ").append(relations.size()).append(" 条, 前 30 条)\n");
+        untrustedData.append("```json\n");
         List<Map<String, String>> relSummary = relations.stream().limit(30).map(r -> {
             Map<String, String> m = new LinkedHashMap<>();
             m.put("source", r.getSourceId());
@@ -320,12 +397,13 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
             m.put("type", r.getRelationType());
             return m;
         }).collect(Collectors.toList());
-        ctx.append(toJson(relSummary)).append("\n```\n\n");
+        untrustedData.append(toJson(relSummary)).append("\n```\n\n");
 
         // 规则引擎预分析结果
-        ctx.append("## 规则引擎预分析结果\n");
-        ctx.append("```json\n");
-        ctx.append(toJson(ruleResult)).append("\n```\n\n");
+        untrustedData.append("## 规则引擎预分析结果\n");
+        untrustedData.append("```json\n");
+        untrustedData.append(toJson(ruleResult)).append("\n```\n\n");
+        ctx.append(PromptInjectionGuard.wrapUntrustedContent("agent scan data and rule result", untrustedData.toString()));
 
         // 按任务类型给出分析指令
         return switch (taskType) {
@@ -357,7 +435,8 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
             case "CHANGE_IMPACT" -> ctx + """
                     ## 分析任务: 变更影响分析
 
-                    用户输入的变更信息: """ + (userInput != null ? userInput : "无") + """
+                    用户输入的变更信息:
+                    """ + PromptInjectionGuard.wrapUntrustedContent("change impact user input", userInput != null ? userInput : "无") + """
 
                     请分析这些变更的影响范围:
                     1. **直接影响**: 直接受影响的模块和类
@@ -389,7 +468,7 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         AgentTaskStep step = stepMapper.selectById(stepId);
         if (step == null) return;
         step.setStatus("FAILED");
-        step.setErrorMessage(errorMessage);
+        step.setErrorMessage(sanitizeError(errorMessage));
         step.setDurationMs(durationMs);
         stepMapper.updateById(step);
     }
@@ -878,19 +957,7 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         Map<String, Object> data = new LinkedHashMap<>();
         if (scanTaskId == null) return data;
 
-        // 加载产物
-        List<ScanArtifact> artifacts = artifactMapper.selectList(
-                new LambdaQueryWrapper<ScanArtifact>()
-                        .eq(ScanArtifact::getScanTaskId, scanTaskId));
-        for (ScanArtifact artifact : artifacts) {
-            if (artifact.getSummaryJson() != null) {
-                try {
-                    data.put(artifact.getArtifactType(), objectMapper.readValue(artifact.getSummaryJson(), Map.class));
-                } catch (Exception e) {
-                    log.warn("解析产物失败: type={}, error={}", artifact.getArtifactType(), e.getMessage());
-                }
-            }
-        }
+        data.putAll(loadScanArtifacts(scanTaskId));
 
         // 加载符号和关系
         List<CodeSymbol> symbols = symbolMapper.selectList(
@@ -902,6 +969,27 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         data.put("_symbols", symbols);
         data.put("_relations", relations);
 
+        return data;
+    }
+
+    private Map<String, Object> loadScanArtifacts(Long scanTaskId) {
+        Map<String, Object> data = artifactStorageService.readJsonMapArtifactsByOwner("SCAN_TASK", scanTaskId);
+        if (!data.isEmpty()) {
+            return data;
+        }
+
+        List<ScanArtifact> legacyArtifacts = artifactMapper.selectList(
+                new LambdaQueryWrapper<ScanArtifact>()
+                        .eq(ScanArtifact::getScanTaskId, scanTaskId));
+        for (ScanArtifact artifact : legacyArtifacts) {
+            if (artifact.getSummaryJson() != null) {
+                try {
+                    data.put(artifact.getArtifactType(), objectMapper.readValue(artifact.getSummaryJson(), Map.class));
+                } catch (Exception e) {
+                    log.warn("解析旧扫描产物失败: type={}, error={}", artifact.getArtifactType(), e.getMessage());
+                }
+            }
+        }
         return data;
     }
 
@@ -943,7 +1031,7 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         AgentTaskStep step = stepMapper.selectById(stepId);
         if (step == null) return;
         step.setStatus("COMPLETED");
-        step.setOutputJson(toJson(output));
+        step.setOutputJson(sanitizeOutput(toJson(output)));
         step.setDurationMs(durationMs);
         stepMapper.updateById(step);
     }
@@ -968,6 +1056,23 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         return val != null ? String.valueOf(val) : defaultVal;
     }
 
+    private void storeAgentReportArtifact(AgentTask task, String reportJson) {
+        if (reportJson == null || reportJson.isBlank()) {
+            return;
+        }
+        artifactStorageService.deleteByOwner("AGENT_TASK", task.getId());
+        artifactStorageService.storeText(
+                task.getProjectId(),
+                null,
+                "AGENT_TASK",
+                task.getId(),
+                "AGENT_REPORT",
+                "agent-report.json",
+                "application/json",
+                reportJson,
+                task.getCreatedBy());
+    }
+
     private String toJson(Object obj) {
         if (obj == null) return null;
         try {
@@ -985,11 +1090,25 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         if (task == null) {
             throw BizException.notFound("AgentTask");
         }
+        if (isTerminalAgentStatus(task.getStatus())) {
+            throw BizException.badRequest("已结束的任务无法完成");
+        }
         task.setStatus(req.getStatus() != null ? req.getStatus() : "COMPLETED");
         task.setFinishedAt(LocalDateTime.now());
-        task.setOutputJson(req.getOutputJson());
-        task.setSummary(req.getSummary());
+        task.setOutputJson(sanitizeOutput(req.getOutputJson()));
+        task.setSummary(sanitizeError(req.getSummary()));
+        if ("COMPLETED".equals(task.getStatus())) {
+            storeAgentReportArtifact(task, task.getOutputJson());
+        }
         updateById(task);
+        ExecutionTask executionTask = executionTaskService.findBySource("AGENT_TASK", taskId);
+        if (executionTask != null) {
+            if ("FAILED".equals(task.getStatus())) {
+                executionTaskService.markFailed(executionTask.getId(), "manual_complete", task.getSummary());
+            } else {
+                executionTaskService.markSuccess(executionTask.getId(), "manual_complete");
+            }
+        }
         log.info("完成 Agent 任务: id={}, status={}", taskId, task.getStatus());
         return task;
     }
@@ -999,21 +1118,28 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         if (task == null) {
             throw BizException.notFound("AgentTask");
         }
-        if ("COMPLETED".equals(task.getStatus()) || "FAILED".equals(task.getStatus())) {
+        if (isTerminalAgentStatus(task.getStatus())) {
             throw BizException.badRequest("已完成的任务无法取消");
         }
         task.setStatus("CANCELLED");
         task.setFinishedAt(LocalDateTime.now());
         updateById(task);
+        ExecutionTask executionTask = executionTaskService.findBySource("AGENT_TASK", taskId);
+        if (executionTask != null) {
+            executionTaskService.markCancelled(executionTask.getId(), "cancelled", "Agent 任务已取消");
+        }
         return task;
     }
 
-    public Page<AgentTask> listByProject(Long projectId, int page, int pageSize, String status) {
+    public Page<AgentTask> listByProject(Long projectId, int page, int pageSize, String status, Long scanTaskId) {
         LambdaQueryWrapper<AgentTask> wrapper = new LambdaQueryWrapper<AgentTask>()
                 .eq(AgentTask::getProjectId, projectId)
                 .orderByDesc(AgentTask::getCreatedAt);
         if (status != null && !status.isEmpty()) {
             wrapper.eq(AgentTask::getStatus, status);
+        }
+        if (scanTaskId != null) {
+            wrapper.eq(AgentTask::getScanTaskId, scanTaskId);
         }
         return page(new Page<>(page, pageSize), wrapper);
     }
@@ -1029,7 +1155,7 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
     // ===== 步骤管理 =====
 
     public AgentTaskStep addStep(Long taskId, AddStepRequest req) {
-        getDetail(taskId);
+        AgentTask task = getDetail(taskId);
         Long count = stepMapper.selectCount(
                 new LambdaQueryWrapper<AgentTaskStep>()
                         .eq(AgentTaskStep::getTaskId, taskId));
@@ -1043,6 +1169,10 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
                 .status("PENDING")
                 .build();
         stepMapper.insert(step);
+        ExecutionTask executionTask = executionTaskService.findBySource("AGENT_TASK", task.getId());
+        if (executionTask != null) {
+            executionTaskService.startStep(executionTask.getId(), executionStepKey(step), req.getDescription());
+        }
         return step;
     }
 
@@ -1051,11 +1181,12 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
         if (step == null) {
             throw BizException.notFound("AgentTaskStep");
         }
-        if (req.getOutputJson() != null) step.setOutputJson(req.getOutputJson());
+        if (req.getOutputJson() != null) step.setOutputJson(sanitizeOutput(req.getOutputJson()));
         if (req.getStatus() != null) step.setStatus(req.getStatus());
-        if (req.getErrorMessage() != null) step.setErrorMessage(req.getErrorMessage());
+        if (req.getErrorMessage() != null) step.setErrorMessage(sanitizeError(req.getErrorMessage()));
         if (req.getDurationMs() != null) step.setDurationMs(req.getDurationMs());
         stepMapper.updateById(step);
+        syncExecutionStep(step);
         return step;
     }
 
@@ -1064,5 +1195,93 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
                 new LambdaQueryWrapper<AgentTaskStep>()
                         .eq(AgentTaskStep::getTaskId, taskId)
                         .orderByAsc(AgentTaskStep::getStepOrder));
+    }
+
+    public AgentTaskStep getStep(Long stepId) {
+        AgentTaskStep step = stepMapper.selectById(stepId);
+        if (step == null) {
+            throw BizException.notFound("AgentTaskStep");
+        }
+        return step;
+    }
+
+    private void syncExecutionStep(AgentTaskStep step) {
+        ExecutionTask executionTask = executionTaskService.findBySource("AGENT_TASK", step.getTaskId());
+        if (executionTask == null) {
+            return;
+        }
+        String stepKey = executionStepKey(step);
+        if ("COMPLETED".equals(step.getStatus())) {
+            executionTaskService.completeStep(executionTask.getId(), stepKey, step.getDescription());
+        } else if ("FAILED".equals(step.getStatus())) {
+            executionTaskService.failStep(executionTask.getId(), stepKey, step.getErrorMessage());
+        } else if ("RUNNING".equals(step.getStatus())) {
+            executionTaskService.startStep(executionTask.getId(), stepKey, step.getDescription());
+        }
+    }
+
+    private String executionStepKey(AgentTaskStep step) {
+        if (step.getToolName() != null && !step.getToolName().isBlank()) {
+            return step.getToolName();
+        }
+        return "agent_step_" + step.getId();
+    }
+
+    private void startExecutionStep(Long executionTaskId, String stepKey, String stepName) {
+        if (executionTaskId != null) {
+            executionTaskService.startStep(executionTaskId, stepKey, stepName);
+        }
+    }
+
+    private void completeExecutionStep(Long executionTaskId, String stepKey, String summary) {
+        if (executionTaskId != null) {
+            executionTaskService.completeStep(executionTaskId, stepKey, summary);
+        }
+    }
+
+    private void failExecutionStep(Long executionTaskId, String stepKey, String errorMessage) {
+        if (executionTaskId != null) {
+            executionTaskService.failStep(executionTaskId, stepKey, errorMessage);
+        }
+    }
+
+    private void markExecutionSuccess(Long executionTaskId, String currentStep) {
+        if (executionTaskId != null) {
+            executionTaskService.markSuccess(executionTaskId, currentStep);
+        }
+    }
+
+    private void markExecutionFailed(Long executionTaskId, String currentStep, String errorMessage) {
+        if (executionTaskId != null) {
+            executionTaskService.markFailed(executionTaskId, currentStep, errorMessage);
+        }
+    }
+
+    private boolean isTerminalAgentStatus(String status) {
+        return "COMPLETED".equals(status)
+                || "FAILED".equals(status)
+                || "CANCELLED".equals(status);
+    }
+
+    private String sanitizeOutput(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_AGENT_OUTPUT_JSON_LENGTH);
+    }
+
+    private String sanitizeError(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_AGENT_ERROR_LENGTH);
+    }
+
+    private void assertNotCancelled(Long taskId, Long executionTaskId, String currentStep) {
+        AgentTask latest = getById(taskId);
+        if (latest != null && "CANCELLED".equals(latest.getStatus())) {
+            if (executionTaskId != null) {
+                executionTaskService.cancelStep(executionTaskId, currentStep, "Agent 任务已取消");
+                executionTaskService.markCancelled(executionTaskId, currentStep, "Agent 任务已取消");
+            }
+            throw new AgentTaskCancelledException();
+        }
+    }
+
+    private static class AgentTaskCancelledException extends RuntimeException {
     }
 }

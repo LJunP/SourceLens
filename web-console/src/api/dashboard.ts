@@ -20,6 +20,8 @@ export interface DashboardStats {
   latestControllers: number | null
   latestServices: number | null
   latestRiskCount: number | null
+  latestCodeChunks: number | null
+  latestEmbeddedChunks: number | null
   languagesJson: string | null
 }
 

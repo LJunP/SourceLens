@@ -17,6 +17,9 @@ import org.springframework.stereotype.Service;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Comparator;
+import java.util.stream.Stream;
 
 /**
  * Git 仓库管理：clone / pull / 本地路径映射
@@ -33,12 +36,26 @@ public class GitService {
      * @return 本地仓库目录绝对路径
      */
     public String ensureLocal(Long projectId, String repoUrl, String branch, String token) {
-        String localPath = buildLocalPath(projectId, repoUrl);
+        RepositoryUrlPolicy.ParsedRepository parsed = RepositoryUrlPolicy.parseAndValidate(repoUrl, true);
+        String normalizedRepoUrl = parsed.normalizedUrl();
+        String normalizedBranch = RepositoryUrlPolicy.validateBranch(branch);
+        if ("LOCAL".equals(parsed.provider())) {
+            Path original = Path.of(java.net.URI.create(normalizedRepoUrl)).toAbsolutePath().normalize();
+            if (Files.isDirectory(original) && !Files.isDirectory(original.resolve(".git"))) {
+                String localPath = buildLocalPath(projectId, normalizedRepoUrl);
+                Path target = Path.of(localPath).toAbsolutePath().normalize();
+                log.info("检测为本地 file:// 非 Git 目录, 复制到隔离工作区: source={}, target={}", original, target);
+                copyLocalDirectory(original, target);
+                return localPath;
+            }
+        }
+
+        String localPath = buildLocalPath(projectId, normalizedRepoUrl);
         File dir = new File(localPath);
 
         if (isGitRepo(dir)) {
             try {
-                pull(dir, branch, token);
+                pull(dir, normalizedBranch, token);
                 return localPath;
             } catch (Exception e) {
                 log.warn("Pull 失败, 清理后重新 clone: {}", e.getMessage());
@@ -49,7 +66,7 @@ public class GitService {
                 }
             }
         }
-        cloneRepo(repoUrl, branch, token, dir);
+        cloneRepo(normalizedRepoUrl, normalizedBranch, token, dir);
         return localPath;
     }
 
@@ -59,6 +76,11 @@ public class GitService {
     public String getHeadSha(String localPath) {
         try {
             File gitDir = new File(localPath, ".git");
+            if (!gitDir.isDirectory()) {
+                // 非 Git 仓库（如直接引用的本地目录），生成基于路径的伪 SHA
+                log.info("非 Git 仓库(无 .git 目录), 使用目录路径生成伪 SHA: {}", localPath);
+                return "local-" + Integer.toHexString(localPath.hashCode());
+            }
             Repository repo = new FileRepositoryBuilder()
                     .setGitDir(gitDir)
                     .readEnvironment()
@@ -92,9 +114,13 @@ public class GitService {
     // ===== private =====
 
     private String buildLocalPath(Long projectId, String repoUrl) {
-        // 从 URL 提取 repo name，例如 https://github.com/owner/repo.git → repo
-        String name = repoUrl.replaceAll(".*?/([^/]+?)(?:\\.git)?$", "$1");
-        return workspaceBasePath + "/" + projectId + "/" + name;
+        String name = RepositoryUrlPolicy.safeRepositoryName(repoUrl);
+        Path base = Path.of(workspaceBasePath).toAbsolutePath().normalize();
+        Path target = base.resolve(String.valueOf(projectId)).resolve(name).normalize();
+        if (!target.startsWith(base)) {
+            throw BizException.badRequest("仓库工作区路径越界");
+        }
+        return target.toString();
     }
 
     private boolean isGitRepo(File dir) {
@@ -122,9 +148,12 @@ public class GitService {
             CloneCommand cmd = Git.cloneRepository()
                     .setURI(url)
                     .setBranch(branch)
-                    .setDirectory(targetDir)
-                    .setDepth(1) // 浅克隆，节省空间
-                    .setCredentialsProvider(buildCredentialsProvider(token));
+                    .setDirectory(targetDir);
+
+            if (!url.startsWith("file://")) {
+                cmd.setDepth(1) // 浅克隆，节省空间
+                   .setCredentialsProvider(buildCredentialsProvider(token));
+            }
 
             try (Git git = cmd.call()) {
                 log.info("Clone 完成, path={}", targetDir.getAbsolutePath());
@@ -163,5 +192,71 @@ public class GitService {
             }
         }
         Files.deleteIfExists(file.toPath());
+    }
+
+    private void copyLocalDirectory(Path source, Path target) {
+        try {
+            if (Files.exists(target)) {
+                cleanPath(target);
+            }
+            Files.createDirectories(target);
+            try (Stream<Path> stream = Files.walk(source)) {
+                stream.forEach(src -> copyOnePath(source, target, src));
+            }
+        } catch (Exception e) {
+            throw BizException.internal("复制本地仓库到隔离工作区失败: " + e.getMessage());
+        }
+    }
+
+    private void copyOnePath(Path sourceRoot, Path targetRoot, Path sourcePath) {
+        try {
+            Path relative = sourceRoot.relativize(sourcePath);
+            if (relative.toString().isEmpty() || shouldSkipLocalCopy(relative)) {
+                return;
+            }
+            Path targetPath = targetRoot.resolve(relative).normalize();
+            if (!targetPath.startsWith(targetRoot)) {
+                throw new SecurityException("本地仓库复制路径越界: " + relative);
+            }
+            if (Files.isDirectory(sourcePath)) {
+                Files.createDirectories(targetPath);
+            } else {
+                Path parent = targetPath.getParent();
+                if (parent != null) {
+                    Files.createDirectories(parent);
+                }
+                Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("复制文件失败: " + sourcePath + ", " + e.getMessage(), e);
+        }
+    }
+
+    private boolean shouldSkipLocalCopy(Path relativePath) {
+        for (Path part : relativePath) {
+            String name = part.toString();
+            if (name.equals(".git")
+                    || name.equals("node_modules")
+                    || name.equals("target")
+                    || name.equals("build")
+                    || name.equals("dist")
+                    || name.equals(".idea")
+                    || name.equals(".vscode")
+                    || name.equals(".gradle")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void cleanPath(Path path) throws Exception {
+        if (!Files.exists(path)) {
+            return;
+        }
+        try (Stream<Path> stream = Files.walk(path)) {
+            for (Path p : stream.sorted(Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(p);
+            }
+        }
     }
 }

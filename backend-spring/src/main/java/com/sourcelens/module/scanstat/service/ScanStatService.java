@@ -4,8 +4,11 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sourcelens.module.agent.entity.AgentTask;
 import com.sourcelens.module.agent.mapper.AgentTaskMapper;
+import com.sourcelens.module.analysis.entity.CodeChunk;
+import com.sourcelens.module.analysis.mapper.CodeChunkMapper;
 import com.sourcelens.module.analysis.entity.ScanArtifact;
 import com.sourcelens.module.analysis.mapper.ScanArtifactMapper;
+import com.sourcelens.module.artifact.service.ArtifactStorageService;
 import com.sourcelens.module.issue.entity.IssueDecomposition;
 import com.sourcelens.module.issue.mapper.IssueDecompositionMapper;
 import com.sourcelens.module.project.entity.Project;
@@ -27,10 +30,14 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class ScanStatService {
 
+    private static final int MAX_RECENT_SCAN_LIMIT = 100;
+
     private final ProjectMapper projectMapper;
     private final RepositoryMapper repositoryMapper;
     private final ScanTaskMapper scanTaskMapper;
     private final ScanArtifactMapper scanArtifactMapper;
+    private final CodeChunkMapper codeChunkMapper;
+    private final ArtifactStorageService artifactStorageService;
     private final AgentTaskMapper agentTaskMapper;
     private final IssueDecompositionMapper issueDecompositionMapper;
 
@@ -129,6 +136,8 @@ public class ScanStatService {
                 .latestControllers(toLong(latestMetrics.get("controllers")))
                 .latestServices(toLong(latestMetrics.get("services")))
                 .latestRiskCount(toLong(latestMetrics.get("riskCount")))
+                .latestCodeChunks(toLong(latestMetrics.get("codeChunks")))
+                .latestEmbeddedChunks(toLong(latestMetrics.get("embeddedChunks")))
                 .languagesJson((String) latestMetrics.get("languagesJson"))
                 .build();
     }
@@ -137,6 +146,7 @@ public class ScanStatService {
      * 最近扫描任务 — 带项目名、仓库名、耗时等真实信息
      */
     public List<Map<String, Object>> getRecentScans(Long userId, int limit) {
+        int safeLimit = normalizeRecentScanLimit(limit);
         List<Long> projectIds = getUserProjectIds(userId);
         if (projectIds.isEmpty()) {
             return Collections.emptyList();
@@ -147,7 +157,7 @@ public class ScanStatService {
                         .in(ScanTask::getProjectId, projectIds)
                         .eq(ScanTask::getDeleted, false)
                         .orderByDesc(ScanTask::getCreatedAt)
-                        .last("LIMIT " + limit)
+                        .last("LIMIT " + safeLimit)
         );
 
         if (tasks.isEmpty()) {
@@ -190,6 +200,10 @@ public class ScanStatService {
         }).toList();
     }
 
+    static int normalizeRecentScanLimit(int limit) {
+        return Math.min(Math.max(limit, 1), MAX_RECENT_SCAN_LIMIT);
+    }
+
     // ===== 内部方法 =====
 
     /**
@@ -211,16 +225,14 @@ public class ScanStatService {
                 return result;
             }
             Long latestTaskId = successTasks.get(0).getId();
+            addLatestCodeChunkMetrics(result, latestTaskId);
+
+            ObjectMapper mapper = new ObjectMapper();
 
             // 读 ARCHITECTURE_OVERVIEW 产物
-            ScanArtifact overview = scanArtifactMapper.selectOne(
-                    new LambdaQueryWrapper<ScanArtifact>()
-                            .eq(ScanArtifact::getScanTaskId, latestTaskId)
-                            .eq(ScanArtifact::getArtifactType, "ARCHITECTURE_OVERVIEW")
-            );
-            if (overview != null && overview.getSummaryJson() != null) {
-                ObjectMapper mapper = new ObjectMapper();
-                var node = mapper.readTree(overview.getSummaryJson());
+            Map<String, Object> overview = getScanArtifactData(latestTaskId, "ARCHITECTURE_OVERVIEW");
+            if (!overview.isEmpty()) {
+                var node = mapper.valueToTree(overview);
                 result.put("totalFiles", node.path("totalFiles").asInt(0));
                 result.put("totalDirs", node.path("totalDirs").asInt(0));
                 result.put("totalLines", node.path("totalLines").asInt(0));
@@ -234,14 +246,9 @@ public class ScanStatService {
             }
 
             // 读 CODE_METRICS 产物(补充大文件、测试文件等)
-            ScanArtifact metrics = scanArtifactMapper.selectOne(
-                    new LambdaQueryWrapper<ScanArtifact>()
-                            .eq(ScanArtifact::getScanTaskId, latestTaskId)
-                            .eq(ScanArtifact::getArtifactType, "CODE_METRICS")
-            );
-            if (metrics != null && metrics.getSummaryJson() != null) {
-                ObjectMapper mapper = new ObjectMapper();
-                var node = mapper.readTree(metrics.getSummaryJson());
+            Map<String, Object> metrics = getScanArtifactData(latestTaskId, "CODE_METRICS");
+            if (!metrics.isEmpty()) {
+                var node = mapper.valueToTree(metrics);
                 if (!result.containsKey("totalFiles")) {
                     result.put("totalFiles", node.path("totalFiles").asInt(0));
                     result.put("totalLines", node.path("totalLines").asInt(0));
@@ -249,14 +256,9 @@ public class ScanStatService {
             }
 
             // 读 ARCHITECTURE_REPORT 产物(提取风险数量)
-            ScanArtifact report = scanArtifactMapper.selectOne(
-                    new LambdaQueryWrapper<ScanArtifact>()
-                            .eq(ScanArtifact::getScanTaskId, latestTaskId)
-                            .eq(ScanArtifact::getArtifactType, "ARCHITECTURE_REPORT")
-            );
-            if (report != null && report.getSummaryJson() != null) {
-                ObjectMapper mapper = new ObjectMapper();
-                var node = mapper.readTree(report.getSummaryJson());
+            Map<String, Object> report = getScanArtifactData(latestTaskId, "ARCHITECTURE_REPORT");
+            if (!report.isEmpty()) {
+                var node = mapper.valueToTree(report);
                 var risks = node.path("codeQuality").path("risks");
                 if (risks.isArray()) {
                     result.put("riskCount", risks.size());
@@ -266,6 +268,36 @@ public class ScanStatService {
             log.warn("获取最新扫描指标失败: {}", e.getMessage());
         }
         return result;
+    }
+
+    private void addLatestCodeChunkMetrics(Map<String, Object> result, Long latestTaskId) {
+        Long totalChunks = codeChunkMapper.selectCount(new LambdaQueryWrapper<CodeChunk>()
+                .eq(CodeChunk::getScanTaskId, latestTaskId));
+        Long embeddedChunks = codeChunkMapper.selectCount(new LambdaQueryWrapper<CodeChunk>()
+                .eq(CodeChunk::getScanTaskId, latestTaskId)
+                .isNotNull(CodeChunk::getEmbedding)
+                .ne(CodeChunk::getEmbedding, ""));
+        result.put("codeChunks", totalChunks);
+        result.put("embeddedChunks", embeddedChunks);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> getScanArtifactData(Long scanTaskId, String artifactType) throws Exception {
+        Map<String, Object> artifacts = artifactStorageService.readJsonMapArtifactsByOwner("SCAN_TASK", scanTaskId);
+        Object artifact = artifacts.get(artifactType);
+        if (artifact instanceof Map<?, ?> map) {
+            return (Map<String, Object>) map;
+        }
+
+        ScanArtifact legacy = scanArtifactMapper.selectOne(
+                new LambdaQueryWrapper<ScanArtifact>()
+                        .eq(ScanArtifact::getScanTaskId, scanTaskId)
+                        .eq(ScanArtifact::getArtifactType, artifactType)
+        );
+        if (legacy == null || legacy.getSummaryJson() == null) {
+            return Collections.emptyMap();
+        }
+        return new ObjectMapper().readValue(legacy.getSummaryJson(), Map.class);
     }
 
     private Long calcDurationMs(ScanTask t) {

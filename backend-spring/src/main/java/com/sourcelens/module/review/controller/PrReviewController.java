@@ -72,8 +72,7 @@ public class PrReviewController {
                                        @RequestAttribute("userId") Long userId) {
         PrReview review = prReviewService.getDetail(id);
         projectService.verifyOwnership(review.getProjectId(), userId);
-        review.setStatus("PENDING");
-        prReviewService.updateById(review);
+        review = prReviewService.requeueAnalysis(id);
         prReviewService.analyze(id);
         return Result.ok(review);
     }

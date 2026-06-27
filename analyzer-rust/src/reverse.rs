@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use regex::Regex;
 use std::collections::HashSet;
 use std::path::Path;
@@ -16,12 +17,47 @@ pub fn analyze_symbols(
 ) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
     match primary_language {
         "Java" => extract_java_symbols(repo_path),
-        "Go" => extract_go_symbols(repo_path),
-        "Python" => extract_python_symbols(repo_path),
-        "TypeScript" | "JavaScript" => extract_tsjs_symbols(repo_path),
-        "Rust" => extract_rust_symbols(repo_path),
+        "Go" => extract_symbols_via_ast(repo_path, &["go"]),
+        "Python" => extract_symbols_via_ast(repo_path, &["py"]),
+        "TypeScript" | "JavaScript" => {
+            extract_symbols_via_ast(repo_path, &["ts", "tsx", "js", "jsx"])
+        }
+        "Rust" => extract_symbols_via_ast(repo_path, &["rs"]),
         _ => (Vec::new(), Vec::new(), empty_graph()),
     }
+}
+
+fn extract_symbols_via_ast(
+    repo_path: &Path,
+    allowed_extensions: &[&str],
+) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
+    let mut symbols = Vec::new();
+    let mut relations = Vec::new();
+    let extractor = crate::ast_extractor::AstExtractor::new();
+
+    for entry in WalkDir::new(repo_path)
+        .into_iter()
+        .filter_entry(|e| !is_skipped(&e.file_name().to_string_lossy()))
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !allowed_extensions.contains(&ext) {
+            continue;
+        }
+
+        let rp = rel_path_str(path, repo_path);
+        if let Ok((mut file_syms, mut file_rels)) = extractor.extract_file(path, &rp) {
+            symbols.append(&mut file_syms);
+            relations.append(&mut file_rels);
+        }
+    }
+
+    let graph = build_dependency_graph(&relations, &symbols);
+    (symbols, relations, graph)
 }
 
 fn empty_graph() -> DependencyGraph {
@@ -34,9 +70,17 @@ fn empty_graph() -> DependencyGraph {
 fn is_skipped(name: &str) -> bool {
     matches!(
         name,
-        ".git" | "node_modules" | "target" | "build" | "dist"
-            | "__pycache__" | ".idea" | ".vscode" | "vendor"
-            | ".gradle" | ".mvn"
+        ".git"
+            | "node_modules"
+            | "target"
+            | "build"
+            | "dist"
+            | "__pycache__"
+            | ".idea"
+            | ".vscode"
+            | "vendor"
+            | ".gradle"
+            | ".mvn"
     )
 }
 
@@ -61,15 +105,18 @@ fn read_file(path: &Path) -> Option<String> {
 // Java 符号提取
 // ============================================================
 
-fn extract_java_symbols(
-    repo_path: &Path,
-) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
+fn extract_java_symbols(repo_path: &Path) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
     let mut symbols = Vec::new();
     let mut relations = Vec::new();
 
-    let class_re = Regex::new(r"(?:public|protected|private|abstract)\s+(?:class|interface|enum)\s+(\w+)").unwrap();
+    let class_re =
+        Regex::new(r"(?:public|protected|private|abstract)\s+(?:class|interface|enum)\s+(\w+)")
+            .unwrap();
     let method_re = Regex::new(r"(?:public|protected|private)\s+(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?(\S+)\s+(\w+)\s*\(").unwrap();
-    let field_re = Regex::new(r"(?:private|protected|public)\s+(?:static\s+)?(?:final\s+)?(\S+)\s+(\w+)\s*[;=]").unwrap();
+    let field_re = Regex::new(
+        r"(?:private|protected|public)\s+(?:static\s+)?(?:final\s+)?(\S+)\s+(\w+)\s*[;=]",
+    )
+    .unwrap();
     let inject_re = Regex::new(r"@(?:Autowired|Inject|Resource)\s").unwrap();
     let constructor_re = Regex::new(r"(?:public|protected|private)\s+(\w+)\s*\(([^)]*)\)").unwrap();
 
@@ -111,15 +158,18 @@ fn extract_java_symbols(
                 "CLASS"
             };
 
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
 
             let symbol_id = format!("{}#{}", package, class_name);
 
             // extends / implements
-            let extends_re = Regex::new(&format!(r"class\s+{}\s+extends\s+(\w+)", class_name)).unwrap();
-            let implements_re = Regex::new(&format!(r"class\s+{}\s+implements\s+([\w,\s]+)", class_name)).unwrap();
+            let extends_re =
+                Regex::new(&format!(r"class\s+{}\s+extends\s+(\w+)", class_name)).unwrap();
+            let implements_re = Regex::new(&format!(
+                r"class\s+{}\s+implements\s+([\w,\s]+)",
+                class_name
+            ))
+            .unwrap();
 
             if let Some(ext_cap) = extends_re.captures(&content) {
                 let parent = ext_cap[1].to_string();
@@ -277,9 +327,7 @@ fn resolve_java_class_id(class_name: &str, file_content: &str) -> String {
 // Go 符号提取
 // ============================================================
 
-fn extract_go_symbols(
-    repo_path: &Path,
-) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
+fn extract_go_symbols(repo_path: &Path) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
     let mut symbols = Vec::new();
     let mut relations = Vec::new();
 
@@ -321,9 +369,7 @@ fn extract_go_symbols(
         // struct 定义
         for cap in struct_re.captures_iter(&content) {
             let name = cap[1].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             let symbol_id = format!("{}#{}", symbol_base, name);
 
             symbols.push(CodeSymbol {
@@ -371,9 +417,7 @@ fn extract_go_symbols(
         // interface 定义
         for cap in iface_re.captures_iter(&content) {
             let name = cap[1].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             symbols.push(CodeSymbol {
                 symbol_id: format!("{}#{}", symbol_base, name),
                 name,
@@ -392,11 +436,13 @@ fn extract_go_symbols(
             let _receiver_var = cap.get(1).map(|m| m.as_str().to_string());
             let receiver_type = cap.get(2).map(|m| m.as_str().to_string());
             let func_name = cap[3].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
 
-            let kind = if receiver_type.is_some() { "METHOD" } else { "FUNCTION" };
+            let kind = if receiver_type.is_some() {
+                "METHOD"
+            } else {
+                "FUNCTION"
+            };
             let symbol_id = if let Some(ref rt) = receiver_type {
                 format!("{}.{}#{}.{}", package, file_stem(path), rt, func_name)
             } else {
@@ -496,9 +542,7 @@ fn extract_python_symbols(
         for cap in class_re.captures_iter(&content) {
             let class_name = cap[1].to_string();
             let bases = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             let symbol_id = format!("{}.{}", module, class_name);
 
             symbols.push(CodeSymbol {
@@ -535,9 +579,7 @@ fn extract_python_symbols(
             if func_name.starts_with('_') && !func_name.starts_with("__") {
                 continue; // 跳过私有函数
             }
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             symbols.push(CodeSymbol {
                 symbol_id: format!("{}.{}", module, func_name),
                 name: func_name,
@@ -560,9 +602,7 @@ fn extract_python_symbols(
 // TypeScript / JavaScript 符号提取
 // ============================================================
 
-fn extract_tsjs_symbols(
-    repo_path: &Path,
-) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
+fn extract_tsjs_symbols(repo_path: &Path) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
     let mut symbols = Vec::new();
     let mut relations = Vec::new();
 
@@ -570,7 +610,8 @@ fn extract_tsjs_symbols(
     let interface_re = Regex::new(r"(?:export\s+)?(?:declare\s+)?interface\s+(\w+)").unwrap();
     let type_re = Regex::new(r"(?:export\s+)?type\s+(\w+)").unwrap();
     let func_re = Regex::new(r"(?:export\s+)?(?:async\s+)?function\s+(\w+)").unwrap();
-    let _method_re = Regex::new(r"(?:public|private|protected|static|async|get|set)\s+(\w+)\s*\(").unwrap();
+    let _method_re =
+        Regex::new(r"(?:public|private|protected|static|async|get|set)\s+(\w+)\s*\(").unwrap();
     let import_re = Regex::new(r#"^(?:import|export)\s+.*from\s+['"]([^'"]+)['"]"#).unwrap();
     let require_re = Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
 
@@ -590,7 +631,11 @@ fn extract_tsjs_symbols(
         };
         let rp = rel_path_str(path, repo_path);
         let _file_name = file_stem(path);
-        let module = rp.trim_end_matches(".tsx").trim_end_matches(".ts").trim_end_matches(".jsx").trim_end_matches(".js")
+        let module = rp
+            .trim_end_matches(".tsx")
+            .trim_end_matches(".ts")
+            .trim_end_matches(".jsx")
+            .trim_end_matches(".js")
             .replace('/', ".")
             .replace('\\', ".");
 
@@ -642,9 +687,7 @@ fn extract_tsjs_symbols(
             let class_name = cap[1].to_string();
             let parent = cap.get(2).map(|m| m.as_str().to_string());
             let implements = cap.get(3).map(|m| m.as_str().to_string());
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             let symbol_id = format!("{}.{}", module, class_name);
 
             symbols.push(CodeSymbol {
@@ -687,9 +730,7 @@ fn extract_tsjs_symbols(
         // interface
         for cap in interface_re.captures_iter(&content) {
             let name = cap[1].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             symbols.push(CodeSymbol {
                 symbol_id: format!("{}.{}", module, name),
                 name,
@@ -706,9 +747,7 @@ fn extract_tsjs_symbols(
         // type alias
         for cap in type_re.captures_iter(&content) {
             let name = cap[1].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             symbols.push(CodeSymbol {
                 symbol_id: format!("{}.{}", module, name),
                 name,
@@ -725,9 +764,7 @@ fn extract_tsjs_symbols(
         // function
         for cap in func_re.captures_iter(&content) {
             let func_name = cap[1].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             symbols.push(CodeSymbol {
                 symbol_id: format!("{}.{}", module, func_name),
                 name: func_name,
@@ -750,9 +787,7 @@ fn extract_tsjs_symbols(
 // Rust 符号提取
 // ============================================================
 
-fn extract_rust_symbols(
-    repo_path: &Path,
-) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
+fn extract_rust_symbols(repo_path: &Path) -> (Vec<CodeSymbol>, Vec<CodeRelation>, DependencyGraph) {
     let mut symbols = Vec::new();
     let mut relations = Vec::new();
 
@@ -781,7 +816,11 @@ fn extract_rust_symbols(
         let rp = rel_path_str(path, repo_path);
         let crate_name = "crate"; // 简化处理
 
-        let symbol_base = format!("{}::{}", crate_name, rp.trim_end_matches(".rs").replace('/', "::"));
+        let symbol_base = format!(
+            "{}::{}",
+            crate_name,
+            rp.trim_end_matches(".rs").replace('/', "::")
+        );
 
         // use 导入
         for cap in use_re.captures_iter(&content) {
@@ -848,21 +887,14 @@ fn extract_rust_symbols(
         // struct / enum
         for cap in struct_re.captures_iter(&content) {
             let name = cap[1].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
 
             // 检查前面的 derive
             let before = &content[..cap.get(0).unwrap().start()];
             let derives: Vec<String> = derive_re
                 .captures_iter(before)
                 .last()
-                .map(|dc| {
-                    dc[1]
-                        .split(',')
-                        .map(|d| d.trim().to_string())
-                        .collect()
-                })
+                .map(|dc| dc[1].split(',').map(|d| d.trim().to_string()).collect())
                 .unwrap_or_default();
 
             let kind = if content.contains(&format!("enum {}", name)) {
@@ -885,7 +917,10 @@ fn extract_rust_symbols(
             });
 
             // 序列化 derive → 标记为数据模型
-            if derives.iter().any(|d| d == "Serialize" || d == "Queryable" || d == "FromRow") {
+            if derives
+                .iter()
+                .any(|d| d == "Serialize" || d == "Queryable" || d == "FromRow")
+            {
                 _current_derive = name;
             }
         }
@@ -893,9 +928,7 @@ fn extract_rust_symbols(
         // trait
         for cap in trait_re.captures_iter(&content) {
             let name = cap[1].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             symbols.push(CodeSymbol {
                 symbol_id: format!("{}::{}", symbol_base, name),
                 name,
@@ -912,9 +945,7 @@ fn extract_rust_symbols(
         // impl 块
         for cap in impl_re.captures_iter(&content) {
             let target_type = cap[1].to_string();
-            let line_number = content[..cap.get(0).unwrap().start()]
-                .lines()
-                .count() + 1;
+            let line_number = content[..cap.get(0).unwrap().start()].lines().count() + 1;
             // impl 块内的方法
             if let Some(start) = content[cap.get(0).unwrap().end()..].find('{') {
                 let body_start = cap.get(0).unwrap().end() + start + 1;
@@ -945,10 +976,7 @@ fn extract_rust_symbols(
 // 通用依赖图构建
 // ============================================================
 
-fn build_dependency_graph(
-    relations: &[CodeRelation],
-    symbols: &[CodeSymbol],
-) -> DependencyGraph {
+fn build_dependency_graph(relations: &[CodeRelation], symbols: &[CodeSymbol]) -> DependencyGraph {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut seen_symbols: HashSet<String> = HashSet::new();
@@ -966,7 +994,9 @@ fn build_dependency_graph(
                             .unwrap_or(id)
                             .to_string()
                     }),
-                    kind: symbol.map(|s| s.kind.clone()).unwrap_or_else(|| "UNKNOWN".to_string()),
+                    kind: symbol
+                        .map(|s| s.kind.clone())
+                        .unwrap_or_else(|| "UNKNOWN".to_string()),
                     file_path: symbol.map(|s| s.file_path.clone()),
                     package: symbol.map(|s| s.package.clone()),
                 });

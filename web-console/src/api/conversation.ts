@@ -94,9 +94,9 @@ export function sendMessageSSE(
       handlers.onError?.('无法读取响应流')
       return
     }
-
     const decoder = new TextDecoder()
     let buffer = ''
+    let eventName = ''
 
     while (true) {
       const { done, value } = await reader.read()
@@ -106,7 +106,6 @@ export function sendMessageSSE(
       const lines = buffer.split('\n')
       buffer = lines.pop() || ''
 
-      let eventName = ''
       for (const line of lines) {
         if (line.startsWith('event:')) {
           eventName = line.slice(6).trim()

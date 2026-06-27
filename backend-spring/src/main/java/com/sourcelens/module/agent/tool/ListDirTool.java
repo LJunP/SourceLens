@@ -55,7 +55,11 @@ public class ListDirTool implements AgentTool {
         }
 
         depth = Math.min(depth, MAX_DEPTH);
-        Path dir = Paths.get(context.getProjectRootPath(), relPath);
+        Path rootPath = Paths.get(context.getProjectRootPath()).toAbsolutePath().normalize();
+        Path dir = Paths.get(context.getProjectRootPath(), relPath).toAbsolutePath().normalize();
+        if (!dir.startsWith(rootPath)) {
+            return ToolResult.fail("路径越界,不允许访问项目目录外的目录");
+        }
         if (!Files.exists(dir) || !Files.isDirectory(dir)) {
             return ToolResult.fail("目录不存在: " + relPath);
         }

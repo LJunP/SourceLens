@@ -16,6 +16,11 @@ public interface AgentTool {
     /** 工具参数的 JSON Schema,描述入参结构 */
     Map<String, Object> inputSchema();
 
+    /** 工具权限等级。默认只读，高风险工具必须显式覆盖。 */
+    default ToolPermissionLevel permissionLevel() {
+        return ToolPermissionLevel.READ_ONLY;
+    }
+
     /** 执行工具,传入 LLM 解析后的参数 JSON,返回执行结果 */
     ToolResult execute(Map<String, Object> args, ToolContext context);
 }

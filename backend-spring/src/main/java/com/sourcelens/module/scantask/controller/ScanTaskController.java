@@ -55,4 +55,13 @@ public class ScanTaskController {
         projectService.verifyOwnership(task.getProjectId(), userId);
         return Result.ok(task);
     }
+
+    @Operation(summary = "取消扫描任务")
+    @PostMapping("/scan-tasks/{scanTaskId}/cancel")
+    public Result<ScanTask> cancel(@PathVariable Long scanTaskId,
+                                   @RequestAttribute("userId") Long userId) {
+        ScanTask task = scanTaskService.getDetail(scanTaskId);
+        projectService.verifyOwnership(task.getProjectId(), userId);
+        return Result.ok(scanTaskService.cancel(scanTaskId, userId));
+    }
 }

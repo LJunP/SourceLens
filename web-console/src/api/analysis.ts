@@ -5,7 +5,6 @@ export interface ScanArtifact {
   id: number
   scanTaskId: number
   artifactType: string
-  storagePath: string
   summaryJson: string
   createdAt: string
 }

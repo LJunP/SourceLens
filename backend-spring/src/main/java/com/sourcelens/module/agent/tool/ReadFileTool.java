@@ -49,32 +49,41 @@ public class ReadFileTool implements AgentTool {
     @Override
     public ToolResult execute(Map<String, Object> args, ToolContext context) {
         String relPath = (String) args.get("path");
-        int offset = args.containsKey("offset") ? ((Number) args.get("offset")).intValue() : 0;
-        int limit = args.containsKey("limit") ? ((Number) args.get("limit")).intValue() : 200;
+        int offset = AgentToolArgumentUtils.boundedInt(args.get("offset"), 0, 0, Integer.MAX_VALUE);
+        int limit = AgentToolArgumentUtils.boundedInt(args.get("limit"), 200, 1, MAX_OUTPUT_LINES);
 
         if (context.getProjectRootPath() == null) {
             return ToolResult.fail("项目根目录未设置");
         }
 
-        Path filePath = Paths.get(context.getProjectRootPath(), relPath);
+        Path rootPath = Paths.get(context.getProjectRootPath()).toAbsolutePath().normalize();
+        Path filePath = Paths.get(context.getProjectRootPath(), relPath).toAbsolutePath().normalize();
+        if (!filePath.startsWith(rootPath)) {
+            return ToolResult.fail("路径越界,不允许访问项目目录外的文件");
+        }
         if (!Files.exists(filePath)) {
             return ToolResult.fail("文件不存在: " + relPath);
         }
-        if (!filePath.startsWith(context.getProjectRootPath())) {
-            return ToolResult.fail("路径越界,不允许访问项目目录外的文件");
-        }
 
         try {
-            limit = Math.min(limit, MAX_OUTPUT_LINES);
-            List<String> lines = Files.readAllLines(filePath);
-            int end = Math.min(offset + limit, lines.size());
+            // 编码容错读取: 替换无法解码的字符为 '?' 而非抛出异常
+            java.nio.charset.CharsetDecoder decoder = java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPLACE)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPLACE);
+            byte[] bytes = Files.readAllBytes(filePath);
+            java.nio.CharBuffer charBuffer = decoder.decode(java.nio.ByteBuffer.wrap(bytes));
+            String content = charBuffer.toString();
+            String[] allLines = content.split("\n", -1);
+
+            int totalLines = allLines.length;
+            int end = Math.min(offset + limit, totalLines);
 
             StringBuilder sb = new StringBuilder();
             for (int i = offset; i < end; i++) {
-                sb.append(String.format("%4d| %s\n", i + 1, lines.get(i)));
+                sb.append(String.format("%4d| %s\n", i + 1, allLines[i]));
             }
-            sb.append("---\n").append("Total lines: ").append(lines.size());
-            if (end < lines.size()) {
+            sb.append("---\n").append("Total lines: ").append(totalLines);
+            if (end < totalLines) {
                 sb.append(", showing ").append(offset + 1).append("-").append(end);
             }
 
@@ -83,4 +92,5 @@ public class ReadFileTool implements AgentTool {
             return ToolResult.fail("读取文件失败: " + e.getMessage());
         }
     }
+
 }

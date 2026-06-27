@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
@@ -21,6 +22,7 @@ import java.util.concurrent.TimeUnit;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class AnalyzerRunner {
 
     @Value("${sourcelens.analyzer.path:sourcelens-analyzer}")
@@ -30,6 +32,7 @@ public class AnalyzerRunner {
     private int timeoutSeconds;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ScanResultSchemaValidator schemaValidator;
     private String analyzerPath;
 
     @PostConstruct
@@ -119,7 +122,9 @@ public class AnalyzerRunner {
                 throw new RuntimeException("Rust Analyzer 执行失败, exitCode=" + exitCode + ", stderr=" + stderr);
             }
 
-            return objectMapper.readTree(stdout);
+            JsonNode scanResult = objectMapper.readTree(stdout);
+            schemaValidator.validate(scanResult);
+            return scanResult;
 
         } catch (RuntimeException e) {
             throw e;

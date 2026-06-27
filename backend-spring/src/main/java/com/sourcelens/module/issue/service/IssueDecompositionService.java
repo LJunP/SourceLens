@@ -5,6 +5,15 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sourcelens.common.exception.BizException;
+import com.sourcelens.common.security.SensitiveDataSanitizer;
+import com.sourcelens.module.agent.entity.LlmConfig;
+import com.sourcelens.module.agent.service.LlmClient;
+import com.sourcelens.module.agent.service.LlmConfigService;
+import com.sourcelens.module.agent.service.LlmJsonExtractor;
+import com.sourcelens.module.agent.service.PromptInjectionGuard;
+import com.sourcelens.module.execution.entity.ExecutionAttempt;
+import com.sourcelens.module.execution.entity.ExecutionTask;
+import com.sourcelens.module.execution.service.ExecutionTaskService;
 import com.sourcelens.module.issue.dto.DecomposeIssueRequest;
 import com.sourcelens.module.issue.entity.IssueDecomposition;
 import com.sourcelens.module.issue.entity.IssueTask;
@@ -24,13 +33,30 @@ import java.util.stream.Collectors;
 @Service
 public class IssueDecompositionService extends ServiceImpl<IssueDecompositionMapper, IssueDecomposition> {
 
+    private static final int MAX_TEXT_FIELD_LENGTH = 8_000;
+    private static final int MAX_JSON_FIELD_LENGTH = 16_000;
+    private static final int MAX_ERROR_LENGTH = 4_000;
+
     private final IssueTaskMapper taskMapper;
     private final GraphService graphService;
+    private final LlmClient llmClient;
+    private final LlmConfigService llmConfigService;
+    private final LlmJsonExtractor llmJsonExtractor;
+    private final ExecutionTaskService executionTaskService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public IssueDecompositionService(IssueTaskMapper taskMapper, GraphService graphService) {
+    public IssueDecompositionService(IssueTaskMapper taskMapper,
+                                     GraphService graphService,
+                                     LlmClient llmClient,
+                                     LlmConfigService llmConfigService,
+                                     LlmJsonExtractor llmJsonExtractor,
+                                     ExecutionTaskService executionTaskService) {
         this.taskMapper = taskMapper;
         this.graphService = graphService;
+        this.llmClient = llmClient;
+        this.llmConfigService = llmConfigService;
+        this.llmJsonExtractor = llmJsonExtractor;
+        this.executionTaskService = executionTaskService;
     }
 
     @Transactional
@@ -39,14 +65,16 @@ public class IssueDecompositionService extends ServiceImpl<IssueDecompositionMap
                 .projectId(req.getProjectId())
                 .scanTaskId(req.getScanTaskId())
                 .title(req.getTitle())
-                .description(req.getDescription())
-                .businessContext(req.getBusinessContext())
+                .description(sanitizeText(req.getDescription()))
+                .businessContext(sanitizeText(req.getBusinessContext()))
                 .priority(req.getPriority() != null ? req.getPriority() : "MEDIUM")
                 .relatedModules(req.getRelatedModules())
                 .status("PENDING")
                 .createdBy(userId)
                 .build();
         save(decomposition);
+        executionTaskService.create(decomposition.getProjectId(), null, "ISSUE_DECOMPOSITION",
+                "ISSUE_DECOMPOSITION", decomposition.getId(), userId);
         log.info("创建需求拆解: id={}, title={}", decomposition.getId(), decomposition.getTitle());
         return decomposition;
     }
@@ -55,62 +83,216 @@ public class IssueDecompositionService extends ServiceImpl<IssueDecompositionMap
     public void processDecomposition(Long decompositionId) {
         IssueDecomposition decomposition = getById(decompositionId);
         if (decomposition == null) return;
+        if (!claimProcessing(decompositionId)) {
+            log.info("跳过需求拆解处理，状态已变化或正在处理: id={}", decompositionId);
+            return;
+        }
+        decomposition.setStatus("PROCESSING");
+        ExecutionTask executionTask = getOrCreateExecutionTask(decomposition);
+        ExecutionAttempt attempt = executionTask == null ? null : executionTaskService.getOrCreateCurrentAttempt(executionTask.getId());
+        Long attemptId = attempt == null ? null : attempt.getId();
+        startExecutionStep(attemptId, "decompose_issue", "拆解需求与技术任务");
 
         try {
-            decomposition.setStatus("PROCESSING");
-            updateById(decomposition);
-
             // 尝试从已有的分析产物中提取上下文
             Map<String, Object> context = buildContext(decomposition);
 
-            // 执行拆解(当前为规则引擎模拟, 后续接入 LLM)
-            Map<String, Object> result = decompose(decomposition, context);
+            Map<String, Object> result = null;
+
+            // 尝试获取激活的大模型配置
+            LlmConfig llmConfig = null;
+            if (decomposition.getCreatedBy() != null) {
+                try {
+                    llmConfig = llmConfigService.getActiveConfig(decomposition.getCreatedBy());
+                } catch (Exception e) {
+                    log.warn("获取激活的 LLM 配置失败, 将使用规则引擎进行需求拆解 fallback: {}", e.getMessage());
+                }
+            }
+
+            if (llmConfig != null) {
+                log.info("使用大模型进行需求拆解: configId={}, model={}", llmConfig.getId(), llmConfig.getModelName());
+                try {
+                    result = decomposeWithLlm(decomposition, context, llmConfig);
+                } catch (Exception e) {
+                    log.error("大模型需求拆解失败, 将使用规则引擎进行需求拆解 fallback", e);
+                }
+            }
+
+            if (result == null) {
+                log.info("使用规则引擎进行需求拆解");
+                result = decompose(decomposition, context);
+            }
 
             // 写回分解结果
-            decomposition.setUnderstanding((String) result.get("understanding"));
+            decomposition.setUnderstanding(sanitizeText((String) result.get("understanding")));
             decomposition.setImpactModules(toJson(result.get("impactModules")));
             decomposition.setImpactApis(toJson(result.get("impactApis")));
             decomposition.setImpactDb(toJson(result.get("impactDb")));
             decomposition.setRisks(toJson(result.get("risks")));
             decomposition.setDependencies(toJson(result.get("dependencies")));
             decomposition.setAcceptance(toJson(result.get("acceptance")));
-            decomposition.setSuggestedBranch((String) result.get("suggestedBranch"));
-            decomposition.setSuggestedCommit((String) result.get("suggestedCommit"));
+            decomposition.setSuggestedBranch(sanitizeText((String) result.get("suggestedBranch")));
+            decomposition.setSuggestedCommit(sanitizeText((String) result.get("suggestedCommit")));
             decomposition.setOutputJson(toJson(result));
+            int taskCount = replaceTasks(decompositionId, result);
+
             decomposition.setStatus("COMPLETED");
             decomposition.setUpdatedAt(LocalDateTime.now());
             updateById(decomposition);
-
-            // 保存子任务
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> tasks = (List<Map<String, Object>>) result.get("tasks");
-            if (tasks != null) {
-                for (int i = 0; i < tasks.size(); i++) {
-                    Map<String, Object> t = tasks.get(i);
-                    IssueTask issueTask = IssueTask.builder()
-                            .decompositionId(decompositionId)
-                            .taskOrder(i + 1)
-                            .category((String) t.get("category"))
-                            .title((String) t.get("title"))
-                            .description((String) t.get("description"))
-                            .impactFiles(toJson(t.get("impactFiles")))
-                            .riskLevel((String) t.get("riskLevel"))
-                            .testSuggestions((String) t.get("testSuggestions"))
-                            .estimatedHours(t.get("estimatedHours") != null ? ((Number) t.get("estimatedHours")).doubleValue() : null)
-                            .status("TODO")
-                            .build();
-                    taskMapper.insert(issueTask);
-                }
-            }
-
-            log.info("需求拆解完成: id={}, tasks={}", decompositionId, tasks != null ? tasks.size() : 0);
+            completeExecutionStep(attemptId, "decompose_issue", "需求拆解完成: " + taskCount + " 个子任务");
+            markExecutionSuccess(attemptId, "decompose_issue");
+            log.info("需求拆解完成: id={}, tasks={}", decompositionId, taskCount);
         } catch (Exception e) {
             log.error("需求拆解失败: id={}", decompositionId, e);
             decomposition.setStatus("FAILED");
-            decomposition.setErrorMessage(e.getMessage());
+            decomposition.setErrorMessage(sanitizeError(e.getMessage()));
             decomposition.setUpdatedAt(LocalDateTime.now());
             updateById(decomposition);
+            failExecutionStep(attemptId, "decompose_issue", e.getMessage());
+            markExecutionFailed(attemptId, "decompose_issue", e.getMessage());
         }
+    }
+
+    private ExecutionTask getOrCreateExecutionTask(IssueDecomposition decomposition) {
+        ExecutionTask executionTask = executionTaskService.findBySource("ISSUE_DECOMPOSITION", decomposition.getId());
+        if (executionTask != null) {
+            return executionTask;
+        }
+        return executionTaskService.create(decomposition.getProjectId(), null, "ISSUE_DECOMPOSITION",
+                "ISSUE_DECOMPOSITION", decomposition.getId(), decomposition.getCreatedBy());
+    }
+
+    private void startExecutionStep(Long attemptId, String stepKey, String stepName) {
+        if (attemptId != null) {
+            executionTaskService.startAttemptStep(attemptId, stepKey, stepName);
+        }
+    }
+
+    private void completeExecutionStep(Long attemptId, String stepKey, String summary) {
+        if (attemptId != null) {
+            executionTaskService.completeAttemptStep(attemptId, stepKey, summary);
+        }
+    }
+
+    private void failExecutionStep(Long attemptId, String stepKey, String errorMessage) {
+        if (attemptId != null) {
+            executionTaskService.failAttemptStep(attemptId, stepKey, errorMessage);
+        }
+    }
+
+    private void markExecutionSuccess(Long attemptId, String currentStep) {
+        if (attemptId != null) {
+            executionTaskService.markAttemptSuccess(attemptId, currentStep);
+        }
+    }
+
+    private void markExecutionFailed(Long attemptId, String currentStep, String errorMessage) {
+        if (attemptId != null) {
+            executionTaskService.markAttemptFailed(attemptId, currentStep, errorMessage);
+        }
+    }
+
+    private boolean claimProcessing(Long decompositionId) {
+        IssueDecomposition update = new IssueDecomposition();
+        update.setStatus("PROCESSING");
+        update.setErrorMessage(null);
+        update.setUpdatedAt(LocalDateTime.now());
+        return update(update, new LambdaQueryWrapper<IssueDecomposition>()
+                .eq(IssueDecomposition::getId, decompositionId)
+                .eq(IssueDecomposition::getStatus, "PENDING"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private int replaceTasks(Long decompositionId, Map<String, Object> result) {
+        taskMapper.delete(new LambdaQueryWrapper<IssueTask>()
+                .eq(IssueTask::getDecompositionId, decompositionId));
+
+        List<Map<String, Object>> tasks = (List<Map<String, Object>>) result.get("tasks");
+        if (tasks == null) {
+            return 0;
+        }
+        for (int i = 0; i < tasks.size(); i++) {
+            Map<String, Object> t = tasks.get(i);
+            IssueTask issueTask = IssueTask.builder()
+                    .decompositionId(decompositionId)
+                    .taskOrder(i + 1)
+                    .category((String) t.get("category"))
+                    .title((String) t.get("title"))
+                    .description(sanitizeText((String) t.get("description")))
+                    .impactFiles(toJson(t.get("impactFiles")))
+                    .riskLevel((String) t.get("riskLevel"))
+                    .testSuggestions(sanitizeText((String) t.get("testSuggestions")))
+                    .estimatedHours(t.get("estimatedHours") != null ? ((Number) t.get("estimatedHours")).doubleValue() : null)
+                    .status("TODO")
+                    .build();
+            taskMapper.insert(issueTask);
+        }
+        return tasks.size();
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> decomposeWithLlm(IssueDecomposition decomposition, Map<String, Object> context, LlmConfig config) {
+        String graphSummary = "No dependency graph context available.";
+        if (context.containsKey("graph")) {
+            try {
+                Map<String, Object> graph = (Map<String, Object>) context.get("graph");
+                List<Map<String, Object>> nodes = (List<Map<String, Object>>) graph.get("nodes");
+                List<Map<String, Object>> edges = (List<Map<String, Object>>) graph.get("edges");
+                int nodeCount = nodes != null ? nodes.size() : 0;
+                int edgeCount = edges != null ? edges.size() : 0;
+
+                StringBuilder sb = new StringBuilder();
+                sb.append("The codebase has ").append(nodeCount).append(" code symbols and ").append(edgeCount).append(" relations.\n");
+                if (nodes != null && !nodes.isEmpty()) {
+                    sb.append("Key packages and components identified:\n");
+                    nodes.stream().limit(15).forEach(node -> {
+                        sb.append("  - Symbol: ").append(node.get("label"))
+                          .append(" [").append(node.get("kind")).append("]")
+                          .append(" in package: ").append(node.get("package")).append("\n");
+                    });
+                }
+                graphSummary = sb.toString();
+            } catch (Exception e) {
+                log.warn("Failed to summarize dependency graph context for prompt: {}", e.getMessage());
+            }
+        }
+
+        String prompt = "You are an expert system architect and project manager. Decompose the following issue requirement into detailed technical impact analysis and subtasks.\n" +
+                PromptInjectionGuard.systemBoundaryInstructions() + "\n" +
+                PromptInjectionGuard.wrapUntrustedContent("issue title", decomposition.getTitle()) +
+                PromptInjectionGuard.wrapUntrustedContent("issue description", decomposition.getDescription()) +
+                PromptInjectionGuard.wrapUntrustedContent("issue business context", decomposition.getBusinessContext()) +
+                PromptInjectionGuard.wrapUntrustedContent("issue priority", decomposition.getPriority() != null ? decomposition.getPriority() : "MEDIUM") +
+                PromptInjectionGuard.wrapUntrustedContent("codebase dependency graph summary", graphSummary) + "\n" +
+                "Analyze this requirement and output a structured JSON response matching the following schema (do not wrap in extra explanation or markdown block code formatting):\n" +
+                "{\n" +
+                "  \"understanding\": \"A detailed explanation of the requirement and technical solution\",\n" +
+                "  \"impactModules\": \"Description of affected system modules/packages\",\n" +
+                "  \"impactApis\": \"Description of affected API endpoints\",\n" +
+                "  \"impactDb\": \"Description of any database/schema/entity changes needed\",\n" +
+                "  \"risks\": \"Identified risks and mitigation strategies\",\n" +
+                "  \"dependencies\": \"Pre-requisites or dependencies on other tasks/modules\",\n" +
+                "  \"acceptance\": [\"Acceptance criteria 1\", \"Acceptance criteria 2\"],\n" +
+                "  \"suggestedBranch\": \"suggested-git-branch-name\",\n" +
+                "  \"suggestedCommit\": \"Suggested commit messages and steps\",\n" +
+                "  \"tasks\": [\n" +
+                "    {\n" +
+                "      \"category\": \"DEVELOP | TEST | DEPLOY\",\n" +
+                "      \"title\": \"Subtask title\",\n" +
+                "      \"description\": \"Subtask description\",\n" +
+                "      \"impactFiles\": [\"list of files to modify\"],\n" +
+                "      \"riskLevel\": \"LOW | MEDIUM | HIGH\",\n" +
+                "      \"testSuggestions\": \"How to verify this subtask\",\n" +
+                "      \"estimatedHours\": 2.5\n" +
+                "    }\n" +
+                "  ]\n" +
+                "}";
+
+        String response = llmClient.chat(config, prompt);
+        return llmJsonExtractor.extractRequiredObject(
+                response,
+                Set.of("understanding", "tasks"),
+                "ISSUE_DECOMPOSITION");
     }
 
     private Map<String, Object> buildContext(IssueDecomposition decomposition) {
@@ -615,10 +797,22 @@ public class IssueDecompositionService extends ServiceImpl<IssueDecompositionMap
     private String toJson(Object obj) {
         if (obj == null) return null;
         try {
-            return objectMapper.writeValueAsString(obj);
+            return sanitizeJson(objectMapper.writeValueAsString(obj));
         } catch (Exception e) {
-            return String.valueOf(obj);
+            return sanitizeJson(String.valueOf(obj));
         }
+    }
+
+    private String sanitizeText(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_TEXT_FIELD_LENGTH);
+    }
+
+    private String sanitizeJson(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_JSON_FIELD_LENGTH);
+    }
+
+    private String sanitizeError(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_ERROR_LENGTH);
     }
 
     // ===== 查询 =====
@@ -648,9 +842,16 @@ public class IssueDecompositionService extends ServiceImpl<IssueDecompositionMap
                         .orderByAsc(IssueTask::getTaskOrder));
     }
 
-    public IssueTask updateTaskStatus(Long taskId, String status) {
+    public IssueTask getTask(Long taskId) {
         IssueTask task = taskMapper.selectById(taskId);
-        if (task == null) throw BizException.notFound("IssueTask");
+        if (task == null) {
+            throw BizException.notFound("IssueTask");
+        }
+        return task;
+    }
+
+    public IssueTask updateTaskStatus(Long taskId, String status) {
+        IssueTask task = getTask(taskId);
         task.setStatus(status);
         taskMapper.updateById(task);
         return task;

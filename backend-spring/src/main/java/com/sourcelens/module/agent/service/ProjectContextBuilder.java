@@ -9,11 +9,13 @@ import com.sourcelens.module.analysis.entity.ScanArtifact;
 import com.sourcelens.module.analysis.mapper.CodeRelationMapper;
 import com.sourcelens.module.analysis.mapper.CodeSymbolMapper;
 import com.sourcelens.module.analysis.mapper.ScanArtifactMapper;
+import com.sourcelens.module.artifact.service.ArtifactStorageService;
 import com.sourcelens.module.project.entity.Project;
 import com.sourcelens.module.project.service.ProjectService;
 import com.sourcelens.module.repository.entity.Repository;
 import com.sourcelens.module.repository.mapper.RepositoryMapper;
 import com.sourcelens.module.repository.service.GitService;
+import com.sourcelens.module.repository.service.RepositoryService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -39,7 +41,9 @@ public class ProjectContextBuilder {
     private final ScanArtifactMapper artifactMapper;
     private final CodeSymbolMapper symbolMapper;
     private final CodeRelationMapper relationMapper;
+    private final ArtifactStorageService artifactStorageService;
     private final GitService gitService;
+    private final RepositoryService repositoryService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${sourcelens.workspace.base-path:/tmp/sourcelens/repos}")
@@ -105,39 +109,49 @@ public class ProjectContextBuilder {
         if (repo == null || repo.getUrl() == null) {
             return null;
         }
+        // 如果是本地 file:// 仓库且路径存在，直接返回
+        if (repo.getUrl().startsWith("file://")) {
+            String originalPath = repo.getUrl().substring(7);
+            if (Files.isDirectory(Path.of(originalPath))) {
+                return originalPath;
+            }
+        }
         String name = repo.getUrl().replaceAll(".*?/([^/]+?)(?:\\.git)?$", "$1");
         String localPath = workspaceBasePath + "/" + projectId + "/" + name;
+        if (!Files.isDirectory(Path.of(localPath))) {
+            try {
+                log.info("本地仓库不存在, 自动克隆/同步: projectId={}, url={}", projectId, repo.getUrl());
+                String token = repositoryService.getDecryptedToken(repo.getId());
+                if (token == null || token.isBlank()) {
+                    token = null;
+                }
+                gitService.ensureLocal(projectId, repo.getUrl(), repo.getDefaultBranch(), token);
+            } catch (Exception e) {
+                log.error("自动同步本地仓库失败: projectId={}, url={}", projectId, repo.getUrl(), e);
+            }
+        }
         return Files.isDirectory(Path.of(localPath)) ? localPath : null;
     }
 
     private String buildScanSummary(Long scanTaskId) {
         StringBuilder sb = new StringBuilder();
 
-        // 扫描产物
-        List<ScanArtifact> artifacts = artifactMapper.selectList(
-                new LambdaQueryWrapper<ScanArtifact>()
-                        .eq(ScanArtifact::getScanTaskId, scanTaskId));
-        if (!artifacts.isEmpty()) {
+        Map<String, Object> artifactData = artifactStorageService.readJsonMapArtifactsByOwner("SCAN_TASK", scanTaskId);
+        if (!artifactData.isEmpty()) {
             sb.append("## 扫描产物摘要\n");
-            for (ScanArtifact a : artifacts) {
-                sb.append("- ").append(a.getArtifactType());
-                if (a.getSummaryJson() != null) {
-                    try {
-                        JsonNode json = objectMapper.readTree(a.getSummaryJson());
-                        // 取前 500 字符作为摘要
-                        String summary = json.toString();
-                        if (summary.length() > 500) {
-                            summary = summary.substring(0, 500) + "...";
-                        }
-                        sb.append(": ").append(summary);
-                    } catch (Exception e) {
-                        sb.append(": ").append(a.getSummaryJson(), 0,
-                                Math.min(500, a.getSummaryJson().length()));
-                    }
+            artifactData.forEach((type, data) -> appendArtifactSummary(sb, type, toJsonNodeText(data)));
+            sb.append("\n");
+        } else {
+            List<ScanArtifact> artifacts = artifactMapper.selectList(
+                    new LambdaQueryWrapper<ScanArtifact>()
+                            .eq(ScanArtifact::getScanTaskId, scanTaskId));
+            if (!artifacts.isEmpty()) {
+                sb.append("## 扫描产物摘要\n");
+                for (ScanArtifact a : artifacts) {
+                    appendArtifactSummary(sb, a.getArtifactType(), a.getSummaryJson());
                 }
                 sb.append("\n");
             }
-            sb.append("\n");
         }
 
         // 代码符号统计
@@ -177,6 +191,31 @@ public class ProjectContextBuilder {
         }
 
         return sb.toString();
+    }
+
+    private void appendArtifactSummary(StringBuilder sb, String artifactType, String jsonText) {
+        sb.append("- ").append(artifactType);
+        if (jsonText != null) {
+            try {
+                JsonNode json = objectMapper.readTree(jsonText);
+                String summary = json.toString();
+                if (summary.length() > 500) {
+                    summary = summary.substring(0, 500) + "...";
+                }
+                sb.append(": ").append(summary);
+            } catch (Exception e) {
+                sb.append(": ").append(jsonText, 0, Math.min(500, jsonText.length()));
+            }
+        }
+        sb.append("\n");
+    }
+
+    private String toJsonNodeText(Object data) {
+        try {
+            return objectMapper.writeValueAsString(data);
+        } catch (Exception e) {
+            return String.valueOf(data);
+        }
     }
 
     private String buildFileTree(String rootPath, String basePath) {

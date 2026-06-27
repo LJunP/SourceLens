@@ -1,6 +1,7 @@
 package com.sourcelens.module.repository.entity;
 
 import com.baomidou.mybatisplus.annotation.*;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -34,6 +35,7 @@ public class Repository {
 
     private String authType;
 
+    @JsonIgnore
     private String encryptedTokenRef;
 
     private LocalDateTime lastSyncedAt;

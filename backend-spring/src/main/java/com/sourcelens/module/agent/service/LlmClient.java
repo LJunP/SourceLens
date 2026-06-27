@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sourcelens.module.agent.entity.LlmConfig;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
@@ -26,17 +27,29 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 @Slf4j
 @Service
+@Primary
 public class LlmClient {
 
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
             .build();
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final List<LlmProviderAdapter> providerAdapters;
+
+    public LlmClient(List<LlmProviderAdapter> providerAdapters) {
+        this.providerAdapters = providerAdapters == null ? List.of() : providerAdapters;
+    }
 
     // ===== 非 streaming 调用(向后兼容) =====
 
     public String chat(LlmConfig config, List<Map<String, String>> messages) {
-        String url = config.getBaseUrl().replaceAll("/+$", "") + "/chat/completions";
+        LlmProviderAdapter adapter = resolveAdapter(config);
+        if (adapter != null) {
+            return adapter.chat(config, messages);
+        }
+
+        String baseUrl = LlmEndpointPolicy.normalizeAndValidate(config.getProvider(), config.getBaseUrl());
+        String url = baseUrl + "/chat/completions";
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", config.getModelName());
@@ -55,6 +68,21 @@ public class LlmClient {
                     .build();
 
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                if (response.statusCode() == 404 && !url.contains("/v1/")) {
+                    String fallbackUrl = baseUrl + "/v1/chat/completions";
+                    log.info("尝试 Fallback Chat completions 接口调用: {}", fallbackUrl);
+                    request = HttpRequest.newBuilder()
+                            .uri(URI.create(fallbackUrl))
+                            .header("Content-Type", "application/json")
+                            .header("Authorization", "Bearer " + config.getApiKey())
+                            .POST(HttpRequest.BodyPublishers.ofString(json))
+                            .timeout(Duration.ofSeconds(120))
+                            .build();
+                    response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                }
+            }
 
             if (response.statusCode() != 200) {
                 log.error("LLM 响应异常: status={}, body={}", response.statusCode(), response.body());
@@ -77,6 +105,157 @@ public class LlmClient {
         return chat(config, List.of(Map.of("role", "user", "content", prompt)));
     }
 
+    @SuppressWarnings("unchecked")
+    public List<Float> getEmbedding(LlmConfig config, String text) {
+        LlmProviderAdapter adapter = resolveAdapter(config);
+        if (adapter != null) {
+            return adapter.getEmbedding(config, text);
+        }
+
+        if (text == null || text.isBlank()) {
+            return Collections.emptyList();
+        }
+
+        String baseUrl = LlmEndpointPolicy.normalizeAndValidate(config.getProvider(), config.getBaseUrl());
+        String url = baseUrl + "/embeddings";
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        String model = "text-embedding-3-small";
+        body.put("model", model);
+        body.put("input", text);
+
+        try {
+            String json = objectMapper.writeValueAsString(body);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + config.getApiKey())
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .timeout(Duration.ofSeconds(30))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                if (url.endsWith("/embeddings") && !url.contains("/v1/")) {
+                    String fallbackUrl = baseUrl + "/v1/embeddings";
+                    log.info("尝试 Fallback 向量调用: {}", fallbackUrl);
+                    request = HttpRequest.newBuilder()
+                            .uri(URI.create(fallbackUrl))
+                            .header("Content-Type", "application/json")
+                            .header("Authorization", "Bearer " + config.getApiKey())
+                            .POST(HttpRequest.BodyPublishers.ofString(json))
+                            .timeout(Duration.ofSeconds(30))
+                            .build();
+                    response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                }
+            }
+
+            if (response.statusCode() != 200) {
+                log.error("Embedding 调用失败: status={}, body={}", response.statusCode(), response.body());
+                throw new RuntimeException("Embedding API 返回错误: " + response.statusCode());
+            }
+
+            JsonNode root = objectMapper.readTree(response.body());
+            JsonNode dataNode = root.get("data");
+            if (dataNode == null || !dataNode.isArray() || dataNode.isEmpty()) {
+                throw new RuntimeException("Embedding 响应为空");
+            }
+
+            JsonNode embeddingNode = dataNode.get(0).get("embedding");
+            if (embeddingNode == null || !embeddingNode.isArray()) {
+                throw new RuntimeException("无法解析向量数据");
+            }
+
+            List<Float> embedding = new ArrayList<>();
+            for (JsonNode val : embeddingNode) {
+                embedding.add((float) val.asDouble());
+            }
+            return embedding;
+        } catch (Exception e) {
+            log.error("获取文本 Embedding 失败: {}", e.getMessage());
+            throw new RuntimeException("获取 Embedding 失败: " + e.getMessage(), e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public List<List<Float>> getEmbeddings(LlmConfig config, List<String> texts) {
+        LlmProviderAdapter adapter = resolveAdapter(config);
+        if (adapter != null) {
+            return adapter.getEmbeddings(config, texts);
+        }
+
+        if (texts == null || texts.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        String baseUrl = LlmEndpointPolicy.normalizeAndValidate(config.getProvider(), config.getBaseUrl());
+        String url = baseUrl + "/embeddings";
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        String model = "text-embedding-3-small";
+        body.put("model", model);
+        body.put("input", texts);
+
+        try {
+            String json = objectMapper.writeValueAsString(body);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + config.getApiKey())
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .timeout(Duration.ofSeconds(60))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                if (url.endsWith("/embeddings") && !url.contains("/v1/")) {
+                    String fallbackUrl = baseUrl + "/v1/embeddings";
+                    log.info("尝试 Fallback 批量向量调用: {}", fallbackUrl);
+                    request = HttpRequest.newBuilder()
+                            .uri(URI.create(fallbackUrl))
+                            .header("Content-Type", "application/json")
+                            .header("Authorization", "Bearer " + config.getApiKey())
+                            .POST(HttpRequest.BodyPublishers.ofString(json))
+                            .timeout(Duration.ofSeconds(60))
+                            .build();
+                    response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                }
+            }
+
+            if (response.statusCode() != 200) {
+                log.error("批量 Embedding 调用失败: status={}, body={}", response.statusCode(), response.body());
+                throw new RuntimeException("Embedding API 返回错误: " + response.statusCode());
+            }
+
+            JsonNode root = objectMapper.readTree(response.body());
+            JsonNode dataNode = root.get("data");
+            if (dataNode == null || !dataNode.isArray() || dataNode.isEmpty()) {
+                throw new RuntimeException("批量 Embedding 响应为空");
+            }
+
+            List<List<Float>> results = new ArrayList<>(Collections.nCopies(texts.size(), null));
+            for (JsonNode item : dataNode) {
+                int index = item.get("index").asInt();
+                JsonNode embeddingNode = item.get("embedding");
+                if (embeddingNode != null && embeddingNode.isArray()) {
+                    List<Float> embedding = new ArrayList<>();
+                    for (JsonNode val : embeddingNode) {
+                        embedding.add((float) val.asDouble());
+                    }
+                    if (index >= 0 && index < results.size()) {
+                        results.set(index, embedding);
+                    }
+                }
+            }
+            return results;
+        } catch (Exception e) {
+            log.error("批量获取文本 Embedding 失败: {}", e.getMessage());
+            throw new RuntimeException("批量获取 Embedding 失败: " + e.getMessage(), e);
+        }
+    }
+
     // ===== Streaming 调用(支持 function calling) =====
 
     /**
@@ -86,11 +265,53 @@ public class LlmClient {
     public LlmStreamResult chatWithTools(LlmConfig config,
                                          List<Map<String, Object>> messages,
                                          List<Map<String, Object>> tools) {
-        String url = config.getBaseUrl().replaceAll("/+$", "") + "/chat/completions";
+        LlmProviderAdapter adapter = resolveAdapter(config);
+        if (adapter != null) {
+            return adapter.chatWithTools(config, messages, tools);
+        }
+
+        String baseUrl = LlmEndpointPolicy.normalizeAndValidate(config.getProvider(), config.getBaseUrl());
+        String url = baseUrl + "/chat/completions";
+
+        // Format assistant messages to ensure that tool call arguments are JSON strings (OpenAI spec)
+        List<Map<String, Object>> formattedMessages = new ArrayList<>();
+        if (messages != null) {
+            for (Map<String, Object> msg : messages) {
+                Map<String, Object> copy = new LinkedHashMap<>(msg);
+                if ("assistant".equals(copy.get("role")) && copy.containsKey("tool_calls")) {
+                    Object tcObj = copy.get("tool_calls");
+                    if (tcObj instanceof List) {
+                        List<Map<String, Object>> toolCalls = (List<Map<String, Object>>) tcObj;
+                        List<Map<String, Object>> formattedToolCalls = new ArrayList<>();
+                        for (Map<String, Object> tc : toolCalls) {
+                            Map<String, Object> tcCopy = new LinkedHashMap<>(tc);
+                            if (tcCopy.containsKey("function")) {
+                                Object funcObj = tcCopy.get("function");
+                                if (funcObj instanceof Map) {
+                                    Map<String, Object> funcCopy = new LinkedHashMap<>((Map<String, Object>) funcObj);
+                                    Object argsObj = funcCopy.get("arguments");
+                                    if (argsObj instanceof Map) {
+                                        try {
+                                            funcCopy.put("arguments", objectMapper.writeValueAsString(argsObj));
+                                        } catch (Exception e) {
+                                            log.error("Failed to serialize tool arguments to JSON string: {}", argsObj, e);
+                                        }
+                                    }
+                                    tcCopy.put("function", funcCopy);
+                                }
+                            }
+                            formattedToolCalls.add(tcCopy);
+                        }
+                        copy.put("tool_calls", formattedToolCalls);
+                    }
+                }
+                formattedMessages.add(copy);
+            }
+        }
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", config.getModelName());
-        body.put("messages", messages);
+        body.put("messages", formattedMessages);
         body.put("temperature", config.getTemperature() != null ? config.getTemperature() : 0.7);
         body.put("max_tokens", config.getMaxTokens() != null ? config.getMaxTokens() : 8192);
         body.put("stream", true);
@@ -114,6 +335,21 @@ public class LlmClient {
             HttpResponse<java.util.stream.Stream<String>> response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
 
             if (response.statusCode() != 200) {
+                if (response.statusCode() == 404 && !url.contains("/v1/")) {
+                    String fallbackUrl = baseUrl + "/v1/chat/completions";
+                    log.info("尝试 Fallback Chat completions (Streaming) 接口调用: {}", fallbackUrl);
+                    request = HttpRequest.newBuilder()
+                            .uri(URI.create(fallbackUrl))
+                            .header("Content-Type", "application/json")
+                            .header("Authorization", "Bearer " + config.getApiKey())
+                            .POST(HttpRequest.BodyPublishers.ofString(json))
+                            .timeout(Duration.ofSeconds(180))
+                            .build();
+                    response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+                }
+            }
+
+            if (response.statusCode() != 200) {
                 String bodyStr = response.body().collect(java.util.stream.Collectors.joining("\n"));
                 log.error("LLM 响应异常: status={}, body={}", response.statusCode(), bodyStr);
                 throw new RuntimeException("LLM API 返回错误: " + response.statusCode() + ": " + bodyStr);
@@ -125,6 +361,13 @@ public class LlmClient {
         } catch (Exception e) {
             throw new RuntimeException("LLM 调用失败: " + e.getMessage(), e);
         }
+    }
+
+    private LlmProviderAdapter resolveAdapter(LlmConfig config) {
+        return providerAdapters.stream()
+                .filter(adapter -> adapter.supports(config))
+                .findFirst()
+                .orElse(null);
     }
 
     /**

@@ -69,7 +69,13 @@ public class IssueDecompositionController {
     @Operation(summary = "更新子任务状态")
     @PatchMapping("/issue-tasks/{taskId}")
     public Result<IssueTask> updateTaskStatus(@PathVariable Long taskId,
-                                               @RequestParam String status) {
+                                               @RequestParam String status,
+                                               @RequestAttribute("userId") Long userId) {
+        // 进行越权安全保护校验
+        IssueTask task = decompositionService.getTask(taskId);
+        IssueDecomposition d = decompositionService.getDetail(task.getDecompositionId());
+        projectService.verifyOwnership(d.getProjectId(), userId);
+
         return Result.ok(decompositionService.updateTaskStatus(taskId, status));
     }
 

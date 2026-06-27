@@ -53,13 +53,57 @@ npm run dev
 
 前端运行在 `http://localhost:5173`。
 
+## Smoke Test
+
+后端启动后可运行最小健康检查：
+
+```bash
+SOURCELENS_BASE_URL=http://localhost:8080 make smoke
+```
+
+Docker Compose 后端默认映射到 `8081`：
+
+```bash
+SOURCELENS_BASE_URL=http://localhost:8081 make smoke
+```
+
+公开 GitHub 仓库分析主链路可运行：
+
+```bash
+SOURCELENS_BASE_URL=http://localhost:8081 make public-repo-smoke
+```
+
+该检查会创建临时用户、项目、仓库和扫描任务，验证 clone、analyzer、scan artifacts、artifact records、execution steps、dependency graph 和 `code_chunks` 落库。默认仓库为 `https://github.com/LJunP/Pawnshop-Management-System.git`，可通过 `SOURCELENS_PUBLIC_REPO_SMOKE_REPO_URL` 和 `SOURCELENS_PUBLIC_REPO_SMOKE_BRANCH` 覆写。
+
+后端 Docker 镜像从仓库根构建，会同时打包 Spring Boot jar 和 Rust `sourcelens-analyzer` 二进制，避免容器扫描时找不到 analyzer。
+
+生产部署、metrics 暴露、GitHub App 和沙箱验收请参考 [Operations Runbook](docs/OPERATIONS_RUNBOOK.md)。
+
+## CI
+
+GitHub Actions 工作流位于 `.github/workflows/ci.yml`，PR 和 `main` 分支 push 会运行：
+
+- 安全回归检查：生产配置、危险旧示例、smoke metrics 保护断言
+- 后端：`mvn clean test`
+- 前端：`npm ci` + `npm run build`
+- Rust analyzer：`cargo check --locked` + `cargo test --locked`
+- Docker 镜像：`docker build -f backend-spring/Dockerfile .`
+
+真实 GitHub App 权限、受控 PR、webhook 和 Docker 沙箱兼容性仍需按 Operations Runbook 做环境级验收。
+
+本地提交前可运行同一组基础门禁：
+
+```bash
+make verify
+```
+
 ## 功能模块
 
 | 模块 | 说明 |
 |------|------|
 | 用户认证 | 注册、登录、JWT 鉴权 |
 | 项目管理 | CRUD、健康评分 |
-| 仓库管理 | GitHub 仓库接入、Token 加密存储 |
+| 仓库管理 | GitHub 仓库接入、GitHub App installation 绑定、PAT 开发兼容 |
 | 扫描任务 | 触发 Rust 分析器、异步执行、状态追踪 |
 | 架构报告 | 文件树、语言统计、API 清单、实体提取 |
 | 依赖图 | 符号/关系提取、可视化依赖图 |

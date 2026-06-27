@@ -4,9 +4,10 @@ spring:
     username: sourcelens
     password: sourcelens123
 
-  redis:
-    host: localhost
-    port: 6379
+  data:
+    redis:
+      host: localhost
+      port: 6379
 
 # flyway 已在 application.yml 中配置，这里仅保留测试配置覆盖
 # flyway:

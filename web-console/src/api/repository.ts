@@ -15,6 +15,28 @@ export interface Repository {
   createdAt: string
 }
 
+export interface GitHubAppInstallation {
+  id: number
+  projectId: number
+  repositoryId: number
+  installationId: number
+  accountLogin: string
+  accountType?: string
+  repositorySelection?: string
+  permissionsJson?: string
+  status: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface BindGitHubAppInstallationRequest {
+  installationId: number
+  accountLogin: string
+  accountType?: string
+  repositorySelection?: string
+  permissionsJson?: string
+}
+
 export const repositoryApi = {
   list: (projectId: number) =>
     client.get<Result<Repository[]>>(`/projects/${projectId}/repositories`),
@@ -26,4 +48,10 @@ export const repositoryApi = {
     client.put<Result<Repository>>(`/repositories/${id}`, data),
   delete: (id: number) =>
     client.delete<Result<void>>(`/repositories/${id}`),
+  getGitHubAppInstallation: (id: number) =>
+    client.get<Result<GitHubAppInstallation>>(`/repositories/${id}/github-app-installation`),
+  bindGitHubAppInstallation: (id: number, data: BindGitHubAppInstallationRequest) =>
+    client.put<Result<GitHubAppInstallation>>(`/repositories/${id}/github-app-installation`, data),
+  disableGitHubAppInstallation: (id: number) =>
+    client.delete<Result<void>>(`/repositories/${id}/github-app-installation`),
 }

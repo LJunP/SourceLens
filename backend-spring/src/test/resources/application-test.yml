@@ -10,9 +10,10 @@ spring:
       schema-locations: classpath:schema-test.sql
   flyway:
     enabled: false
-  redis:
-    host: localhost
-    port: 6379
+  data:
+    redis:
+      host: localhost
+      port: 6379
 
 mybatis-plus:
   configuration:
@@ -28,6 +29,8 @@ sourcelens:
   jwt:
     secret: TestSecretKey2026-ForUnitTestsOnly-PleaseChange
     expiration: 86400000
+    denylist:
+      redis-enabled: false
   analyzer:
     path: sourcelens-analyzer
     timeout-seconds: 30

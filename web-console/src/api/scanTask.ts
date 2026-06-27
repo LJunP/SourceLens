@@ -30,4 +30,6 @@ export const scanTaskApi = {
     client.get<Result<PageResult<ScanTask>>>(`/projects/${projectId}/scan-tasks`, { params: { page, pageSize } }),
   detail: (id: number) =>
     client.get<Result<ScanTask>>(`/scan-tasks/${id}`),
+  cancel: (id: number) =>
+    client.post<Result<ScanTask>>(`/scan-tasks/${id}/cancel`),
 }

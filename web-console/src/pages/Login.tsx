@@ -3,6 +3,7 @@ import { useNavigate, Link } from 'react-router-dom'
 import { Form, Input, Button, Card, message, Typography } from 'antd'
 import { UserOutlined, LockOutlined } from '@ant-design/icons'
 import { useAuth } from '../contexts/AuthContext'
+import { showApiError } from '../api/client'
 
 export default function Login() {
   const [loading, setLoading] = useState(false)
@@ -15,8 +16,8 @@ export default function Login() {
       await login(values.username, values.password)
       message.success('登录成功')
       navigate('/dashboard')
-    } catch (err: any) {
-      message.error(err.response?.data?.message || '登录失败')
+    } catch (error) {
+      showApiError(error, '登录失败')
     } finally {
       setLoading(false)
     }

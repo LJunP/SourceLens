@@ -55,9 +55,10 @@ export const agentTaskApi = {
     inputJson?: string
   }) => client.post<Result<AgentTask>>('/agent-tasks', data),
 
-  listByProject: (projectId: number, page = 1, pageSize = 20, status?: string) => {
+  listByProject: (projectId: number, page = 1, pageSize = 20, status?: string, scanTaskId?: number) => {
     const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
     if (status) params.set('status', status)
+    if (scanTaskId) params.set('scanTaskId', String(scanTaskId))
     return client.get<Result<PageResult<AgentTask>>>(`/projects/${projectId}/agent-tasks?${params}`)
   },
 

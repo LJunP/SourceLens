@@ -1,18 +1,39 @@
 # prod profile: 生产环境
 spring:
   datasource:
-    url: ${DB_URL:jdbc:mysql://localhost:3307/sourcelens}
-    username: ${DB_USERNAME:sourcelens}
-    password: ${DB_PASSWORD:sourcelens123}
-  redis:
-    host: ${REDIS_HOST:localhost}
-    port: ${REDIS_PORT:6379}
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT}
 
 sourcelens:
   jwt:
     secret: ${JWT_SECRET}
   workspace:
     base-path: ${SOURCELENS_WORKSPACE:/var/lib/sourcelens/repos}
+  repository:
+    allow-local-file: false
+    allow-pat-credentials: ${SOURCELENS_ALLOW_PAT_CREDENTIALS:false}
+  sandbox:
+    executor: ${SOURCELENS_SANDBOX_EXECUTOR:docker}
+    docker:
+      image: ${SOURCELENS_SANDBOX_DOCKER_IMAGE:alpine/git:latest@sha256:8d6ede0b29c666ac111c732468c4d758c1c08f054f211dd98f15d421a6ffab40}
+      memory: ${SOURCELENS_SANDBOX_DOCKER_MEMORY:512m}
+      cpus: ${SOURCELENS_SANDBOX_DOCKER_CPUS:1.0}
+      network: ${SOURCELENS_SANDBOX_DOCKER_NETWORK:none}
+      user: ${SOURCELENS_SANDBOX_DOCKER_USER:1000:1000}
+      pids-limit: ${SOURCELENS_SANDBOX_DOCKER_PIDS_LIMIT:256}
+      read-only-root: ${SOURCELENS_SANDBOX_DOCKER_READ_ONLY_ROOT:true}
+      tmpfs: ${SOURCELENS_SANDBOX_DOCKER_TMPFS:/tmp:rw,noexec,nosuid,size=64m}
   encrypt:
     password: ${ENCRYPT_PASSWORD}
     salt: ${ENCRYPT_SALT}
+
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false

@@ -14,9 +14,17 @@ use crate::models::{
 fn is_skipped_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | "node_modules" | "target" | "build" | "dist"
-            | ".idea" | ".vscode" | "__pycache__" | "vendor"
-            | ".gradle" | ".mvn"
+        ".git"
+            | "node_modules"
+            | "target"
+            | "build"
+            | "dist"
+            | ".idea"
+            | ".vscode"
+            | "__pycache__"
+            | "vendor"
+            | ".gradle"
+            | ".mvn"
     )
 }
 
@@ -109,7 +117,10 @@ fn detect_java_framework(repo_path: &Path) -> Option<FrameworkInfo> {
     for entry in walk_non_skipped(repo_path) {
         if entry.file_type().is_file() {
             let name = entry.file_name().to_string_lossy();
-            if name == "application.yml" || name == "application.yaml" || name == "application.properties" {
+            if name == "application.yml"
+                || name == "application.yaml"
+                || name == "application.properties"
+            {
                 let rp = rel_path(entry.path(), repo_path);
                 if rp.contains("resources") || rp.contains("config") {
                     evidence.push(format!("Found {}", rp));
@@ -255,7 +266,13 @@ fn detect_python_framework(repo_path: &Path) -> Option<FrameworkInfo> {
     let mut evidence = Vec::new();
 
     // 检查 requirements.txt / pyproject.toml / setup.py / Pipfile
-    let dep_files = ["requirements.txt", "pyproject.toml", "setup.py", "Pipfile", "poetry.lock"];
+    let dep_files = [
+        "requirements.txt",
+        "pyproject.toml",
+        "setup.py",
+        "Pipfile",
+        "poetry.lock",
+    ];
     let mut all_deps = String::new();
 
     for entry in walk_non_skipped(repo_path) {
@@ -361,7 +378,9 @@ fn detect_tsjs_framework(repo_path: &Path) -> Option<FrameworkInfo> {
                     });
                 }
                 // Next.js
-                if content.contains("next") && (content.contains("next.config") || content.contains("\"next\"")) {
+                if content.contains("next")
+                    && (content.contains("next.config") || content.contains("\"next\""))
+                {
                     evidence.push("package.json: next.js".to_string());
                     return Some(FrameworkInfo {
                         name: "Next.js".to_string(),
@@ -612,11 +631,17 @@ fn detect_java_directories(repo_path: &Path) -> ProjectDirectories {
                 match name.as_str() {
                     "controller" | "controllers" => dirs.controller_dir.push(rp),
                     "service" | "services" => dirs.service_dir.push(rp),
-                    "repository" | "repositories" | "repo" | "repos" => dirs.repository_dir.push(rp),
+                    "repository" | "repositories" | "repo" | "repos" => {
+                        dirs.repository_dir.push(rp)
+                    }
                     "mapper" | "mappers" | "dao" | "daos" => dirs.mapper_dir.push(rp),
-                    "entity" | "entities" | "model" | "models" | "domain" => dirs.entity_dir.push(rp),
+                    "entity" | "entities" | "model" | "models" | "domain" => {
+                        dirs.entity_dir.push(rp)
+                    }
                     "dto" | "dtos" | "vo" | "vos" | "request" | "response" => dirs.dto_dir.push(rp),
-                    "config" | "configuration" | "configs" | "configurations" => dirs.config_dir.push(rp),
+                    "config" | "configuration" | "configs" | "configurations" => {
+                        dirs.config_dir.push(rp)
+                    }
                     _ => {}
                 }
             }
@@ -624,7 +649,11 @@ fn detect_java_directories(repo_path: &Path) -> ProjectDirectories {
 
         let res_base = main_path.join("resources");
         if res_base.exists() {
-            for entry in WalkDir::new(&res_base).max_depth(4).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(&res_base)
+                .max_depth(4)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
                 if !entry.file_type().is_dir() {
                     continue;
                 }
@@ -651,7 +680,10 @@ fn detect_java_directories(repo_path: &Path) -> ProjectDirectories {
 }
 
 fn extract_request_method_from_inner(inner: &str) -> Option<String> {
-    let re = Regex::new(r#"(?:method\s*=\s*(?:RequestMethod\.(\w+)|\{[^}]*RequestMethod\.(\w+)[^}]*\}))"#).ok()?;
+    let re = Regex::new(
+        r#"(?:method\s*=\s*(?:RequestMethod\.(\w+)|\{[^}]*RequestMethod\.(\w+)[^}]*\}))"#,
+    )
+    .ok()?;
     let caps = re.captures(inner)?;
     caps.get(1)
         .or_else(|| caps.get(2))
@@ -773,7 +805,10 @@ fn extract_java_api_routes(
     routes
 }
 
-fn analyze_java_structure(repo_path: &Path, _framework: &Option<FrameworkInfo>) -> ProjectStructure {
+fn analyze_java_structure(
+    repo_path: &Path,
+    _framework: &Option<FrameworkInfo>,
+) -> ProjectStructure {
     let mut controllers = Vec::new();
     let mut services = Vec::new();
     let mut repositories = Vec::new();
@@ -786,7 +821,9 @@ fn analyze_java_structure(repo_path: &Path, _framework: &Option<FrameworkInfo>) 
 
     let let_re = Regex::new(r"@RestController|@Controller").unwrap();
     let svc_re = Regex::new(r"@Service").unwrap();
-    let repo_re = Regex::new(r"@Repository|extends BaseMapper|extends CrudRepository|extends JpaRepository").unwrap();
+    let repo_re =
+        Regex::new(r"@Repository|extends BaseMapper|extends CrudRepository|extends JpaRepository")
+            .unwrap();
     let entity_re = Regex::new(r"@Entity|@TableName|@Table\b").unwrap();
     let mapper_re = Regex::new(r"@Mapper|extends BaseMapper").unwrap();
     let config_re = Regex::new(r"@Configuration|@ConfigurationProperties").unwrap();
@@ -881,11 +918,7 @@ fn analyze_java_structure(repo_path: &Path, _framework: &Option<FrameworkInfo>) 
             let table_name = table_name_re
                 .captures(&content)
                 .map(|c| c[1].to_string())
-                .or_else(|| {
-                    entity_table_re
-                        .captures(&content)
-                        .map(|c| c[1].to_string())
-                });
+                .or_else(|| entity_table_re.captures(&content).map(|c| c[1].to_string()));
             let is_jpa_entity = content.contains("@Entity");
             if is_jpa_entity || table_name.is_some() {
                 db_entities.push(DbEntity {
@@ -906,7 +939,8 @@ fn analyze_java_structure(repo_path: &Path, _framework: &Option<FrameworkInfo>) 
     for ctrl in &controllers {
         let path = repo_path.join(&ctrl.file_path);
         if let Some(content) = read_file_str(&path) {
-            let routes = extract_java_api_routes(&content, &ctrl.name, &request_mapping_re, &mapping_re);
+            let routes =
+                extract_java_api_routes(&content, &ctrl.name, &request_mapping_re, &mapping_re);
             api_routes.extend(routes);
         }
     }
@@ -943,7 +977,8 @@ fn analyze_go_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> 
     let mut api_routes = Vec::new();
     let mut db_entities = Vec::new();
 
-    let handler_re = Regex::new(r#"(?:func\s+\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(.*\*gin\.Context\b"#).unwrap();
+    let handler_re =
+        Regex::new(r#"(?:func\s+\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(.*\*gin\.Context\b"#).unwrap();
     let http_handler_re = Regex::new(r"func\s+(\w+)\s*\([^)]*\*?(?:http\.ResponseWriter|gin\.Context|echo\.Context|fiber\.Ctx|context\.Context)").unwrap();
     let struct_re = Regex::new(r"^type\s+(\w+)\s+struct\s*\{").unwrap();
     let func_re = Regex::new(r"^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(").unwrap();
@@ -1013,17 +1048,15 @@ fn analyze_go_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> 
             controllers.push(class_info.clone());
 
             // 提取路由（Gin 风格: r.GET("/path", handler) 或 group.POST(...)）
-            let route_re = Regex::new(
-                r#"\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*"([^"]+)"\s*,"#
-            ).unwrap();
-            let group_route_re = Regex::new(
-                r#"(\w+)\s*:=\s*\w+\.Group\s*\(\s*"([^"]*)"\s*\)"#
-            ).unwrap();
-            let group_method_re = Regex::new(
-                r#"\.(\w+)\s*\(\s*"([^"]+)"\s*,"#
-            ).unwrap();
+            let route_re =
+                Regex::new(r#"\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*"([^"]+)"\s*,"#)
+                    .unwrap();
+            let group_route_re =
+                Regex::new(r#"(\w+)\s*:=\s*\w+\.Group\s*\(\s*"([^"]*)"\s*\)"#).unwrap();
+            let group_method_re = Regex::new(r#"\.(\w+)\s*\(\s*"([^"]+)"\s*,"#).unwrap();
 
-            let mut groups: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut groups: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
 
             for line in content.lines() {
                 // 直接路由
@@ -1074,12 +1107,19 @@ fn analyze_go_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> 
         let has_gorm = gorm_re.is_match(content);
         for cap in struct_re.captures_iter(content) {
             let struct_name = cap[1].to_string();
-            let field_count = content.lines().filter(|l| l.contains("json:") || l.contains("gorm:")).count();
+            let field_count = content
+                .lines()
+                .filter(|l| l.contains("json:") || l.contains("gorm:"))
+                .count();
             entities.push(ClassInfo {
                 name: struct_name.clone(),
                 file_path: rp.clone(),
                 package: None,
-                annotations: if has_gorm { vec!["GORM".to_string()] } else { Vec::new() },
+                annotations: if has_gorm {
+                    vec!["GORM".to_string()]
+                } else {
+                    Vec::new()
+                },
                 line_count,
                 method_count: 0,
             });
@@ -1098,7 +1138,10 @@ fn analyze_go_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> 
 
         // 按目录名分类
         let path_lower = rp.to_lowercase();
-        if path_lower.contains("service") || path_lower.contains("biz") || path_lower.contains("usecase") {
+        if path_lower.contains("service")
+            || path_lower.contains("biz")
+            || path_lower.contains("usecase")
+        {
             if !is_handler {
                 services.push(class_info.clone());
             }
@@ -1114,8 +1157,11 @@ fn analyze_go_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> 
     // 检查配置文件
     for entry in walk_non_skipped(repo_path) {
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name == "config.yaml" || name == "config.yml" || name == "config.json"
-            || name == "config.toml" || name == ".env"
+        if name == "config.yaml"
+            || name == "config.yml"
+            || name == "config.json"
+            || name == "config.toml"
+            || name == ".env"
         {
             config_files.push(rel_path(entry.path(), repo_path));
         }
@@ -1140,8 +1186,14 @@ fn analyze_go_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> 
 // Python 结构分析
 // ============================================================
 
-fn analyze_python_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> ProjectStructure {
-    let fw_name = framework.as_ref().map(|f| f.name.as_str()).unwrap_or("Python");
+fn analyze_python_structure(
+    repo_path: &Path,
+    framework: &Option<FrameworkInfo>,
+) -> ProjectStructure {
+    let fw_name = framework
+        .as_ref()
+        .map(|f| f.name.as_str())
+        .unwrap_or("Python");
 
     let mut controllers = Vec::new();
     let mut services = Vec::new();
@@ -1161,7 +1213,8 @@ fn analyze_python_structure(repo_path: &Path, framework: &Option<FrameworkInfo>)
     let django_model_re = Regex::new(r"models\.Model").unwrap();
 
     // FastAPI 路由
-    let fastapi_route_re = Regex::new(r#"@\w+\.(get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']"#).unwrap();
+    let fastapi_route_re =
+        Regex::new(r#"@\w+\.(get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']"#).unwrap();
     // Flask 路由
     let flask_route_re = Regex::new(r#"@\w+\.route\s*\(\s*["']([^"']+)["']"#).unwrap();
     let flask_method_re = Regex::new(r#"methods\s*=\s*\[([^\]]+)\]"#).unwrap();
@@ -1188,7 +1241,10 @@ fn analyze_python_structure(repo_path: &Path, framework: &Option<FrameworkInfo>)
         let method_count = func_re.captures_iter(&content).count();
 
         // 入口检测
-        if content.contains("if __name__") || content.contains("app = ") || content.contains("application = ") {
+        if content.contains("if __name__")
+            || content.contains("app = ")
+            || content.contains("application = ")
+        {
             entry_points.push(rp.clone());
         }
 
@@ -1236,13 +1292,26 @@ fn analyze_python_structure(repo_path: &Path, framework: &Option<FrameworkInfo>)
 
         // 按目录名分类
         let path_lower = rp.to_lowercase();
-        if path_lower.contains("view") || path_lower.contains("endpoint") || path_lower.contains("route") || path_lower.contains("handler") {
+        if path_lower.contains("view")
+            || path_lower.contains("endpoint")
+            || path_lower.contains("route")
+            || path_lower.contains("handler")
+        {
             controllers.push(class_info.clone());
-        } else if path_lower.contains("service") || path_lower.contains("biz") || path_lower.contains("usecase") {
+        } else if path_lower.contains("service")
+            || path_lower.contains("biz")
+            || path_lower.contains("usecase")
+        {
             services.push(class_info.clone());
-        } else if path_lower.contains("repo") || path_lower.contains("dao") || path_lower.contains("dal") {
+        } else if path_lower.contains("repo")
+            || path_lower.contains("dao")
+            || path_lower.contains("dal")
+        {
             repositories.push(class_info.clone());
-        } else if path_lower.contains("model") || path_lower.contains("entity") || path_lower.contains("schema") {
+        } else if path_lower.contains("model")
+            || path_lower.contains("entity")
+            || path_lower.contains("schema")
+        {
             entities.push(class_info.clone());
             // Pydantic / SQLAlchemy
             if pydantic_re.is_match(&content) || sqlalchemy_re.is_match(&content) {
@@ -1251,7 +1320,10 @@ fn analyze_python_structure(repo_path: &Path, framework: &Option<FrameworkInfo>)
                         class_name: file_name,
                         table_name: None,
                         file_path: rp,
-                        field_count: content.lines().filter(|l| l.contains("= Column(") || l.contains("= models.")).count(),
+                        field_count: content
+                            .lines()
+                            .filter(|l| l.contains("= Column(") || l.contains("= models."))
+                            .count(),
                         annotations: annotations,
                     });
                 }
@@ -1264,9 +1336,14 @@ fn analyze_python_structure(repo_path: &Path, framework: &Option<FrameworkInfo>)
     // 配置文件
     for entry in walk_non_skipped(repo_path) {
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name == "settings.py" || name == "config.py" || name == ".env"
-            || name == "config.yaml" || name == "config.yml" || name == "config.json"
-            || name == "pyproject.toml" || name == "setup.cfg"
+        if name == "settings.py"
+            || name == "config.py"
+            || name == ".env"
+            || name == "config.yaml"
+            || name == "config.yml"
+            || name == "config.json"
+            || name == "pyproject.toml"
+            || name == "setup.cfg"
         {
             config_files.push(rel_path(entry.path(), repo_path));
         }
@@ -1292,7 +1369,10 @@ fn analyze_python_structure(repo_path: &Path, framework: &Option<FrameworkInfo>)
 // ============================================================
 
 fn analyze_tsjs_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> ProjectStructure {
-    let fw_name = framework.as_ref().map(|f| f.name.as_str()).unwrap_or("Node.js");
+    let fw_name = framework
+        .as_ref()
+        .map(|f| f.name.as_str())
+        .unwrap_or("Node.js");
 
     let mut controllers = Vec::new();
     let mut services = Vec::new();
@@ -1309,13 +1389,18 @@ fn analyze_tsjs_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -
     let method_re = Regex::new(r"(?:public|private|protected|static|async)\s+(\w+)\s*\(").unwrap();
     let nestjs_controller_re = Regex::new(r#"@Controller\(([^)]*)\)"#).unwrap();
     let nestjs_get_re = Regex::new(r"@(Get|Post|Put|Delete|Patch)\(([^)]*)\)").unwrap();
-    let express_route_re = Regex::new(r#"\.(get|post|put|delete|patch)\s*\(\s*['"`]([^'"`]+)['"`]"#).unwrap();
+    let express_route_re =
+        Regex::new(r#"\.(get|post|put|delete|patch)\s*\(\s*['"`]([^'"`]+)['"`]"#).unwrap();
     let typeorm_re = Regex::new(r#"@Entity\(|@Column\(|@PrimaryGeneratedColumn"#).unwrap();
     let prisma_re = Regex::new(r#"model\s+\w+\s*\{"#).unwrap();
 
     // 收集 .ts/.js/.tsx/.jsx 文件
     for entry in walk_non_skipped(repo_path) {
-        let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("");
+        let ext = entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
         if !matches!(ext, "ts" | "tsx" | "js" | "jsx") {
             continue;
         }
@@ -1338,7 +1423,11 @@ fn analyze_tsjs_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -
             .collect();
 
         // 入口检测
-        if file_name == "index" || file_name == "main" || file_name == "app" || file_name == "server" {
+        if file_name == "index"
+            || file_name == "main"
+            || file_name == "app"
+            || file_name == "server"
+        {
             entry_points.push(rp.clone());
         }
 
@@ -1357,11 +1446,23 @@ fn analyze_tsjs_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -
                 controllers.push(class_info.clone());
                 for cap in nestjs_get_re.captures_iter(&content) {
                     let method = cap[1].to_uppercase();
-                    let path = cap[2].trim().trim_matches('\'').trim_matches('"').trim_matches('`').to_string();
+                    let path = cap[2]
+                        .trim()
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .trim_matches('`')
+                        .to_string();
                     let class_prefix = nestjs_controller_re
                         .captures(&content)
                         .and_then(|c| c.get(1))
-                        .map(|m| m.as_str().trim().trim_matches('\'').trim_matches('"').trim_matches('`').to_string())
+                        .map(|m| {
+                            m.as_str()
+                                .trim()
+                                .trim_matches('\'')
+                                .trim_matches('"')
+                                .trim_matches('`')
+                                .to_string()
+                        })
                         .unwrap_or_default();
                     let full_path = combine_paths(&class_prefix, &path);
                     if !full_path.is_empty() {
@@ -1394,13 +1495,20 @@ fn analyze_tsjs_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -
 
         // 目录分类
         let path_lower = rp.to_lowercase();
-        if path_lower.contains("controller") || path_lower.contains("handler") || path_lower.contains("resolver") {
+        if path_lower.contains("controller")
+            || path_lower.contains("handler")
+            || path_lower.contains("resolver")
+        {
             controllers.push(class_info.clone());
         } else if path_lower.contains("service") || path_lower.contains("usecase") {
             services.push(class_info.clone());
         } else if path_lower.contains("repository") || path_lower.contains("dao") {
             repositories.push(class_info.clone());
-        } else if path_lower.contains("model") || path_lower.contains("entity") || path_lower.contains("type") || path_lower.contains("interface") {
+        } else if path_lower.contains("model")
+            || path_lower.contains("entity")
+            || path_lower.contains("type")
+            || path_lower.contains("interface")
+        {
             entities.push(class_info.clone());
             if typeorm_re.is_match(&content) || prisma_re.is_match(&content) {
                 // TypeORM 实体
@@ -1413,8 +1521,12 @@ fn analyze_tsjs_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -
     // Config file
     for entry in walk_non_skipped(repo_path) {
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name == "tsconfig.json" || name == ".eslintrc.js" || name == ".eslintrc.json"
-            || name == "next.config.js" || name == "nest-cli.json" || name == ".env"
+        if name == "tsconfig.json"
+            || name == ".eslintrc.js"
+            || name == ".eslintrc.json"
+            || name == "next.config.js"
+            || name == "nest-cli.json"
+            || name == ".env"
             || name == "docker-compose.yml"
         {
             config_files.push(rel_path(entry.path(), repo_path));
@@ -1441,7 +1553,10 @@ fn analyze_tsjs_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -
 // ============================================================
 
 fn analyze_rust_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -> ProjectStructure {
-    let fw_name = framework.as_ref().map(|f| f.name.as_str()).unwrap_or("Rust");
+    let fw_name = framework
+        .as_ref()
+        .map(|f| f.name.as_str())
+        .unwrap_or("Rust");
 
     let mut controllers = Vec::new();
     let mut services = Vec::new();
@@ -1460,7 +1575,8 @@ fn analyze_rust_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -
     let _trait_re = Regex::new(r"^pub\s+trait\s+(\w+)").unwrap();
 
     // Axum 路由
-    let _axum_route_re = Regex::new(r#"\.(get|post|put|delete|patch|route)\s*\(\s*"[^"]*""#).unwrap();
+    let _axum_route_re =
+        Regex::new(r#"\.(get|post|put|delete|patch|route)\s*\(\s*"[^"]*""#).unwrap();
     // Actix 路由
     let actix_route_re = Regex::new(r#"#\[(get|post|put|delete|patch)\s*\(\s*"([^"]+)""#).unwrap();
     // Rocket 路由
@@ -1534,16 +1650,33 @@ fn analyze_rust_structure(repo_path: &Path, framework: &Option<FrameworkInfo>) -
 
         // 目录分类
         let path_lower = rp.to_lowercase();
-        if path_lower.contains("handler") || path_lower.contains("controller") || path_lower.contains("route") || path_lower.contains("api") {
+        if path_lower.contains("handler")
+            || path_lower.contains("controller")
+            || path_lower.contains("route")
+            || path_lower.contains("api")
+        {
             controllers.push(class_info.clone());
-        } else if path_lower.contains("service") || path_lower.contains("biz") || path_lower.contains("usecase") {
+        } else if path_lower.contains("service")
+            || path_lower.contains("biz")
+            || path_lower.contains("usecase")
+        {
             services.push(class_info.clone());
-        } else if path_lower.contains("repository") || path_lower.contains("repo") || path_lower.contains("dao") {
+        } else if path_lower.contains("repository")
+            || path_lower.contains("repo")
+            || path_lower.contains("dao")
+        {
             repositories.push(class_info.clone());
-        } else if path_lower.contains("model") || path_lower.contains("entity") || path_lower.contains("schema") {
+        } else if path_lower.contains("model")
+            || path_lower.contains("entity")
+            || path_lower.contains("schema")
+        {
             entities.push(class_info.clone());
             // struct 带 serde/diesel/sqlx 可能是数据模型
-            if content.contains("#[derive(") && (content.contains("Serialize") || content.contains("Queryable") || content.contains("FromRow")) {
+            if content.contains("#[derive(")
+                && (content.contains("Serialize")
+                    || content.contains("Queryable")
+                    || content.contains("FromRow"))
+            {
                 db_entities.push(DbEntity {
                     class_name: file_name,
                     table_name: None,
@@ -1636,7 +1769,10 @@ fn detect_risks(structure: &ProjectStructure, _all_classes: &[&ClassInfo]) -> Ve
             risks.push(RiskItem {
                 severity: "HIGH".to_string(),
                 category: "Controller too large".to_string(),
-                message: format!("{}  has  {}  lines, consider splitting", ctrl.name, ctrl.line_count),
+                message: format!(
+                    "{}  has  {}  lines, consider splitting",
+                    ctrl.name, ctrl.line_count
+                ),
                 file_path: Some(ctrl.file_path.clone()),
                 evidence: Some(format!("{} lines", ctrl.line_count)),
             });
@@ -1648,7 +1784,10 @@ fn detect_risks(structure: &ProjectStructure, _all_classes: &[&ClassInfo]) -> Ve
             risks.push(RiskItem {
                 severity: "MEDIUM".to_string(),
                 category: "Service too many methods".to_string(),
-                message: format!("{}  has  {}  methods, consider splitting", svc.name, svc.method_count),
+                message: format!(
+                    "{}  has  {}  methods, consider splitting",
+                    svc.name, svc.method_count
+                ),
                 file_path: Some(svc.file_path.clone()),
                 evidence: Some(format!("{} methods", svc.method_count)),
             });
@@ -1660,7 +1799,8 @@ fn detect_risks(structure: &ProjectStructure, _all_classes: &[&ClassInfo]) -> Ve
         // skip for Go/Rust/Python/TS projects that do not use src/main structure
     }
 
-    if !structure.services.is_empty() && structure.controllers.len() > structure.services.len() * 3 {
+    if !structure.services.is_empty() && structure.controllers.len() > structure.services.len() * 3
+    {
         risks.push(RiskItem {
             severity: "MEDIUM".to_string(),
             category: "Module ratio imbalance".to_string(),
@@ -1679,7 +1819,10 @@ fn detect_risks(structure: &ProjectStructure, _all_classes: &[&ClassInfo]) -> Ve
             risks.push(RiskItem {
                 severity: "MEDIUM".to_string(),
                 category: "Entity too large".to_string(),
-                message: format!("{}  has  {}  lines,  too many fields, consider splitting", entity.name, entity.line_count),
+                message: format!(
+                    "{}  has  {}  lines,  too many fields, consider splitting",
+                    entity.name, entity.line_count
+                ),
                 file_path: Some(entity.file_path.clone()),
                 evidence: Some(format!("{} lines", entity.line_count)),
             });
@@ -1696,12 +1839,17 @@ fn detect_risks(structure: &ProjectStructure, _all_classes: &[&ClassInfo]) -> Ve
             if let Some(content) = read_file_str(full_path) {
                 let lower = content.to_lowercase();
                 if lower.contains("password")
-                    && (lower.contains("${") || lower.contains("default") || lower.contains("secret"))
+                    && (lower.contains("${")
+                        || lower.contains("default")
+                        || lower.contains("secret"))
                 {
                     risks.push(RiskItem {
                         severity: "MEDIUM".to_string(),
                         category: "Config Security".to_string(),
-                        message: format!("Config file {}  may contain hardcoded or default passwords", config),
+                        message: format!(
+                            "Config file {}  may contain hardcoded or default passwords",
+                            config
+                        ),
                         file_path: Some(config.clone()),
                         evidence: Some("password keyword detected".to_string()),
                     });

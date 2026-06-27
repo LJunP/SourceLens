@@ -18,6 +18,9 @@ import java.util.stream.Collectors;
 @Component
 public class GetSymbolsTool implements AgentTool {
 
+    private static final int DEFAULT_LIMIT = 50;
+    private static final int MAX_LIMIT = 100;
+
     private final ScanTaskMapper scanTaskMapper;
     private final CodeSymbolMapper symbolMapper;
     private final CodeRelationMapper relationMapper;
@@ -72,21 +75,21 @@ public class GetSymbolsTool implements AgentTool {
 
         String query = args.get("query") != null ? (String) args.get("query") : null;
         String kind = args.get("kind") != null ? (String) args.get("kind") : null;
-        int limit = args.containsKey("limit") ? ((Number) args.get("limit")).intValue() : 50;
+        int limit = AgentToolArgumentUtils.boundedInt(args.get("limit"), DEFAULT_LIMIT, 1, MAX_LIMIT);
 
-        // 找到该项目最新的扫描任务
-        ScanTask latestScan = scanTaskMapper.selectOne(
-                new LambdaQueryWrapper<ScanTask>()
-                        .eq(ScanTask::getProjectId, projectId)
-                        .eq(ScanTask::getStatus, "SUCCESS")
-                        .orderByDesc(ScanTask::getId)
-                        .last("LIMIT 1"));
-
-        if (latestScan == null) {
+        ScanTask scanTask = resolveScanTask(projectId, context.getScanTaskId());
+        if (scanTask == null) {
             return ToolResult.ok("该项目尚无成功的扫描结果。请先运行代码扫描。");
         }
 
-        Long scanTaskId = latestScan.getId();
+        if (!projectId.equals(scanTask.getProjectId())) {
+            return ToolResult.fail("扫描任务不属于当前项目");
+        }
+        if (!"SUCCESS".equals(scanTask.getStatus())) {
+            return ToolResult.ok("指定扫描任务 #" + scanTask.getId() + " 尚未成功完成，无法读取符号图谱。");
+        }
+
+        Long scanTaskId = scanTask.getId();
 
         // 查询符号
         LambdaQueryWrapper<CodeSymbol> symbolWrapper = new LambdaQueryWrapper<CodeSymbol>()
@@ -129,4 +132,17 @@ public class GetSymbolsTool implements AgentTool {
 
         return ToolResult.ok(sb.toString());
     }
+
+    private ScanTask resolveScanTask(Long projectId, Long requestedScanTaskId) {
+        if (requestedScanTaskId != null) {
+            return scanTaskMapper.selectById(requestedScanTaskId);
+        }
+        return scanTaskMapper.selectOne(
+                new LambdaQueryWrapper<ScanTask>()
+                        .eq(ScanTask::getProjectId, projectId)
+                        .eq(ScanTask::getStatus, "SUCCESS")
+                        .orderByDesc(ScanTask::getId)
+                        .last("LIMIT 1"));
+    }
+
 }

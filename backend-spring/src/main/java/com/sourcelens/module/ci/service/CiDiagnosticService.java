@@ -5,9 +5,18 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sourcelens.common.exception.BizException;
+import com.sourcelens.common.security.SensitiveDataSanitizer;
+import com.sourcelens.module.agent.entity.LlmConfig;
+import com.sourcelens.module.agent.service.LlmClient;
+import com.sourcelens.module.agent.service.LlmConfigService;
+import com.sourcelens.module.agent.service.LlmJsonExtractor;
+import com.sourcelens.module.agent.service.PromptInjectionGuard;
 import com.sourcelens.module.ci.dto.CreateCiDiagnosticRequest;
 import com.sourcelens.module.ci.entity.CiDiagnostic;
 import com.sourcelens.module.ci.mapper.CiDiagnosticMapper;
+import com.sourcelens.module.execution.entity.ExecutionAttempt;
+import com.sourcelens.module.execution.entity.ExecutionTask;
+import com.sourcelens.module.execution.service.ExecutionTaskService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
@@ -19,7 +28,25 @@ import java.util.*;
 @Service
 public class CiDiagnosticService extends ServiceImpl<CiDiagnosticMapper, CiDiagnostic> {
 
+    private static final int MAX_TEXT_FIELD_LENGTH = 8_000;
+    private static final int MAX_JSON_FIELD_LENGTH = 16_000;
+    private static final int MAX_ERROR_LENGTH = 4_000;
+
+    private final LlmClient llmClient;
+    private final LlmConfigService llmConfigService;
+    private final LlmJsonExtractor llmJsonExtractor;
+    private final ExecutionTaskService executionTaskService;
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public CiDiagnosticService(LlmClient llmClient,
+                               LlmConfigService llmConfigService,
+                               LlmJsonExtractor llmJsonExtractor,
+                               ExecutionTaskService executionTaskService) {
+        this.llmClient = llmClient;
+        this.llmConfigService = llmConfigService;
+        this.llmJsonExtractor = llmJsonExtractor;
+        this.executionTaskService = executionTaskService;
+    }
 
     public CiDiagnostic create(CreateCiDiagnosticRequest req, Long userId) {
         CiDiagnostic diag = CiDiagnostic.builder()
@@ -35,11 +62,29 @@ public class CiDiagnosticService extends ServiceImpl<CiDiagnosticMapper, CiDiagn
                 .commitMessage(req.getCommitMessage())
                 .status("PENDING")
                 .conclusion(req.getConclusion())
-                .rawLogSnippet(req.getRawLogSnippet())
+                .rawLogSnippet(sanitizeText(req.getRawLogSnippet()))
                 .createdBy(userId)
                 .build();
         save(diag);
+        executionTaskService.create(diag.getProjectId(), diag.getRepositoryId(), "CI_DIAGNOSTIC",
+                "CI_DIAGNOSTIC", diag.getId(), userId);
         log.info("创建 CI 诊断: id={}, workflow={}", diag.getId(), diag.getWorkflowName());
+        return diag;
+    }
+
+    public CiDiagnostic requeueAnalysis(Long diagnosticId) {
+        CiDiagnostic diag = getDetail(diagnosticId);
+        if ("ANALYZING".equals(diag.getStatus())) {
+            throw BizException.badRequest("CI 诊断正在分析中，请勿重复触发");
+        }
+        diag.setStatus("PENDING");
+        diag.setErrorMessage(null);
+        diag.setUpdatedAt(LocalDateTime.now());
+        updateById(diag);
+        ExecutionTask executionTask = getOrCreateExecutionTask(diag);
+        if (executionTask != null) {
+            executionTaskService.startNewAttempt(executionTask.getId());
+        }
         return diag;
     }
 
@@ -47,33 +92,138 @@ public class CiDiagnosticService extends ServiceImpl<CiDiagnosticMapper, CiDiagn
     public void analyze(Long diagnosticId) {
         CiDiagnostic diag = getById(diagnosticId);
         if (diag == null) return;
+        if (!claimAnalysis(diagnosticId)) {
+            log.info("跳过 CI 诊断分析，状态已变化或正在分析: id={}", diagnosticId);
+            return;
+        }
+        diag.setStatus("ANALYZING");
+        ExecutionTask executionTask = getOrCreateExecutionTask(diag);
+        ExecutionAttempt attempt = executionTask == null ? null : executionTaskService.getOrCreateCurrentAttempt(executionTask.getId());
+        Long attemptId = attempt == null ? null : attempt.getId();
+        startExecutionStep(attemptId, "analyze_ci_failure", "分析 CI 失败日志");
 
         try {
-            diag.setStatus("ANALYZING");
-            updateById(diag);
+            Map<String, Object> result = null;
 
-            // 分析逻辑(规则引擎, 后续接入 LLM)
-            String logSnippet = diag.getRawLogSnippet();
-            Map<String, Object> result = analyzeFailure(diag.getConclusion(), logSnippet, diag.getCommitMessage());
+            // 尝试获取激活的大模型配置
+            LlmConfig llmConfig = null;
+            if (diag.getCreatedBy() != null) {
+                try {
+                    llmConfig = llmConfigService.getActiveConfig(diag.getCreatedBy());
+                } catch (Exception e) {
+                    log.warn("获取激活的 LLM 配置失败, 将使用规则引擎进行 CI 诊断 fallback: {}", e.getMessage());
+                }
+            }
+
+            if (llmConfig != null) {
+                log.info("使用大模型进行 CI 诊断: configId={}, model={}", llmConfig.getId(), llmConfig.getModelName());
+                try {
+                    result = analyzeFailureWithLlm(diag, llmConfig);
+                } catch (Exception e) {
+                    log.error("大模型 CI 诊断失败, 将使用规则引擎进行 CI 诊断 fallback", e);
+                }
+            }
+
+            if (result == null) {
+                log.info("使用规则引擎进行 CI 诊断");
+                result = analyzeFailure(diag.getConclusion(), diag.getRawLogSnippet(), diag.getCommitMessage());
+            }
 
             diag.setErrorCategory((String) result.get("errorCategory"));
-            diag.setFailureSummary((String) result.get("failureSummary"));
-            diag.setRootCause((String) result.get("rootCause"));
+            diag.setFailureSummary(sanitizeText((String) result.get("failureSummary")));
+            diag.setRootCause(sanitizeText((String) result.get("rootCause")));
             diag.setRelatedFiles(toJson(result.get("relatedFiles")));
             diag.setFixSuggestions(toJson(result.get("fixSuggestions")));
             diag.setDiagnosticJson(toJson(result));
             diag.setStatus("COMPLETED");
             diag.setUpdatedAt(LocalDateTime.now());
             updateById(diag);
+            completeExecutionStep(attemptId, "analyze_ci_failure", "CI 诊断完成: " + diag.getErrorCategory());
+            markExecutionSuccess(attemptId, "analyze_ci_failure");
 
             log.info("CI 诊断完成: id={}, category={}", diagnosticId, diag.getErrorCategory());
         } catch (Exception e) {
             log.error("CI 诊断失败: id={}", diagnosticId, e);
             diag.setStatus("FAILED");
-            diag.setErrorMessage(e.getMessage());
+            diag.setErrorMessage(sanitizeError(e.getMessage()));
             diag.setUpdatedAt(LocalDateTime.now());
             updateById(diag);
+            failExecutionStep(attemptId, "analyze_ci_failure", e.getMessage());
+            markExecutionFailed(attemptId, "analyze_ci_failure", e.getMessage());
         }
+    }
+
+    private ExecutionTask getOrCreateExecutionTask(CiDiagnostic diag) {
+        ExecutionTask executionTask = executionTaskService.findBySource("CI_DIAGNOSTIC", diag.getId());
+        if (executionTask != null) {
+            return executionTask;
+        }
+        return executionTaskService.create(diag.getProjectId(), diag.getRepositoryId(), "CI_DIAGNOSTIC",
+                "CI_DIAGNOSTIC", diag.getId(), diag.getCreatedBy());
+    }
+
+    private void startExecutionStep(Long attemptId, String stepKey, String stepName) {
+        if (attemptId != null) {
+            executionTaskService.startAttemptStep(attemptId, stepKey, stepName);
+        }
+    }
+
+    private void completeExecutionStep(Long attemptId, String stepKey, String summary) {
+        if (attemptId != null) {
+            executionTaskService.completeAttemptStep(attemptId, stepKey, summary);
+        }
+    }
+
+    private void failExecutionStep(Long attemptId, String stepKey, String errorMessage) {
+        if (attemptId != null) {
+            executionTaskService.failAttemptStep(attemptId, stepKey, errorMessage);
+        }
+    }
+
+    private void markExecutionSuccess(Long attemptId, String currentStep) {
+        if (attemptId != null) {
+            executionTaskService.markAttemptSuccess(attemptId, currentStep);
+        }
+    }
+
+    private void markExecutionFailed(Long attemptId, String currentStep, String errorMessage) {
+        if (attemptId != null) {
+            executionTaskService.markAttemptFailed(attemptId, currentStep, errorMessage);
+        }
+    }
+
+    private boolean claimAnalysis(Long diagnosticId) {
+        CiDiagnostic update = new CiDiagnostic();
+        update.setStatus("ANALYZING");
+        update.setErrorMessage(null);
+        update.setUpdatedAt(LocalDateTime.now());
+        return update(update, new LambdaQueryWrapper<CiDiagnostic>()
+                .eq(CiDiagnostic::getId, diagnosticId)
+                .eq(CiDiagnostic::getStatus, "PENDING"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> analyzeFailureWithLlm(CiDiagnostic diag, LlmConfig config) {
+        String prompt = "You are a senior DevOps engineer and developer. Analyze the following CI workflow run failure log, categorize the error, and provide a clear diagnosis and fix suggestions.\n" +
+                PromptInjectionGuard.systemBoundaryInstructions() + "\n" +
+                PromptInjectionGuard.wrapUntrustedContent("ci workflow name", diag.getWorkflowName()) +
+                PromptInjectionGuard.wrapUntrustedContent("ci conclusion", diag.getConclusion() != null ? diag.getConclusion() : "failure") +
+                PromptInjectionGuard.wrapUntrustedContent("ci commit message", diag.getCommitMessage()) +
+                PromptInjectionGuard.wrapUntrustedContent("ci log snippet", diag.getRawLogSnippet()) + "\n" +
+                "Analyze and output a structured JSON response matching the following schema (do not wrap in extra explanation or markdown block code formatting):\n" +
+                "{\n" +
+                "  \"errorCategory\": \"COMPILE | TEST | DEPENDENCY | LINT | DOCKER | ENV | UNKNOWN\",\n" +
+                "  \"failureSummary\": \"Brief summary of the build failure\",\n" +
+                "  \"rootCause\": \"Deep dive into the root cause of the error\",\n" +
+                "  \"relatedFiles\": [\"list of files causing or related to the failure\"],\n" +
+                "  \"fixSuggestions\": [\"Actionable step-by-step instructions to fix the error\"]\n" +
+                "}";
+
+        String response = llmClient.chat(config, prompt);
+        return llmJsonExtractor.extractRequiredObject(
+                response,
+                Set.of("errorCategory", "failureSummary"),
+                "CI_DIAGNOSTIC");
     }
 
     private Map<String, Object> analyzeFailure(String conclusion, String logSnippet, String commitMessage) {
@@ -367,9 +517,21 @@ public class CiDiagnosticService extends ServiceImpl<CiDiagnosticMapper, CiDiagn
     private String toJson(Object obj) {
         if (obj == null) return null;
         try {
-            return objectMapper.writeValueAsString(obj);
+            return sanitizeJson(objectMapper.writeValueAsString(obj));
         } catch (Exception e) {
-            return String.valueOf(obj);
+            return sanitizeJson(String.valueOf(obj));
         }
+    }
+
+    private String sanitizeText(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_TEXT_FIELD_LENGTH);
+    }
+
+    private String sanitizeJson(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_JSON_FIELD_LENGTH);
+    }
+
+    private String sanitizeError(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_ERROR_LENGTH);
     }
 }

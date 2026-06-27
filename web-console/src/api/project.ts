@@ -1,5 +1,6 @@
 import client from './client'
 import type { Result } from './client'
+import type { CodeChunkEvidenceProfile, CodeChunkSearchItem } from './codeChunk'
 
 export interface Project {
   id: number
@@ -20,6 +21,20 @@ export interface PageResult<T> {
   total: number
 }
 
+export interface CodeQaResponse {
+  answer: string
+  scanTaskId: number | null
+  question: string
+  matchedChunks: number
+  resultCount: number
+  retrievalMode?: string
+  totalChunks: number
+  embeddedChunks: number
+  truncated: boolean
+  evidenceProfile?: CodeChunkEvidenceProfile
+  retrievedChunks: CodeChunkSearchItem[]
+}
+
 export const projectApi = {
   list: (page = 1, pageSize = 20) =>
     client.get<Result<PageResult<Project>>>('/projects', { params: { page, pageSize } }),
@@ -31,4 +46,9 @@ export const projectApi = {
     client.put<Result<Project>>(`/projects/${id}`, data),
   delete: (id: number) =>
     client.delete<Result<void>>(`/projects/${id}`),
+  codeQa: (projectId: number, question: string, scanTaskId?: number | null) =>
+    client.post<Result<CodeQaResponse>>(`/projects/${projectId}/qa`, {
+      question,
+      ...(scanTaskId ? { scanTaskId } : {}),
+    }),
 }

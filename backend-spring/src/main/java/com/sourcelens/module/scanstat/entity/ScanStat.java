@@ -32,6 +32,8 @@ public class ScanStat {
     private Long latestControllers;
     private Long latestServices;
     private Long latestRiskCount;
+    private Long latestCodeChunks;
+    private Long latestEmbeddedChunks;
     /** 语言分布 JSON: [{"name":"Java","files":10,"lines":5000},...] */
     private String languagesJson;
 }

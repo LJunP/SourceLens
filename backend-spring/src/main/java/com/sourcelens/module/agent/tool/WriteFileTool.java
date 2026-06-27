@@ -1,10 +1,14 @@
 package com.sourcelens.module.agent.tool;
 
+import com.sourcelens.module.sandbox.SandboxCommand;
+import com.sourcelens.module.sandbox.SandboxExecutor;
 import lombok.extern.slf4j.Slf4j;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.nio.file.*;
+import java.time.Duration;
 import java.util.*;
 
 /**
@@ -13,7 +17,10 @@ import java.util.*;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class WriteFileTool implements AgentTool {
+
+    private final SandboxExecutor sandboxExecutor;
 
     @Override
     public String name() {
@@ -47,6 +54,11 @@ public class WriteFileTool implements AgentTool {
     }
 
     @Override
+    public ToolPermissionLevel permissionLevel() {
+        return ToolPermissionLevel.WRITE_PATCH;
+    }
+
+    @Override
     public ToolResult execute(Map<String, Object> args, ToolContext context) {
         String relPath = (String) args.get("path");
         String content = (String) args.get("content");
@@ -55,8 +67,9 @@ public class WriteFileTool implements AgentTool {
             return ToolResult.fail("项目根目录未设置");
         }
 
-        Path filePath = Path.of(context.getProjectRootPath(), relPath);
-        if (!filePath.startsWith(context.getProjectRootPath())) {
+        Path rootPath = Path.of(context.getProjectRootPath()).toAbsolutePath().normalize();
+        Path filePath = Path.of(context.getProjectRootPath(), relPath).toAbsolutePath().normalize();
+        if (!filePath.startsWith(rootPath)) {
             return ToolResult.fail("路径越界,不允许写入项目目录外的文件");
         }
 
@@ -83,16 +96,17 @@ public class WriteFileTool implements AgentTool {
             Path root = Path.of(projectRoot);
             if (!Files.exists(root.resolve(".git"))) return;
 
-            new ProcessBuilder("git", "add", filePath)
-                    .directory(root.toFile())
-                    .start()
-                    .waitFor();
+            sandboxExecutor.execute(SandboxCommand.builder()
+                    .command(List.of("git", "add", filePath))
+                    .workingDirectory(root)
+                    .timeout(Duration.ofSeconds(15))
+                    .build());
 
-            Process commit = new ProcessBuilder("git", "commit", "-m", "agent-checkpoint: before write " + filePath, "--allow-empty")
-                    .directory(root.toFile())
-                    .redirectErrorStream(true)
-                    .start();
-            commit.waitFor();
+            sandboxExecutor.execute(SandboxCommand.builder()
+                    .command(List.of("git", "commit", "-m", "agent-checkpoint: before write " + filePath, "--allow-empty"))
+                    .workingDirectory(root)
+                    .timeout(Duration.ofSeconds(30))
+                    .build());
         } catch (Exception e) {
             log.debug("git checkpoint 失败(非致命): {}", e.getMessage());
         }

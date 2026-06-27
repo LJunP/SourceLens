@@ -1,3 +1,4 @@
+mod ast_extractor;
 mod framework;
 mod models;
 mod reverse;
@@ -8,7 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use framework::{analyze_code_quality, analyze_structure, detect_framework};
-use models::ScanResult;
+use models::{ScanResult, SCAN_RESULT_SCHEMA_VERSION};
 use reverse::analyze_symbols;
 use scanner::build_file_tree;
 
@@ -44,25 +45,16 @@ fn main() {
     match cli.command {
         Commands::Scan { repo_path } => {
             if !repo_path.exists() {
-                eprintln!(
-                    "{{\"error\": \"路径不存在: {}\"}}",
-                    repo_path.display()
-                );
+                eprintln!("{{\"error\": \"路径不存在: {}\"}}", repo_path.display());
                 std::process::exit(1);
             }
 
             if !repo_path.is_dir() {
-                eprintln!(
-                    "{{\"error\": \"路径不是目录: {}\"}}",
-                    repo_path.display()
-                );
+                eprintln!("{{\"error\": \"路径不是目录: {}\"}}", repo_path.display());
                 std::process::exit(1);
             }
 
-            eprintln!(
-                "[SourceLens Analyzer] 开始扫描: {}",
-                repo_path.display()
-            );
+            eprintln!("[SourceLens Analyzer] 开始扫描: {}", repo_path.display());
 
             // 1. 构建文件树 + 语言统计
             let (file_tree, language_stats) = build_file_tree(&repo_path);
@@ -83,9 +75,7 @@ fn main() {
                     fw.name, fw.version
                 );
             } else {
-                eprintln!(
-                    "[SourceLens Analyzer] 未检测到特定框架, 将进行通用分析"
-                );
+                eprintln!("[SourceLens Analyzer] 未检测到特定框架, 将进行通用分析");
             }
 
             // 3. 项目结构分析（多语言）
@@ -124,6 +114,7 @@ fn main() {
 
             // 6. 组装结果
             let result = ScanResult {
+                scan_result_schema_version: SCAN_RESULT_SCHEMA_VERSION,
                 repo_path: repo_path.to_string_lossy().to_string(),
                 language: primary_language,
                 file_tree,

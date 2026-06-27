@@ -49,6 +49,12 @@ public class GraphService {
     public Map<String, Object> getDependencyGraph(Long scanTaskId) {
         List<CodeSymbol> symbols = listSymbols(scanTaskId, null);
         List<CodeRelationEntity> relations = listRelations(scanTaskId, null);
+        Map<String, CodeSymbol> symbolIndex = symbols.stream()
+                .collect(Collectors.toMap(
+                        CodeSymbol::getSymbolId,
+                        symbol -> symbol,
+                        (first, ignored) -> first,
+                        LinkedHashMap::new));
 
         // 构建节点集合
         Set<String> seenIds = new LinkedHashSet<>();
@@ -57,10 +63,7 @@ public class GraphService {
         for (CodeRelationEntity rel : relations) {
             for (String id : Arrays.asList(rel.getSourceId(), rel.getTargetId())) {
                 if (seenIds.add(id)) {
-                    CodeSymbol sym = symbols.stream()
-                            .filter(s -> id.equals(s.getSymbolId()))
-                            .findFirst().orElse(null);
-                    nodes.add(buildNode(id, sym));
+                    nodes.add(buildNode(id, symbolIndex.get(id)));
                 }
             }
         }

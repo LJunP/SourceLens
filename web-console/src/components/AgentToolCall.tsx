@@ -25,79 +25,49 @@ export default function AgentToolCall({ name, arguments: args, result, success }
 
   const label = TOOL_LABELS[name] || name
   const summary = buildSummary(name, args)
+  const statusClass = success === false ? 'failed' : success === true ? 'success' : 'pending'
+  const resultPreview = result && result.length > 3000 ? result.slice(0, 3000) + '\n...(截断)' : result
 
   return (
-    <div style={{
-      margin: '6px 0',
-      border: '1px solid #e8e8e8',
-      borderRadius: 8,
-      overflow: 'hidden',
-      fontSize: 13,
-    }}>
-      {/* 标题行 */}
-      <div
+    <div className={`sl-agent-tool-call sl-agent-tool-call-${statusClass}`}>
+      <button
+        type="button"
+        className="sl-agent-tool-call-head"
+        aria-expanded={expanded}
         onClick={() => setExpanded(!expanded)}
-        style={{
-          padding: '6px 10px',
-          background: '#fafafa',
-          cursor: 'pointer',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          userSelect: 'none',
-        }}
       >
-        <span style={{ color: '#999', fontSize: 10 }}>
+        <span className="sl-agent-tool-call-toggle">
           {expanded ? <DownOutlined /> : <RightOutlined />}
         </span>
-        <CodeOutlined style={{ color: '#1677ff' }} />
-        <Text strong style={{ fontSize: 12 }}>{label}</Text>
-        <Text type="secondary" style={{ fontSize: 11, flex: 1, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
+        <CodeOutlined className="sl-agent-tool-call-icon" />
+        <Text strong className="sl-agent-tool-call-label">{label}</Text>
+        <Text type="secondary" className="sl-agent-tool-call-summary">
           {summary}
         </Text>
-        {success !== undefined && (
-          success
-            ? <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 12 }} />
-            : <CloseCircleOutlined style={{ color: '#ff4d4f', fontSize: 12 }} />
+        {success === undefined ? (
+          <Tag>等待结果</Tag>
+        ) : success ? (
+          <CheckCircleOutlined className="sl-agent-tool-call-success-icon" />
+        ) : (
+          <CloseCircleOutlined className="sl-agent-tool-call-failed-icon" />
         )}
-      </div>
+      </button>
 
-      {/* 展开内容 */}
       {expanded && (
-        <div style={{ padding: '8px 10px', borderTop: '1px solid #f0f0f0' }}>
-          <div style={{ marginBottom: 6 }}>
-            <Text type="secondary" style={{ fontSize: 11 }}>参数</Text>
-            <pre style={{
-              margin: '4px 0 0',
-              padding: 8,
-              background: '#f6f6f6',
-              borderRadius: 4,
-              fontSize: 12,
-              lineHeight: 1.5,
-              overflow: 'auto',
-              maxHeight: 200,
-            }}>
+        <div className="sl-agent-tool-call-body">
+          <div className="sl-agent-tool-call-block">
+            <Text type="secondary">参数</Text>
+            <pre>
               {JSON.stringify(args, null, 2)}
             </pre>
           </div>
           {result !== null && (
-            <div>
-              <Text type="secondary" style={{ fontSize: 11 }}>
-                结果 {success === false && <Tag color="error" style={{ marginLeft: 4, fontSize: 10 }}>失败</Tag>}
+            <div className="sl-agent-tool-call-block">
+              <Text type="secondary">
+                结果 {success === false && <Tag color="error">失败</Tag>}
               </Text>
-              <pre style={{
-                margin: '4px 0 0',
-                padding: 8,
-                background: success === false ? '#fff2f0' : '#f6f6f6',
-                borderRadius: 4,
-                fontSize: 12,
-                lineHeight: 1.5,
-                overflow: 'auto',
-                maxHeight: 300,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-all',
-              }}>
-                {result.length > 3000 ? result.slice(0, 3000) + '\n...(截断)' : result}
+              <pre className={success === false ? 'sl-agent-tool-call-result-error' : undefined}>
+                {resultPreview}
               </pre>
             </div>
           )}

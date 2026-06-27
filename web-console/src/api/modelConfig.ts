@@ -17,7 +17,7 @@ export interface LlmConfig {
 export interface LlmConfigRequest {
   provider: string
   modelName: string
-  apiKey: string
+  apiKey?: string
   baseUrl: string
   temperature?: number
   maxTokens?: number

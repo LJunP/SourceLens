@@ -15,7 +15,6 @@ public class LlmConfigRequest {
     @NotBlank(message = "模型名称不能为空")
     private String modelName;
 
-    @NotBlank(message = "API Key 不能为空")
     private String apiKey;
 
     @NotBlank(message = "Base URL 不能为空")

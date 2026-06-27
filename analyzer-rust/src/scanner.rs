@@ -1,8 +1,14 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use walkdir::WalkDir;
 
-use crate::models::{DirEntry, FileTree, LargeFile, LanguageStat};
+use sha2::{Digest, Sha256};
+
+use crate::models::{DirEntry, FileManifestEntry, FileTree, LanguageStat, LargeFile};
+
+pub const MAX_TEXT_SCAN_BYTES: u64 = 1024 * 1024;
+const BINARY_SNIFF_BYTES: usize = 8192;
 
 // 扩展名 -> 语言名称映射
 fn ext_to_language() -> HashMap<&'static str, &'static str> {
@@ -95,10 +101,76 @@ fn is_generated_file(path: &Path, rel: &str) -> bool {
     false
 }
 
-fn count_lines(path: &Path) -> usize {
+fn is_probably_binary(path: &Path) -> bool {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return true,
+    };
+    let mut buffer = [0u8; BINARY_SNIFF_BYTES];
+    let read = match file.read(&mut buffer) {
+        Ok(read) => read,
+        Err(_) => return true,
+    };
+    buffer[..read].iter().any(|byte| *byte == 0)
+}
+
+fn count_lines_limited(path: &Path, size_bytes: u64) -> Option<usize> {
+    if size_bytes > MAX_TEXT_SCAN_BYTES || is_probably_binary(path) {
+        return None;
+    }
     std::fs::read_to_string(path)
         .map(|content| content.lines().count())
-        .unwrap_or(0)
+        .ok()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn content_hash_limited(path: &Path, size_bytes: u64, is_binary: bool) -> Option<String> {
+    if size_bytes > MAX_TEXT_SCAN_BYTES || is_binary {
+        return None;
+    }
+    std::fs::read(path).ok().map(|bytes| sha256_hex(&bytes))
+}
+
+fn repo_content_hash(file_manifest: &[FileManifestEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for file in file_manifest {
+        hasher.update(file.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(file.size_bytes.to_string().as_bytes());
+        hasher.update(b"\0");
+        if let Some(hash) = &file.content_hash_sha256 {
+            hasher.update(hash.as_bytes());
+        }
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn detect_language_for_entry(
+    path: &Path,
+    file_name: &str,
+    ext_map: &HashMap<&'static str, &'static str>,
+) -> String {
+    if file_name == "Dockerfile" {
+        return "Dockerfile".to_string();
+    }
+    path.extension()
+        .and_then(|ext| {
+            let ext_s = ext.to_string_lossy().to_lowercase();
+            ext_map
+                .get(ext_s.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    let fname = file_name.to_lowercase();
+                    ext_map.get(fname.as_str()).map(|s| s.to_string())
+                })
+        })
+        .unwrap_or_else(|| "Other".to_string())
 }
 
 /// 构建文件树并收集语言统计
@@ -112,6 +184,7 @@ pub fn build_file_tree(repo_path: &Path) -> (FileTree, HashMap<String, LanguageS
     let mut large_files = Vec::new();
     let mut config_files = Vec::new();
     let mut generated_files = Vec::new();
+    let mut file_manifest = Vec::new();
 
     let mut root_children: Vec<DirEntry> = Vec::new();
     let mut dir_map: HashMap<String, Vec<DirEntry>> = HashMap::new();
@@ -137,19 +210,26 @@ pub fn build_file_tree(repo_path: &Path) -> (FileTree, HashMap<String, LanguageS
             dir_map.insert(rel_str, Vec::new());
         } else {
             total_files += 1;
-            let lines = count_lines(entry.path());
+            let size_bytes = std::fs::metadata(entry.path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let is_binary = is_probably_binary(entry.path());
+            let lines = if size_bytes > MAX_TEXT_SCAN_BYTES || is_binary {
+                0
+            } else {
+                count_lines_limited(entry.path(), size_bytes).unwrap_or(0)
+            };
             total_lines += lines;
 
             // 测试文件检测
-            if is_test_file(entry.path(), &rel_str) {
+            let is_test = is_test_file(entry.path(), &rel_str);
+            if is_test {
                 test_files.push(rel_str.clone());
             }
 
-            // 大文件检测 (>500行)
-            if lines > 500 {
-                let size_bytes = std::fs::metadata(entry.path())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+            // 大文件检测 (>500行或超过文本扫描上限)
+            let is_large = lines > 500 || size_bytes > MAX_TEXT_SCAN_BYTES;
+            if is_large {
                 large_files.push(LargeFile {
                     path: rel_str.clone(),
                     line_count: lines,
@@ -165,7 +245,7 @@ pub fn build_file_tree(repo_path: &Path) -> (FileTree, HashMap<String, LanguageS
                 .unwrap_or("")
                 .to_lowercase();
             let fname = entry.file_name().to_string_lossy().to_lowercase();
-            if ext_str == "yml"
+            let is_config = ext_str == "yml"
                 || ext_str == "yaml"
                 || ext_str == "properties"
                 || ext_str == "toml"
@@ -173,53 +253,53 @@ pub fn build_file_tree(repo_path: &Path) -> (FileTree, HashMap<String, LanguageS
                 || fname == "dockerfile"
                 || fname == "docker-compose.yml"
                 || fname == "docker-compose.yaml"
-                || fname == "makefile"
-            {
+                || fname == "makefile";
+            if is_config {
                 config_files.push(rel_str.clone());
             }
 
             // 生成文件检测
-            if is_generated_file(entry.path(), &rel_str) {
+            let is_generated = is_generated_file(entry.path(), &rel_str);
+            if is_generated {
                 generated_files.push(rel_str.clone());
             }
 
             // 语言统计
-            let lang = if entry.file_name().to_string_lossy() == "Dockerfile" {
-                "Dockerfile".to_string()
-            } else {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|ext| {
-                        let ext_s = ext.to_string_lossy().to_lowercase();
-                        ext_map
-                            .get(ext_s.as_str())
-                            .map(|s| s.to_string())
-                            .or_else(|| {
-                                let fname2 = entry.file_name().to_string_lossy().to_lowercase();
-                                ext_map.get(fname2.as_str()).map(|s| s.to_string())
-                            })
-                    })
-                    .unwrap_or_else(|| "Other".to_string())
-            };
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let lang = detect_language_for_entry(entry.path(), &file_name, &ext_map);
 
-            let stat = lang_stats.entry(lang.clone()).or_insert_with(|| LanguageStat {
-                file_count: 0,
-                line_count: 0,
-                ext: ext_map
-                    .get(
-                        entry
-                            .path()
-                            .extension()
-                            .unwrap_or_default()
-                            .to_str()
-                            .unwrap_or(""),
-                    )
-                    .unwrap_or(&"")
-                    .to_string(),
-            });
+            let stat = lang_stats
+                .entry(lang.clone())
+                .or_insert_with(|| LanguageStat {
+                    file_count: 0,
+                    line_count: 0,
+                    ext: ext_map
+                        .get(
+                            entry
+                                .path()
+                                .extension()
+                                .unwrap_or_default()
+                                .to_str()
+                                .unwrap_or(""),
+                        )
+                        .unwrap_or(&"")
+                        .to_string(),
+                });
             stat.file_count += 1;
             stat.line_count += lines;
+
+            file_manifest.push(FileManifestEntry {
+                path: rel_str.clone(),
+                language: lang,
+                size_bytes,
+                line_count: lines,
+                content_hash_sha256: content_hash_limited(entry.path(), size_bytes, is_binary),
+                is_test,
+                is_generated,
+                is_config,
+                is_large,
+                is_binary,
+            });
 
             // 将文件添加到父目录
             let parent_rel = rel
@@ -227,16 +307,13 @@ pub fn build_file_tree(repo_path: &Path) -> (FileTree, HashMap<String, LanguageS
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
             let file_name = entry.file_name().to_string_lossy().to_string();
-            dir_map
-                .entry(parent_rel)
-                .or_default()
-                .push(DirEntry {
-                    name: file_name,
-                    path: rel_str,
-                    is_dir: false,
-                    children: Vec::new(),
-                    file_count: 0,
-                });
+            dir_map.entry(parent_rel).or_default().push(DirEntry {
+                name: file_name,
+                path: rel_str,
+                is_dir: false,
+                children: Vec::new(),
+                file_count: 0,
+            });
         }
     }
 
@@ -274,11 +351,15 @@ pub fn build_file_tree(repo_path: &Path) -> (FileTree, HashMap<String, LanguageS
 
     // 排序大文件
     large_files.sort_by(|a, b| b.line_count.cmp(&a.line_count));
+    file_manifest.sort_by(|a, b| a.path.cmp(&b.path));
+    let repo_content_hash = repo_content_hash(&file_manifest);
 
     let file_tree = FileTree {
         total_files,
         total_dirs,
         total_lines,
+        repo_content_hash,
+        file_manifest,
         root_dirs: root_children,
         test_files,
         large_files,
@@ -287,4 +368,80 @@ pub fn build_file_tree(repo_path: &Path) -> (FileTree, HashMap<String, LanguageS
     };
 
     (file_tree, lang_stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn build_file_tree_should_limit_large_text_files() {
+        let repo = create_temp_repo("large-file");
+        let large_file = repo.join("src/Large.java");
+        fs::create_dir_all(large_file.parent().unwrap()).unwrap();
+        fs::write(
+            &large_file,
+            "line\n".repeat((MAX_TEXT_SCAN_BYTES / 5 + 10) as usize),
+        )
+        .unwrap();
+
+        let (tree, _) = build_file_tree(&repo);
+
+        assert_eq!(tree.total_files, 1);
+        assert_eq!(tree.total_lines, 0);
+        assert_eq!(tree.large_files.len(), 1);
+        assert_eq!(tree.large_files[0].path, "src/Large.java");
+    }
+
+    #[test]
+    fn build_file_tree_should_not_count_binary_file_lines() {
+        let repo = create_temp_repo("binary-file");
+        let binary_file = repo.join("assets/image.bin");
+        fs::create_dir_all(binary_file.parent().unwrap()).unwrap();
+        fs::write(&binary_file, [0, 159, 146, 150, 0, 1, 2, 3]).unwrap();
+
+        let (tree, _) = build_file_tree(&repo);
+
+        assert_eq!(tree.total_files, 1);
+        assert_eq!(tree.total_lines, 0);
+        assert_eq!(tree.file_manifest.len(), 1);
+        assert!(tree.file_manifest[0].is_binary);
+        assert!(tree.file_manifest[0].content_hash_sha256.is_none());
+    }
+
+    #[test]
+    fn build_file_tree_should_emit_stable_file_manifest_hashes() {
+        let repo = create_temp_repo("manifest-hash");
+        let source_file = repo.join("src/App.java");
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, "class App {}\n").unwrap();
+
+        let (first_tree, _) = build_file_tree(&repo);
+        let (second_tree, _) = build_file_tree(&repo);
+
+        assert_eq!(first_tree.file_manifest.len(), 1);
+        assert_eq!(first_tree.file_manifest[0].path, "src/App.java");
+        assert_eq!(
+            first_tree.file_manifest[0]
+                .content_hash_sha256
+                .as_ref()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(first_tree.repo_content_hash, second_tree.repo_content_hash);
+    }
+
+    fn create_temp_repo(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!("sourcelens-scanner-{name}-{nonce}"));
+        fs::create_dir_all(&repo).unwrap();
+        repo
+    }
 }

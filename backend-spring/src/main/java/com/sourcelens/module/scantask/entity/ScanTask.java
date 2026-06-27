@@ -28,6 +28,8 @@ public class ScanTask {
 
     private String status;
 
+    private String activeLockKey;
+
     private String triggerType;
 
     private LocalDateTime startedAt;

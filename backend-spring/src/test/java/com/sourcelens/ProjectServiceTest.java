@@ -3,10 +3,12 @@ package com.sourcelens;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.sourcelens.common.exception.BizException;
+import com.sourcelens.module.audit.service.AuditLogService;
 import com.sourcelens.module.project.dto.CreateProjectRequest;
 import com.sourcelens.module.project.dto.UpdateProjectRequest;
 import com.sourcelens.module.project.entity.Project;
 import com.sourcelens.module.project.mapper.ProjectMapper;
+import com.sourcelens.module.project.service.ProjectDeletionService;
 import com.sourcelens.module.project.service.ProjectService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -25,6 +27,12 @@ class ProjectServiceTest {
 
     @Mock
     private ProjectMapper projectMapper;
+
+    @Mock
+    private ProjectDeletionService projectDeletionService;
+
+    @Mock
+    private AuditLogService auditLogService;
 
     @InjectMocks
     private ProjectService projectService;
@@ -132,10 +140,11 @@ class ProjectServiceTest {
     void delete_shouldRemoveById() {
         Project p = buildProject(10L, 1L, false);
         when(projectMapper.selectById(10L)).thenReturn(p);
-        when(projectMapper.deleteById(10L)).thenReturn(1);
 
         assertDoesNotThrow(() -> projectService.delete(10L, 1L));
-        verify(projectMapper).deleteById(10L);
+        verify(projectDeletionService).deleteProjectCascade(10L);
+        verify(auditLogService).record(eq(1L), eq(10L), eq("PROJECT"), eq(10L),
+                eq("PROJECT_DELETE_CASCADE"), eq("SUCCESS"), isNull(), anyString(), anyLong(), isNull());
     }
 
     @Test

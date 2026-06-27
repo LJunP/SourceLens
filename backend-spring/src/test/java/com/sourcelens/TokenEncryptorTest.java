@@ -36,6 +36,7 @@ class TokenEncryptorTest {
     void isEncryptedReturnsTrueForEncryptedValue() {
         String encrypted = encryptor.encrypt("some-token");
         assertTrue(TokenEncryptor.isEncrypted(encrypted), "加密后的值应被识别为已加密");
+        assertTrue(encrypted.startsWith("SLENC2:"), "新密文应带版本前缀");
     }
 
     @Test
@@ -52,5 +53,16 @@ class TokenEncryptorTest {
 
         assertThrows(RuntimeException.class, () -> other.decrypt(encrypted),
                 "不同密码解密应失败");
+    }
+
+    @Test
+    void tamperedCiphertextCannotDecrypt() {
+        String encrypted = encryptor.encrypt("ghp_tamper_test_token");
+        int lastIndex = encrypted.length() - 1;
+        char replacement = encrypted.charAt(lastIndex) == 'A' ? 'B' : 'A';
+        String tampered = encrypted.substring(0, lastIndex) + replacement;
+
+        assertThrows(RuntimeException.class, () -> encryptor.decrypt(tampered),
+                "密文被篡改后应认证失败");
     }
 }

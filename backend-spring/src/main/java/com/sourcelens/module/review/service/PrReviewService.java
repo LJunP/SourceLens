@@ -5,6 +5,15 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sourcelens.common.exception.BizException;
+import com.sourcelens.common.security.SensitiveDataSanitizer;
+import com.sourcelens.module.agent.entity.LlmConfig;
+import com.sourcelens.module.agent.service.LlmClient;
+import com.sourcelens.module.agent.service.LlmConfigService;
+import com.sourcelens.module.agent.service.LlmJsonExtractor;
+import com.sourcelens.module.agent.service.PromptInjectionGuard;
+import com.sourcelens.module.execution.entity.ExecutionAttempt;
+import com.sourcelens.module.execution.entity.ExecutionTask;
+import com.sourcelens.module.execution.service.ExecutionTaskService;
 import com.sourcelens.module.review.dto.CreatePrReviewRequest;
 import com.sourcelens.module.review.entity.PrReview;
 import com.sourcelens.module.review.entity.PrReviewComment;
@@ -13,7 +22,6 @@ import com.sourcelens.module.review.mapper.PrReviewMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -22,11 +30,27 @@ import java.util.*;
 @Service
 public class PrReviewService extends ServiceImpl<PrReviewMapper, PrReview> {
 
+    private static final int MAX_TEXT_FIELD_LENGTH = 8_000;
+    private static final int MAX_JSON_FIELD_LENGTH = 16_000;
+    private static final int MAX_ERROR_LENGTH = 4_000;
+
     private final PrReviewCommentMapper commentMapper;
+    private final LlmClient llmClient;
+    private final LlmConfigService llmConfigService;
+    private final LlmJsonExtractor llmJsonExtractor;
+    private final ExecutionTaskService executionTaskService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public PrReviewService(PrReviewCommentMapper commentMapper) {
+    public PrReviewService(PrReviewCommentMapper commentMapper,
+                           LlmClient llmClient,
+                           LlmConfigService llmConfigService,
+                           LlmJsonExtractor llmJsonExtractor,
+                           ExecutionTaskService executionTaskService) {
         this.commentMapper = commentMapper;
+        this.llmClient = llmClient;
+        this.llmConfigService = llmConfigService;
+        this.llmJsonExtractor = llmJsonExtractor;
+        this.executionTaskService = executionTaskService;
     }
 
     public PrReview create(CreatePrReviewRequest req, Long userId) {
@@ -36,71 +60,220 @@ public class PrReviewService extends ServiceImpl<PrReviewMapper, PrReview> {
                 .repositoryId(req.getRepositoryId())
                 .prNumber(req.getPrNumber())
                 .prTitle(req.getPrTitle())
-                .prDescription(req.getPrDescription())
+                .prDescription(sanitizeText(req.getPrDescription()))
                 .branch(req.getBranch())
                 .baseBranch(req.getBaseBranch() != null ? req.getBaseBranch() : "main")
                 .commitSha(req.getCommitSha())
                 .author(req.getAuthor())
                 .changedFiles(req.getChangedFiles())
-                .diffSummary(req.getDiffSummary())
+                .diffSummary(sanitizeText(req.getDiffSummary()))
                 .ciStatus(req.getCiStatus())
                 .status("PENDING")
                 .createdBy(userId)
                 .build();
         save(review);
+        executionTaskService.create(review.getProjectId(), review.getRepositoryId(), "PR_REVIEW",
+                "PR_REVIEW", review.getId(), userId);
         log.info("创建 PR 审查: id={}, pr#{}", review.getId(), review.getPrNumber());
         return review;
     }
 
+    public PrReview requeueAnalysis(Long reviewId) {
+        PrReview review = getDetail(reviewId);
+        if ("ANALYZING".equals(review.getStatus())) {
+            throw BizException.badRequest("PR 审查正在分析中，请勿重复触发");
+        }
+        review.setStatus("PENDING");
+        review.setErrorMessage(null);
+        review.setUpdatedAt(LocalDateTime.now());
+        updateById(review);
+        ExecutionTask executionTask = getOrCreateExecutionTask(review);
+        if (executionTask != null) {
+            executionTaskService.startNewAttempt(executionTask.getId());
+        }
+        return review;
+    }
+
     @Async("scanTaskExecutor")
-    @Transactional
     public void analyze(Long reviewId) {
         PrReview review = getById(reviewId);
         if (review == null) return;
+        if (!claimAnalysis(reviewId)) {
+            log.info("跳过 PR 审查分析，状态已变化或正在分析: id={}", reviewId);
+            return;
+        }
+        review.setStatus("ANALYZING");
+        ExecutionTask executionTask = getOrCreateExecutionTask(review);
+        ExecutionAttempt attempt = executionTask == null ? null : executionTaskService.getOrCreateCurrentAttempt(executionTask.getId());
+        Long attemptId = attempt == null ? null : attempt.getId();
+        startExecutionStep(attemptId, "analyze_pr_review", "分析 Pull Request 风险");
 
         try {
-            review.setStatus("ANALYZING");
-            updateById(review);
+            Map<String, Object> result = null;
 
-            Map<String, Object> result = analyzePr(review);
-
-            review.setRiskLevel((String) result.get("riskLevel"));
-            review.setChangeSummary((String) result.get("changeSummary"));
-            review.setImpactScope(toJson(result.get("impactScope")));
-            review.setRisks(toJson(result.get("risks")));
-            review.setTestSuggestions(toJson(result.get("testSuggestions")));
-            review.setMergeRecommendation((String) result.get("mergeRecommendation"));
-            review.setReviewJson(toJson(result));
-            review.setStatus("COMPLETED");
-            review.setUpdatedAt(LocalDateTime.now());
-            updateById(review);
-
-            // 保存行级评论
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> comments = (List<Map<String, Object>>) result.get("comments");
-            if (comments != null) {
-                for (Map<String, Object> c : comments) {
-                    PrReviewComment comment = PrReviewComment.builder()
-                            .reviewId(reviewId)
-                            .filePath((String) c.get("filePath"))
-                            .lineNumber(c.get("lineNumber") != null ? ((Number) c.get("lineNumber")).intValue() : null)
-                            .severity((String) c.get("severity"))
-                            .category((String) c.get("category"))
-                            .message((String) c.get("message"))
-                            .suggestion((String) c.get("suggestion"))
-                            .build();
-                    commentMapper.insert(comment);
+            // 尝试获取激活的大模型配置
+            LlmConfig llmConfig = null;
+            if (review.getCreatedBy() != null) {
+                try {
+                    llmConfig = llmConfigService.getActiveConfig(review.getCreatedBy());
+                } catch (Exception e) {
+                    log.warn("获取激活的 LLM 配置失败, 将使用规则引擎进行 PR 审查 fallback: {}", e.getMessage());
                 }
             }
 
+            if (llmConfig != null) {
+                log.info("使用大模型进行 PR 审查: configId={}, model={}", llmConfig.getId(), llmConfig.getModelName());
+                try {
+                    result = analyzePrWithLlm(review, llmConfig);
+                } catch (Exception e) {
+                    log.error("大模型 PR 审查失败, 将使用规则引擎进行 PR 审查 fallback", e);
+                }
+            }
+
+            if (result == null) {
+                log.info("使用规则引擎进行 PR 审查");
+                result = analyzePr(review);
+            }
+
+            review.setRiskLevel((String) result.get("riskLevel"));
+            review.setChangeSummary(sanitizeText((String) result.get("changeSummary")));
+            review.setImpactScope(toJson(result.get("impactScope")));
+            review.setRisks(toJson(result.get("risks")));
+            review.setTestSuggestions(toJson(result.get("testSuggestions")));
+            review.setMergeRecommendation(sanitizeText((String) result.get("mergeRecommendation")));
+            review.setReviewJson(toJson(result));
+            replaceComments(reviewId, result);
+
+            review.setStatus("COMPLETED");
+            review.setUpdatedAt(LocalDateTime.now());
+            updateById(review);
+            completeExecutionStep(attemptId, "analyze_pr_review", "PR 审查完成: " + review.getRiskLevel());
+            markExecutionSuccess(attemptId, "analyze_pr_review");
             log.info("PR 审查完成: id={}, risk={}, merge={}", reviewId, review.getRiskLevel(), review.getMergeRecommendation());
         } catch (Exception e) {
             log.error("PR 审查失败: id={}", reviewId, e);
             review.setStatus("FAILED");
-            review.setErrorMessage(e.getMessage());
+            review.setErrorMessage(sanitizeError(e.getMessage()));
             review.setUpdatedAt(LocalDateTime.now());
             updateById(review);
+            failExecutionStep(attemptId, "analyze_pr_review", e.getMessage());
+            markExecutionFailed(attemptId, "analyze_pr_review", e.getMessage());
         }
+    }
+
+    private ExecutionTask getOrCreateExecutionTask(PrReview review) {
+        ExecutionTask executionTask = executionTaskService.findBySource("PR_REVIEW", review.getId());
+        if (executionTask != null) {
+            return executionTask;
+        }
+        return executionTaskService.create(review.getProjectId(), review.getRepositoryId(), "PR_REVIEW",
+                "PR_REVIEW", review.getId(), review.getCreatedBy());
+    }
+
+    private void startExecutionStep(Long attemptId, String stepKey, String stepName) {
+        if (attemptId != null) {
+            executionTaskService.startAttemptStep(attemptId, stepKey, stepName);
+        }
+    }
+
+    private void completeExecutionStep(Long attemptId, String stepKey, String summary) {
+        if (attemptId != null) {
+            executionTaskService.completeAttemptStep(attemptId, stepKey, summary);
+        }
+    }
+
+    private void failExecutionStep(Long attemptId, String stepKey, String errorMessage) {
+        if (attemptId != null) {
+            executionTaskService.failAttemptStep(attemptId, stepKey, errorMessage);
+        }
+    }
+
+    private void markExecutionSuccess(Long attemptId, String currentStep) {
+        if (attemptId != null) {
+            executionTaskService.markAttemptSuccess(attemptId, currentStep);
+        }
+    }
+
+    private void markExecutionFailed(Long attemptId, String currentStep, String errorMessage) {
+        if (attemptId != null) {
+            executionTaskService.markAttemptFailed(attemptId, currentStep, errorMessage);
+        }
+    }
+
+    private boolean claimAnalysis(Long reviewId) {
+        PrReview update = new PrReview();
+        update.setStatus("ANALYZING");
+        update.setErrorMessage(null);
+        update.setUpdatedAt(LocalDateTime.now());
+        return update(update, new LambdaQueryWrapper<PrReview>()
+                .eq(PrReview::getId, reviewId)
+                .eq(PrReview::getStatus, "PENDING"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void replaceComments(Long reviewId, Map<String, Object> result) {
+        commentMapper.delete(new LambdaQueryWrapper<PrReviewComment>()
+                .eq(PrReviewComment::getReviewId, reviewId));
+
+        List<Map<String, Object>> comments = (List<Map<String, Object>>) result.get("comments");
+        if (comments == null) {
+            return;
+        }
+        for (Map<String, Object> c : comments) {
+            PrReviewComment comment = PrReviewComment.builder()
+                    .reviewId(reviewId)
+                    .filePath((String) c.get("filePath"))
+                    .lineNumber(c.get("lineNumber") != null ? ((Number) c.get("lineNumber")).intValue() : null)
+                    .severity((String) c.get("severity"))
+                    .category((String) c.get("category"))
+                    .message(sanitizeText((String) c.get("message")))
+                    .suggestion(sanitizeText((String) c.get("suggestion")))
+                    .build();
+            commentMapper.insert(comment);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> analyzePrWithLlm(PrReview review, LlmConfig config) {
+        String prompt = "You are a senior software engineer and architect. Review the following Pull Request details and code changes (diff), and output a structured JSON analysis.\n" +
+                PromptInjectionGuard.systemBoundaryInstructions() + "\n" +
+                PromptInjectionGuard.wrapUntrustedContent("pr title", review.getPrTitle()) +
+                PromptInjectionGuard.wrapUntrustedContent("pr description", review.getPrDescription()) +
+                PromptInjectionGuard.wrapUntrustedContent("pr ci status", review.getCiStatus()) +
+                PromptInjectionGuard.wrapUntrustedContent("pr changed files", review.getChangedFiles() != null ? review.getChangedFiles() : "[]") +
+                PromptInjectionGuard.wrapUntrustedContent("pr diff summary", review.getDiffSummary()) + "\n" +
+                "Please analyze the changes for potential issues, security vulnerabilities, API compatibility, database migration impacts, and test coverage.\n" +
+                "You MUST respond with a single, valid JSON object matching the following schema (do not wrap in extra explanation or markdown block code formatting):\n" +
+                "{\n" +
+                "  \"riskLevel\": \"LOW | MEDIUM | HIGH | CRITICAL\",\n" +
+                "  \"changeSummary\": \"A brief summary of the changes\",\n" +
+                "  \"impactScope\": [\"list of impacted areas/modules\"],\n" +
+                "  \"risks\": [\n" +
+                "    {\n" +
+                "      \"category\": \"DATABASE | SECURITY | API_COMPATIBILITY | SCOPE | DELETION | TEST_COVERAGE | CI_FAILURE | GENERAL\",\n" +
+                "      \"severity\": \"LOW | MEDIUM | HIGH | CRITICAL\",\n" +
+                "      \"message\": \"Risk description\"\n" +
+                "    }\n" +
+                "  ],\n" +
+                "  \"testSuggestions\": [\"suggestions for testing\"],\n" +
+                "  \"mergeRecommendation\": \"MERGE | CHANGES_REQUESTED | BLOCKED\",\n" +
+                "  \"comments\": [\n" +
+                "    {\n" +
+                "      \"filePath\": \"path/to/file\",\n" +
+                "      \"lineNumber\": 12,\n" +
+                "      \"severity\": \"INFO | WARNING | CRITICAL\",\n" +
+                "      \"category\": \"CORRECTNESS | SECURITY | COMPATIBILITY | TEST | LINT\",\n" +
+                "      \"message\": \"Detailed code issue description\",\n" +
+                "      \"suggestion\": \"Actionable code improvement recommendation\"\n" +
+                "    }\n" +
+                "  ]\n" +
+                "}";
+
+        String response = llmClient.chat(config, prompt);
+        return llmJsonExtractor.extractRequiredObject(
+                response,
+                Set.of("riskLevel", "mergeRecommendation"),
+                "PR_REVIEW");
     }
 
     private Map<String, Object> analyzePr(PrReview review) {
@@ -142,7 +315,7 @@ public class PrReviewService extends ServiceImpl<PrReviewMapper, PrReview> {
 
         // 2. 安全相关: 检查实际文件路径和 diff 中的敏感模式
         List<String> securityFiles = filesByCategory.getOrDefault("SECURITY", Collections.emptyList());
-        boolean hasSecurityPatterns = diffLower.matches("(?s).*(password|secret|token|jwt|session|credential|encrypt|decrypt|auth).*");
+        boolean hasSecurityPatterns = diffLower.matches("(?s).*(password|secret|token|api[_-]?key|jwt|session|credential|encrypt|decrypt|auth).*");
         if (!securityFiles.isEmpty() || hasSecurityPatterns) {
             risks.add(Map.of("category", "SECURITY", "severity", "HIGH",
                     "message", "涉及安全相关逻辑变更"));
@@ -156,7 +329,8 @@ public class PrReviewService extends ServiceImpl<PrReviewMapper, PrReview> {
             // 检查 diff 中是否有硬编码敏感信息
             for (String line : addedLines) {
                 String lower = line.toLowerCase();
-                if (lower.matches(".*(\"|')(password|secret|token|key|api_key)(\"|').*[:=].*(\"|').+.*")) {
+                if (lower.matches(".*(\"|')(password|secret|token|key|api[_-]?key)(\"|').*[:=].*(\"|').+.*")
+                        || lower.matches(".*\\b(password|secret|token|api[_-]?key)\\b\\s*[:=].*")) {
                     comments.add(Map.of(
                             "filePath", "diff 新增行", "severity", "CRITICAL", "category", "SECURITY",
                             "message", "可能存在硬编码敏感信息: " + line.trim().substring(0, Math.min(80, line.trim().length())),
@@ -429,9 +603,21 @@ public class PrReviewService extends ServiceImpl<PrReviewMapper, PrReview> {
     private String toJson(Object obj) {
         if (obj == null) return null;
         try {
-            return objectMapper.writeValueAsString(obj);
+            return sanitizeJson(objectMapper.writeValueAsString(obj));
         } catch (Exception e) {
-            return String.valueOf(obj);
+            return sanitizeJson(String.valueOf(obj));
         }
+    }
+
+    private String sanitizeText(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_TEXT_FIELD_LENGTH);
+    }
+
+    private String sanitizeJson(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_JSON_FIELD_LENGTH);
+    }
+
+    private String sanitizeError(String value) {
+        return SensitiveDataSanitizer.sanitizeAndTruncate(value, MAX_ERROR_LENGTH);
     }
 }

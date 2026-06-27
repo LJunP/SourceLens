@@ -60,8 +60,7 @@ public class CiDiagnosticController {
                                           @RequestAttribute("userId") Long userId) {
         CiDiagnostic diag = ciDiagnosticService.getDetail(id);
         projectService.verifyOwnership(diag.getProjectId(), userId);
-        diag.setStatus("PENDING");
-        ciDiagnosticService.updateById(diag);
+        diag = ciDiagnosticService.requeueAnalysis(id);
         ciDiagnosticService.analyze(id);
         return Result.ok(diag);
     }

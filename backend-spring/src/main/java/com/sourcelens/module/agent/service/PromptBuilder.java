@@ -2,6 +2,8 @@ package com.sourcelens.module.agent.service;
 
 import com.sourcelens.module.agent.entity.Conversation;
 import com.sourcelens.module.agent.entity.ConversationMessage;
+import com.sourcelens.module.agent.entity.AgentTask;
+import com.sourcelens.module.agent.mapper.AgentTaskMapper;
 import com.sourcelens.module.agent.mapper.ConversationMapper;
 import com.sourcelens.module.agent.mapper.ConversationMessageMapper;
 import com.sourcelens.module.agent.tool.ToolRegistry;
@@ -24,6 +26,7 @@ public class PromptBuilder {
 
     private final ConversationMapper conversationMapper;
     private final ConversationMessageMapper messageMapper;
+    private final AgentTaskMapper agentTaskMapper;
     private final ProjectContextBuilder projectContextBuilder;
     private final ToolRegistry toolRegistry;
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -93,27 +96,40 @@ public class PromptBuilder {
                     log.warn("解析 tool_calls_json 失败: {}", e.getMessage());
                 }
             } else if ("TOOL".equals(msg.getRole())) {
-                // tool 消息需要 tool_call_id 和 name
-                msgMap.put("content", msg.getContent());
-                if (msg.getToolCallsJson() != null) {
+                // tool 消息需要按每个 tool result 单独展开，每个结果对应一条 role:tool 消息
+                String toolResultsJson = msg.getToolResultsJson() != null ? msg.getToolResultsJson() : msg.getToolCallsJson();
+                if (toolResultsJson != null) {
                     try {
-                        // toolCallsJson 是 JSON 数组: [{tool_call_id, name, content}]
+                        // toolResultsJson 是 JSON 数组: [{tool_call_id, name, content}]
                         List<Map<String, Object>> toolInfoList = objectMapper.readValue(
-                                msg.getToolCallsJson(), objectMapper.getTypeFactory()
+                                toolResultsJson, objectMapper.getTypeFactory()
                                         .constructCollectionType(List.class, Map.class));
-                        if (!toolInfoList.isEmpty()) {
-                            Map<String, Object> firstTool = toolInfoList.get(0);
-                            if (firstTool.containsKey("tool_call_id")) {
-                                msgMap.put("tool_call_id", firstTool.get("tool_call_id"));
+                        for (Map<String, Object> toolInfo : toolInfoList) {
+                            Map<String, Object> toolMsgMap = new LinkedHashMap<>();
+                            toolMsgMap.put("role", "tool");
+                            String toolName = String.valueOf(toolInfo.getOrDefault("name", "unknown"));
+                            String toolContent = String.valueOf(toolInfo.getOrDefault("content", ""));
+                            toolMsgMap.put("content", PromptInjectionGuard.wrapUntrustedContent("tool result: " + toolName, toolContent));
+                            if (toolInfo.containsKey("tool_call_id")) {
+                                toolMsgMap.put("tool_call_id", toolInfo.get("tool_call_id"));
                             }
-                            if (firstTool.containsKey("name")) {
-                                msgMap.put("name", firstTool.get("name"));
+                            if (toolInfo.containsKey("name")) {
+                                toolMsgMap.put("name", toolInfo.get("name"));
                             }
+                            messages.add(toolMsgMap);
                         }
                     } catch (Exception e) {
                         log.warn("解析 tool 消息元数据失败: {}", e.getMessage());
+                        // 降级：生成一条空的 tool 消息
+                        msgMap.put("content", msg.getContent() != null ? msg.getContent() : "");
+                        messages.add(msgMap);
                     }
+                } else {
+                    msgMap.put("content", msg.getContent() != null ? msg.getContent() : "");
+                    messages.add(msgMap);
                 }
+                // TOOL 消息已在上面单独处理，不走下面统一的 messages.add(msgMap)
+                continue;
             } else {
                 msgMap.put("content", msg.getContent());
             }
@@ -139,13 +155,15 @@ public class PromptBuilder {
         } else {
             prompt.append(DEFAULT_SYSTEM_PROMPT);
         }
+        prompt.append(PromptInjectionGuard.systemBoundaryInstructions());
 
         // 项目上下文
-        String projectContext = projectContextBuilder.buildContext(conv.getProjectId(), null);
+        Long scanTaskId = resolveConversationScanTaskId(conv);
+        String projectContext = projectContextBuilder.buildContext(conv.getProjectId(), scanTaskId);
         if (!projectContext.isBlank()) {
             prompt.append("\n\n---\n\n");
             prompt.append("# 项目上下文\n\n");
-            prompt.append(projectContext);
+            prompt.append(PromptInjectionGuard.wrapUntrustedContent("project context", projectContext));
         }
 
         // 工具说明
@@ -159,6 +177,14 @@ public class PromptBuilder {
         }
 
         return prompt.toString();
+    }
+
+    private Long resolveConversationScanTaskId(Conversation conv) {
+        if (conv.getAgentTaskId() == null) {
+            return null;
+        }
+        AgentTask task = agentTaskMapper.selectById(conv.getAgentTaskId());
+        return task == null ? null : task.getScanTaskId();
     }
 
     /**

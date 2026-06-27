@@ -4,14 +4,20 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.sourcelens.common.exception.BizException;
+import com.sourcelens.module.audit.service.AuditLogService;
 import com.sourcelens.module.project.dto.CreateProjectRequest;
 import com.sourcelens.module.project.dto.UpdateProjectRequest;
 import com.sourcelens.module.project.entity.Project;
 import com.sourcelens.module.project.mapper.ProjectMapper;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 @Service
+@RequiredArgsConstructor
 public class ProjectService extends ServiceImpl<ProjectMapper, Project> {
+
+    private final ProjectDeletionService projectDeletionService;
+    private final AuditLogService auditLogService;
 
     public Project create(CreateProjectRequest req, Long userId) {
         Project project = Project.builder()
@@ -52,7 +58,14 @@ public class ProjectService extends ServiceImpl<ProjectMapper, Project> {
 
     public void delete(Long projectId, Long userId) {
         getDetail(projectId, userId);
-        removeById(projectId);
+        long start = System.currentTimeMillis();
+        projectDeletionService.deleteProjectCascade(projectId);
+        auditLogService.record(userId, projectId, "PROJECT", projectId,
+                "PROJECT_DELETE_CASCADE", "SUCCESS",
+                null,
+                "项目及关联数据已级联清理",
+                System.currentTimeMillis() - start,
+                null);
     }
 
     /** 验证用户是否拥有该项目,无权限则抛 403 */

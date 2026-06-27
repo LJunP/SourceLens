@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const SCAN_RESULT_SCHEMA_VERSION: u32 = 2;
+
 /// 扫描结果顶层结构
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanResult {
+    pub scan_result_schema_version: u32,
     pub repo_path: String,
     /// 主语言(从 language_stats 中按行数选出)
     pub language: String,
@@ -23,11 +26,28 @@ pub struct FileTree {
     pub total_files: usize,
     pub total_dirs: usize,
     pub total_lines: usize,
+    pub repo_content_hash: String,
+    pub file_manifest: Vec<FileManifestEntry>,
     pub root_dirs: Vec<DirEntry>,
     pub test_files: Vec<String>,
     pub large_files: Vec<LargeFile>,
     pub config_files: Vec<String>,
     pub generated_files: Vec<String>,
+}
+
+/// 文件级扫描指纹, 用于增量扫描和重复分析复用
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileManifestEntry {
+    pub path: String,
+    pub language: String,
+    pub size_bytes: u64,
+    pub line_count: usize,
+    pub content_hash_sha256: Option<String>,
+    pub is_test: bool,
+    pub is_generated: bool,
+    pub is_config: bool,
+    pub is_large: bool,
+    pub is_binary: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

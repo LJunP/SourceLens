@@ -6,10 +6,11 @@ const { Title } = Typography
 
 interface Props {
   title?: string
+  initialProjectId?: number
   children: (projectId: number) => React.ReactNode
 }
 
-export default function ProjectSelector({ title = '选择项目', children }: Props) {
+export default function ProjectSelector({ title = '选择项目', initialProjectId, children }: Props) {
   const [projects, setProjects] = useState<Project[]>([])
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
@@ -20,15 +21,21 @@ export default function ProjectSelector({ title = '选择项目', children }: Pr
       .then((res) => {
         const items = res.data.data.items || []
         setProjects(items)
-        if (items.length > 0) setSelectedProjectId(items[0].id)
+        if (items.length > 0) {
+          const initial = initialProjectId && items.some(item => item.id === initialProjectId)
+            ? initialProjectId
+            : items[0].id
+          setSelectedProjectId(initial)
+        }
       })
       .finally(() => setLoading(false))
-  }, [])
+  }, [initialProjectId])
 
   if (loading) {
     return (
       <div style={{ textAlign: 'center', padding: 60 }}>
-        <Spin size="large" tip="加载中..." />
+        <Spin size="large" />
+        <div style={{ marginTop: 12, color: '#64748b' }}>加载中...</div>
       </div>
     )
   }

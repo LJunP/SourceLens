@@ -20,6 +20,12 @@ public class ToolContext {
     /** 项目 ID */
     private Long projectId;
 
+    /** 当前分析绑定的扫描任务 ID，可为空表示使用项目最新成功扫描 */
+    private Long scanTaskId;
+
     /** 对话 ID */
     private Long conversationId;
+
+    /** 发起工具调用的用户 ID */
+    private Long userId;
 }

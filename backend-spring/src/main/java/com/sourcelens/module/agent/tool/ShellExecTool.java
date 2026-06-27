@@ -1,15 +1,16 @@
 package com.sourcelens.module.agent.tool;
 
+import com.sourcelens.module.sandbox.SandboxCommand;
+import com.sourcelens.module.sandbox.SandboxExecutionResult;
+import com.sourcelens.module.sandbox.SandboxExecutor;
 import lombok.extern.slf4j.Slf4j;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 /**
  * 在项目沙箱目录中执行 shell 命令。
@@ -17,24 +18,20 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class ShellExecTool implements AgentTool {
 
     private static final long DEFAULT_TIMEOUT = 30;
+    private static final int MIN_TIMEOUT = 1;
     private static final long MAX_TIMEOUT = 120;
-    private static final int MAX_OUTPUT_SIZE = 50_000;
+    private final SandboxExecutor sandboxExecutor;
 
-    // 危险命令黑名单
-    private static final List<String> BLOCKED_PATTERNS = List.of(
-            "rm -rf /",
-            "rm -rf /*",
-            "mkfs",
-            "dd if=",
-            "> /dev/sd",
-            "chmod -R 777 /",
-            "shutdown",
-            "reboot",
-            "init 0",
-            ":(){ :|:& };:" // fork bomb
+    private static final Set<String> ALLOWED_COMMANDS = Set.of(
+            "git", "mvn", "gradle", "./gradlew", "npm", "pnpm", "yarn",
+            "cargo", "go", "python", "python3", "pytest", "make", "ls", "pwd", "cat"
+    );
+    private static final List<String> BLOCKED_TOKENS = List.of(
+            ";", "&&", "||", "|", ">", "<", "`", "$(", "\n", "\r"
     );
 
     @Override
@@ -69,65 +66,91 @@ public class ShellExecTool implements AgentTool {
     }
 
     @Override
+    public ToolPermissionLevel permissionLevel() {
+        return ToolPermissionLevel.EXEC_TEST;
+    }
+
+    @Override
     public ToolResult execute(Map<String, Object> args, ToolContext context) {
         String command = (String) args.get("command");
-        long timeout = args.containsKey("timeout")
-                ? Math.min(((Number) args.get("timeout")).longValue(), MAX_TIMEOUT)
-                : DEFAULT_TIMEOUT;
+        int timeout = AgentToolArgumentUtils.boundedInt(args.get("timeout"), (int) DEFAULT_TIMEOUT, MIN_TIMEOUT, (int) MAX_TIMEOUT);
 
         if (context.getProjectRootPath() == null) {
             return ToolResult.fail("项目根目录未设置");
         }
 
-        // 检查危险命令
-        String lowerCmd = command.toLowerCase();
-        for (String blocked : BLOCKED_PATTERNS) {
-            if (lowerCmd.contains(blocked.toLowerCase())) {
-                return ToolResult.fail("命令被阻止(安全限制): 包含危险模式 '" + blocked + "'");
+        for (String blocked : BLOCKED_TOKENS) {
+            if (command.contains(blocked)) {
+                return ToolResult.fail("命令被阻止(安全限制): 不允许 shell 组合符号 '" + blocked + "'");
             }
         }
 
+        List<String> argv = parseSimpleCommand(command);
+        if (argv.isEmpty()) {
+            return ToolResult.fail("命令不能为空");
+        }
+        if (!ALLOWED_COMMANDS.contains(argv.get(0))) {
+            return ToolResult.fail("命令未在白名单中: " + argv.get(0));
+        }
+
         Path projectRoot = Paths.get(context.getProjectRootPath());
-        log.info("Agent 执行命令: dir={}, cmd={}", projectRoot, command);
+        log.info("Agent 执行命令: dir={}, argv={}", projectRoot, argv);
 
         try {
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c", command);
-            pb.directory(projectRoot.toFile());
-            pb.redirectErrorStream(true);
-
-            Process process = pb.start();
-            StringBuilder output = new StringBuilder();
-
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                    if (output.length() > MAX_OUTPUT_SIZE) {
-                        output.append("\n... [输出截断, 超过 ").append(MAX_OUTPUT_SIZE).append(" 字节限制] ...\n");
-                        process.destroyForcibly();
-                        break;
-                    }
-                }
-            }
-
-            boolean finished = process.waitFor(timeout, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                output.append("\n... [命令超时: ").append(timeout).append("s] ...\n");
-            }
-
-            int exitCode = process.exitValue();
-            String result = output.toString();
+            SandboxExecutionResult result = sandboxExecutor.execute(SandboxCommand.builder()
+                    .command(argv)
+                    .workingDirectory(projectRoot)
+                    .timeout(Duration.ofSeconds(timeout))
+                    .build());
 
             StringBuilder sb = new StringBuilder();
-            sb.append("Exit code: ").append(exitCode).append("\n");
-            if (!result.isEmpty()) {
-                sb.append("Output:\n").append(result);
+            sb.append("Exit code: ").append(result.getExitCode()).append("\n");
+            if (result.isTimedOut()) {
+                sb.append("Timed out: ").append(timeout).append("s\n");
+            }
+            if (result.getOutput() != null && !result.getOutput().isEmpty()) {
+                sb.append("Output:\n").append(result.getOutput());
             }
 
             return ToolResult.ok(sb.toString());
         } catch (Exception e) {
             return ToolResult.fail("命令执行失败: " + e.getMessage());
         }
+    }
+
+    private List<String> parseSimpleCommand(String command) {
+        if (command == null || command.isBlank()) {
+            return List.of();
+        }
+        List<String> parts = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inSingleQuote = false;
+        boolean inDoubleQuote = false;
+        for (int i = 0; i < command.length(); i++) {
+            char ch = command.charAt(i);
+            if (ch == '\'' && !inDoubleQuote) {
+                inSingleQuote = !inSingleQuote;
+                continue;
+            }
+            if (ch == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+            if (Character.isWhitespace(ch) && !inSingleQuote && !inDoubleQuote) {
+                if (!current.isEmpty()) {
+                    parts.add(current.toString());
+                    current.setLength(0);
+                }
+                continue;
+            }
+            current.append(ch);
+        }
+        if (inSingleQuote || inDoubleQuote) {
+            return List.of();
+        }
+        if (!current.isEmpty()) {
+            parts.add(current.toString());
+        }
+        return parts;
     }
 }

@@ -3,6 +3,7 @@ import { useNavigate, Link } from 'react-router-dom'
 import { Form, Input, Button, Card, message, Typography } from 'antd'
 import { UserOutlined, LockOutlined, MailOutlined } from '@ant-design/icons'
 import { useAuth } from '../contexts/AuthContext'
+import { showApiError } from '../api/client'
 
 export default function Register() {
   const [loading, setLoading] = useState(false)
@@ -15,8 +16,8 @@ export default function Register() {
       await register(values.username, values.email, values.password)
       message.success('注册成功，请登录')
       navigate('/login')
-    } catch (err: any) {
-      message.error(err.response?.data?.message || '注册失败')
+    } catch (error) {
+      showApiError(error, '注册失败')
     } finally {
       setLoading(false)
     }

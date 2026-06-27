@@ -42,6 +42,8 @@ public class DashboardController {
         data.put("latestControllers", stat.getLatestControllers());
         data.put("latestServices", stat.getLatestServices());
         data.put("latestRiskCount", stat.getLatestRiskCount());
+        data.put("latestCodeChunks", stat.getLatestCodeChunks());
+        data.put("latestEmbeddedChunks", stat.getLatestEmbeddedChunks());
         data.put("languagesJson", stat.getLanguagesJson());
         return Result.ok(data);
     }

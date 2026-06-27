@@ -43,9 +43,10 @@ public class AgentTaskController {
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "20") int pageSize,
             @RequestParam(required = false) String status,
+            @RequestParam(required = false) Long scanTaskId,
             @RequestAttribute("userId") Long userId) {
         projectService.verifyOwnership(projectId, userId);
-        Page<AgentTask> records = agentTaskService.listByProject(projectId, page, pageSize, status);
+        Page<AgentTask> records = agentTaskService.listByProject(projectId, page, pageSize, status, scanTaskId);
         return Result.ok(PageResult.of(records.getRecords(), page, pageSize, records.getTotal()));
     }
 
@@ -99,7 +100,11 @@ public class AgentTaskController {
     @Operation(summary = "更新任务步骤状态")
     @PatchMapping("/agent-steps/{stepId}")
     public Result<AgentTaskStep> updateStep(@PathVariable Long stepId,
-                                            @RequestBody UpdateStepRequest req) {
+                                            @RequestBody UpdateStepRequest req,
+                                            @RequestAttribute("userId") Long userId) {
+        AgentTaskStep step = agentTaskService.getStep(stepId);
+        AgentTask task = agentTaskService.getDetail(step.getTaskId());
+        projectService.verifyOwnership(task.getProjectId(), userId);
         return Result.ok(agentTaskService.updateStep(stepId, req));
     }
 

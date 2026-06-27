@@ -25,15 +25,22 @@ build/
 Thumbs.db
 
 node_modules/
+web-console/dist/
+web-console/.vite/
+web-console/tsconfig*.tsbuildinfo
+
 .env
 .env.local
 deploy/.env
 
 *.log
 logs/
+release-evidence/
 
 out/
 bin/
+**/target 2/
+analyzer-rust/target/
 
 *.o
 *.so

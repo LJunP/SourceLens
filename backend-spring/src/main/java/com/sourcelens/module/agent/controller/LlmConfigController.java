@@ -2,7 +2,7 @@ package com.sourcelens.module.agent.controller;
 
 import com.sourcelens.common.Result;
 import com.sourcelens.module.agent.dto.LlmConfigRequest;
-import com.sourcelens.module.agent.entity.LlmConfig;
+import com.sourcelens.module.agent.dto.LlmConfigResponse;
 import com.sourcelens.module.agent.service.LlmConfigService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -22,36 +22,36 @@ public class LlmConfigController {
 
     @Operation(summary = "创建 LLM 配置")
     @PostMapping
-    public Result<LlmConfig> create(@Valid @RequestBody LlmConfigRequest req,
-                                    @RequestAttribute("userId") Long userId) {
-        return Result.ok(llmConfigService.create(req, userId));
+    public Result<LlmConfigResponse> create(@Valid @RequestBody LlmConfigRequest req,
+                                            @RequestAttribute("userId") Long userId) {
+        return Result.ok(llmConfigService.toResponse(llmConfigService.create(req, userId)));
     }
 
     @Operation(summary = "获取当前用户的 LLM 配置列表")
     @GetMapping
-    public Result<List<LlmConfig>> list(@RequestAttribute("userId") Long userId) {
-        return Result.ok(llmConfigService.listByUser(userId));
+    public Result<List<LlmConfigResponse>> list(@RequestAttribute("userId") Long userId) {
+        return Result.ok(llmConfigService.listResponsesByUser(userId));
     }
 
     @Operation(summary = "获取当前激活的 LLM 配置")
     @GetMapping("/active")
-    public Result<LlmConfig> getActive(@RequestAttribute("userId") Long userId) {
-        return Result.ok(llmConfigService.getActiveConfig(userId));
+    public Result<LlmConfigResponse> getActive(@RequestAttribute("userId") Long userId) {
+        return Result.ok(llmConfigService.getActiveConfigResponse(userId));
     }
 
     @Operation(summary = "激活指定配置")
     @PostMapping("/{configId}/activate")
-    public Result<LlmConfig> activate(@PathVariable Long configId,
-                                      @RequestAttribute("userId") Long userId) {
-        return Result.ok(llmConfigService.activate(configId, userId));
+    public Result<LlmConfigResponse> activate(@PathVariable Long configId,
+                                              @RequestAttribute("userId") Long userId) {
+        return Result.ok(llmConfigService.toResponse(llmConfigService.activate(configId, userId)));
     }
 
     @Operation(summary = "更新 LLM 配置")
     @PutMapping("/{configId}")
-    public Result<LlmConfig> update(@PathVariable Long configId,
-                                    @Valid @RequestBody LlmConfigRequest req,
-                                    @RequestAttribute("userId") Long userId) {
-        return Result.ok(llmConfigService.update(configId, req, userId));
+    public Result<LlmConfigResponse> update(@PathVariable Long configId,
+                                            @Valid @RequestBody LlmConfigRequest req,
+                                            @RequestAttribute("userId") Long userId) {
+        return Result.ok(llmConfigService.toResponse(llmConfigService.update(configId, req, userId)));
     }
 
     @Operation(summary = "删除 LLM 配置")
