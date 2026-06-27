@@ -1188,8 +1188,21 @@ write_git_metadata() {
     printf 'git_head: '
     git rev-parse HEAD 2>/dev/null || printf 'unavailable\n'
   } > "${RUN_DIR}/manifest.txt"
-  (cd "$ROOT_DIR" && git status --short) > "${RUN_DIR}/git-status.txt" 2>&1 || true
-  (cd "$ROOT_DIR" && git diff --stat) > "${RUN_DIR}/git-diff-stat.txt" 2>&1 || true
+  local git_status_output
+  local git_diff_output
+  git_status_output=$(cd "$ROOT_DIR" && git status --short 2>&1) || git_status_output=""
+  if [[ -z "$git_status_output" ]]; then
+    printf 'working tree clean\n' > "${RUN_DIR}/git-status.txt"
+  else
+    printf '%s\n' "$git_status_output" > "${RUN_DIR}/git-status.txt"
+  fi
+
+  git_diff_output=$(cd "$ROOT_DIR" && git diff --stat 2>&1) || git_diff_output=""
+  if [[ -z "$git_diff_output" ]]; then
+    printf 'no changes\n' > "${RUN_DIR}/git-diff-stat.txt"
+  else
+    printf '%s\n' "$git_diff_output" > "${RUN_DIR}/git-diff-stat.txt"
+  fi
   record_status "OK" "Git metadata snapshot" "git-metadata" "0" "manifest.txt" "manifest, status and diff stat captured"
 }
 
