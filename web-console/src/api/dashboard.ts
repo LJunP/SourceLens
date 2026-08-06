@@ -23,6 +23,15 @@ export interface DashboardStats {
   latestCodeChunks: number | null
   latestEmbeddedChunks: number | null
   languagesJson: string | null
+  trustedLoopCompletionRate?: number | null
+  trustedLoopStatus?: string | null
+  trustedLoopStatusLabel?: string | null
+  trustedLoopReadyStages?: number | null
+  trustedLoopTotalStages?: number | null
+  reportEvidenceReady?: boolean | null
+  codeQaReadiness?: string | null
+  recoverySignal?: string | null
+  trustedLoopMetricsSource?: string | null
 }
 
 export interface LanguageStat {

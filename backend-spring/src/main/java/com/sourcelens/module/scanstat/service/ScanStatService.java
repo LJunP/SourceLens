@@ -61,10 +61,10 @@ public class ScanStatService {
 
         long projectCount = projectIds.size();
         if (projectIds.isEmpty()) {
-            return ScanStat.builder()
+            return applyTrustedLoopMetrics(ScanStat.builder()
                     .projectCount(0)
                     .repositoryCount(0)
-                    .build();
+                    .build());
         }
 
         // 仓库数
@@ -117,7 +117,7 @@ public class ScanStatService {
         // 最新一次成功扫描的产物指标(真实数据)
         Map<String, Object> latestMetrics = getLatestScanMetrics(projectIds);
 
-        return ScanStat.builder()
+        return applyTrustedLoopMetrics(ScanStat.builder()
                 .projectCount(projectCount)
                 .repositoryCount(repositoryCount)
                 .totalScans(totalScans)
@@ -139,7 +139,7 @@ public class ScanStatService {
                 .latestCodeChunks(toLong(latestMetrics.get("codeChunks")))
                 .latestEmbeddedChunks(toLong(latestMetrics.get("embeddedChunks")))
                 .languagesJson((String) latestMetrics.get("languagesJson"))
-                .build();
+                .build());
     }
 
     /**
@@ -311,5 +311,47 @@ public class ScanStatService {
         if (val == null) return null;
         if (val instanceof Number n) return n.longValue();
         return null;
+    }
+
+    static ScanStat applyTrustedLoopMetrics(ScanStat stat) {
+        long activeScans = stat.getRunningScans() + stat.getPendingScans();
+        long riskCount = stat.getLatestRiskCount() == null ? 0 : stat.getLatestRiskCount();
+        boolean repositoryReady = stat.getRepositoryCount() > 0;
+        boolean scanReady = activeScans == 0 && stat.getSuccessScans() > 0;
+        boolean latestAnalysisReady = stat.getLatestTotalFiles() != null;
+        boolean codeKnowledgeReady = stat.getLatestCodeChunks() != null && stat.getLatestCodeChunks() > 0;
+        boolean nextStepReady = codeKnowledgeReady || riskCount > 0;
+
+        long readyStages = 0;
+        if (repositoryReady) readyStages += 1;
+        if (scanReady) readyStages += 1;
+        if (codeKnowledgeReady) readyStages += 1;
+        if (nextStepReady) readyStages += 1;
+
+        long totalStages = 4;
+        long completionRate = Math.round((readyStages * 100.0) / totalStages);
+        String status;
+        String statusLabel;
+        if (completionRate >= 100 && riskCount == 0) {
+            status = "ready";
+            statusLabel = "闭环可用";
+        } else if (completionRate >= 50) {
+            status = "warning";
+            statusLabel = "需要复核";
+        } else {
+            status = "idle";
+            statusLabel = "等待启动";
+        }
+
+        stat.setTrustedLoopCompletionRate(completionRate);
+        stat.setTrustedLoopStatus(status);
+        stat.setTrustedLoopStatusLabel(statusLabel);
+        stat.setTrustedLoopReadyStages(readyStages);
+        stat.setTrustedLoopTotalStages(totalStages);
+        stat.setReportEvidenceReady(stat.getSuccessScans() > 0);
+        stat.setCodeQaReadiness(codeKnowledgeReady ? "READY" : latestAnalysisReady ? "REVIEW" : "GAP");
+        stat.setRecoverySignal(activeScans > 0 ? "RUNNING" : riskCount > 0 ? "RISK" : "OK");
+        stat.setTrustedLoopMetricsSource("API");
+        return stat;
     }
 }

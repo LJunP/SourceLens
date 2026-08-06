@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { Tag, Typography } from 'antd'
 import { CodeOutlined, CheckCircleOutlined, CloseCircleOutlined, DownOutlined, RightOutlined } from '@ant-design/icons'
+import { redactAndTruncateText, redactSensitiveText, stringifyRedactedPayload } from '../utils/displayRedaction'
 
 const { Text } = Typography
 
@@ -22,43 +23,65 @@ const TOOL_LABELS: Record<string, string> = {
 
 export default function AgentToolCall({ name, arguments: args, result, success }: Props) {
   const [expanded, setExpanded] = useState(false)
+  const generatedId = useId()
 
   const label = TOOL_LABELS[name] || name
   const summary = buildSummary(name, args)
   const statusClass = success === false ? 'failed' : success === true ? 'success' : 'pending'
-  const resultPreview = result && result.length > 3000 ? result.slice(0, 3000) + '\n...(截断)' : result
+  const statusText = success === false ? '执行失败' : success === true ? '执行成功' : '等待结果'
+  const buttonId = `${generatedId}-button`
+  const bodyId = `${generatedId}-body`
+  const statusId = `${generatedId}-status`
+  const redactedArgsPreview = stringifyRedactedPayload(args)
+  const redactedResultPreview = buildRedactedPayloadPreview(result)
+  const resultSummary = buildResultSummary(result, success)
 
   return (
     <div className={`sl-agent-tool-call sl-agent-tool-call-${statusClass}`}>
       <button
+        id={buttonId}
         type="button"
         className="sl-agent-tool-call-head"
         aria-expanded={expanded}
+        aria-controls={bodyId}
+        aria-describedby={statusId}
+        aria-label={`${label}：${summary || '无摘要'}，${statusText}`}
         onClick={() => setExpanded(!expanded)}
       >
-        <span className="sl-agent-tool-call-toggle">
+        <span className="sl-agent-tool-call-toggle" aria-hidden="true">
           {expanded ? <DownOutlined /> : <RightOutlined />}
         </span>
-        <CodeOutlined className="sl-agent-tool-call-icon" />
+        <CodeOutlined className="sl-agent-tool-call-icon" aria-hidden="true" />
         <Text strong className="sl-agent-tool-call-label">{label}</Text>
         <Text type="secondary" className="sl-agent-tool-call-summary">
           {summary}
         </Text>
-        {success === undefined ? (
-          <Tag>等待结果</Tag>
-        ) : success ? (
-          <CheckCircleOutlined className="sl-agent-tool-call-success-icon" />
-        ) : (
-          <CloseCircleOutlined className="sl-agent-tool-call-failed-icon" />
-        )}
+        <span id={statusId} className="sl-agent-tool-call-status">
+          {success === undefined ? (
+            <Tag>等待结果</Tag>
+          ) : success ? (
+            <>
+              <CheckCircleOutlined className="sl-agent-tool-call-success-icon" aria-hidden="true" />
+              <span>执行成功</span>
+            </>
+          ) : (
+            <>
+              <CloseCircleOutlined className="sl-agent-tool-call-failed-icon" aria-hidden="true" />
+              <span>执行失败</span>
+            </>
+          )}
+        </span>
       </button>
 
       {expanded && (
-        <div className="sl-agent-tool-call-body">
+        <div id={bodyId} className="sl-agent-tool-call-body" role="region" aria-labelledby={buttonId}>
+          <div className="sl-agent-tool-call-readable-summary">
+            {resultSummary}
+          </div>
           <div className="sl-agent-tool-call-block">
             <Text type="secondary">参数</Text>
             <pre>
-              {JSON.stringify(args, null, 2)}
+              {redactedArgsPreview}
             </pre>
           </div>
           {result !== null && (
@@ -67,7 +90,7 @@ export default function AgentToolCall({ name, arguments: args, result, success }
                 结果 {success === false && <Tag color="error">失败</Tag>}
               </Text>
               <pre className={success === false ? 'sl-agent-tool-call-result-error' : undefined}>
-                {resultPreview}
+                {redactedResultPreview}
               </pre>
             </div>
           )}
@@ -77,21 +100,36 @@ export default function AgentToolCall({ name, arguments: args, result, success }
   )
 }
 
+function buildResultSummary(result: string | null, success?: boolean): string {
+  if (result === null) {
+    return '工具调用仍在等待返回结果。'
+  }
+  if (success === false) {
+    return '工具调用失败，请优先复核错误内容和下一步追问。'
+  }
+  const lineCount = result.split(/\r?\n/).filter(line => line.trim().length > 0).length
+  return `工具调用已返回 ${lineCount} 行内容，可展开核对原始证据。`
+}
+
 function buildSummary(name: string, args: Record<string, unknown>): string {
   switch (name) {
     case 'read_file':
-      return String(args.path || '')
+      return redactSensitiveText(String(args.path || ''))
     case 'search_code':
-      return String(args.pattern || '')
+      return redactSensitiveText(String(args.pattern || ''))
     case 'write_file':
-      return String(args.path || '')
+      return redactSensitiveText(String(args.path || ''))
     case 'shell_exec':
-      return String(args.command || '').slice(0, 80)
+      return redactSensitiveText(String(args.command || '')).slice(0, 80)
     case 'list_dir':
-      return String(args.path || '.')
+      return redactSensitiveText(String(args.path || '.'))
     case 'get_symbols':
-      return args.symbol ? String(args.symbol) : 'all'
+      return args.symbol ? redactSensitiveText(String(args.symbol)) : 'all'
     default:
-      return JSON.stringify(args).slice(0, 60)
+      return redactSensitiveText(stringifyRedactedPayload(args)).slice(0, 60)
   }
+}
+
+function buildRedactedPayloadPreview(value: string | null): string | null {
+  return redactAndTruncateText(value, 3000)
 }

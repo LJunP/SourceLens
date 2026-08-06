@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sourcelens.local/schemas/aios/task-spec-v1.json",
+  "title": "SourceLens AIOS TaskSpec v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "task_id", "dataset_version", "evaluation_split", "source", "repository", "issue",
+    "language", "build_system", "environment_snapshot_ref", "baseline_context", "allowed_tools",
+    "network_policy", "allowed_network_hosts", "budgets", "verification", "forbidden_changes",
+    "required_evidence", "risk_class", "human_approval_required"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "task_id": { "type": "string", "pattern": "^[A-Z0-9][A-Z0-9._-]{2,127}$" },
+    "dataset_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "evaluation_split": { "enum": ["development", "validation", "hidden"] },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "provenance", "license", "redistribution"],
+      "properties": {
+        "kind": { "enum": ["public_issue", "internal_issue", "synthetic_fixture"] },
+        "provenance": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "license": { "type": ["string", "null"], "maxLength": 256 },
+        "redistribution": { "enum": ["allowed", "restricted", "prohibited", "unknown"] }
+      }
+    },
+    "repository": {
+      "type": "object", "additionalProperties": false,
+      "required": ["identity", "base_commit", "tree_hash", "dirty_state_policy"],
+      "properties": {
+        "identity": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "base_commit": { "type": "string", "pattern": "^[0-9a-fA-F]{40,64}$" },
+        "tree_hash": { "type": "string", "pattern": "^[0-9a-fA-F]{40,64}$" },
+        "dirty_state_policy": { "const": "clean_immutable_base" }
+      }
+    },
+    "issue": {
+      "type": "object", "additionalProperties": false,
+      "required": ["text", "allowed_clarifications"],
+      "properties": {
+        "text": { "type": "string", "minLength": 1, "maxLength": 50000 },
+        "allowed_clarifications": { "type": "array", "items": { "type": "string", "maxLength": 4000 }, "maxItems": 20 }
+      }
+    },
+    "language": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
+    "build_system": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
+    "environment_snapshot_ref": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "baseline_context": {
+      "type": "object", "additionalProperties": false,
+      "required": ["artifact_ref", "sha256", "max_model_tokens", "ordering", "response_format_ref", "response_format_sha256"],
+      "properties": {
+        "artifact_ref": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "max_model_tokens": { "type": "integer", "minimum": 1 },
+        "ordering": { "enum": ["artifact_order", "path_then_line"] },
+        "response_format_ref": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "response_format_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "allowed_tools": { "type": "array", "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$" }, "uniqueItems": true },
+    "network_policy": { "enum": ["none", "fixture_only", "declared_allowlist"] },
+    "allowed_network_hosts": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "budgets": {
+      "type": "object", "additionalProperties": false,
+      "required": ["wall_clock_seconds", "max_model_tokens", "max_tool_calls", "max_cost_usd"],
+      "properties": {
+        "wall_clock_seconds": { "type": "integer", "minimum": 1 },
+        "max_model_tokens": { "type": "integer", "minimum": 0 },
+        "max_tool_calls": { "type": "integer", "minimum": 0 },
+        "max_cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "verification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["evaluator_version", "required_commands", "behavioral_assertions", "scope_policy"],
+      "properties": {
+        "evaluator_version": { "type": "string", "minLength": 1 },
+        "required_commands": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["command_id", "role", "argv", "working_directory", "timeout_seconds", "expected_exit_codes"],
+            "properties": {
+              "command_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$" },
+              "role": { "enum": ["issue_specific", "regression", "static", "security"] },
+              "argv": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+              "working_directory": { "type": "string", "minLength": 1 },
+              "timeout_seconds": { "type": "integer", "minimum": 1 },
+              "expected_exit_codes": { "type": "array", "items": { "type": "integer" }, "minItems": 1, "uniqueItems": true },
+              "non_secret_environment": { "type": "object", "additionalProperties": { "type": "string" } }
+            }
+          }
+        },
+        "behavioral_assertions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "scope_policy": { "type": "string", "minLength": 1 }
+      }
+    },
+    "forbidden_changes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "required_evidence": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
+    "risk_class": { "enum": ["low", "medium", "high", "critical"] },
+    "human_approval_required": { "type": "boolean" },
+    "tags": { "type": "array", "items": { "type": "string", "maxLength": 128 }, "uniqueItems": true }
+  }
+}

@@ -7,17 +7,42 @@ ENV_FILE="${SOURCELENS_RELEASE_EVIDENCE_ENV_FILE:-${SOURCELENS_PREFLIGHT_ENV_FIL
 EVIDENCE_DIR="${SOURCELENS_RELEASE_EVIDENCE_DIR:-release-evidence}"
 RUN_ID="${SOURCELENS_RELEASE_EVIDENCE_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RELEASE_EVIDENCE_PROFILE="${SOURCELENS_RELEASE_EVIDENCE_PROFILE:-local}"
+RELEASE_EVIDENCE_PROFILE_SOURCE="default"
+if [[ -n "${SOURCELENS_RELEASE_EVIDENCE_PROFILE+x}" ]]; then
+  RELEASE_EVIDENCE_PROFILE_SOURCE="env"
+fi
+RELEASE_EVIDENCE_PROFILE_SCHEMA_VERSION="3"
 INCLUDE_VERIFY="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY:-true}"
 INCLUDE_PREFLIGHT="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT:-true}"
 INCLUDE_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE:-auto}"
+INCLUDE_PUBLIC_REPO_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE:-auto}"
+PUBLIC_REPO_SMOKE_UI="${SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_SMOKE_UI:-false}"
+PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION="${SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION:-auto}"
+INCLUDE_FILE_BOUND_REPAIR_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE:-auto}"
+INCLUDE_AUTOREPAIR_PATCH_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE:-auto}"
+INCLUDE_PATCH_READY_UI_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE:-false}"
+INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE:-false}"
+INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE:-false}"
+INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE:-false}"
+INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE:-false}"
+INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE:-false}"
+INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE:-false}"
+INCLUDE_AUDIT_WORKBENCH_SMOKE="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE:-auto}"
 INCLUDE_PHASE12="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12:-auto}"
 INCLUDE_SANDBOX_DRILL="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL:-auto}"
 INCLUDE_GITHUB_APP_DRILL="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL:-auto}"
 INCLUDE_GITHUB_WEBHOOK_DRILL="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL:-auto}"
 INCLUDE_LLM_PROVIDER_RUN="${SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN:-auto}"
 WORKTREE_INVENTORY_STRICT="${SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT:-true}"
+AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES="${SOURCELENS_RELEASE_EVIDENCE_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES:-${SOURCELENS_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES:-false}}"
 LLM_PROVIDER_RUN_FILE="${SOURCELENS_RELEASE_EVIDENCE_LLM_PROVIDER_RUN_FILE:-}"
 LLM_RAW_OUTPUT_DIR="${SOURCELENS_RELEASE_EVIDENCE_LLM_RAW_OUTPUT_DIR:-}"
+RELEASE_EVIDENCE_TARGET_ENV="${SOURCELENS_RELEASE_EVIDENCE_TARGET_ENV:-local}"
+ALLOW_MUTATING_PROD="${SOURCELENS_RELEASE_EVIDENCE_ALLOW_MUTATING_PROD:-false}"
+ALLOW_EXTERNAL_DRILLS="${SOURCELENS_RELEASE_EVIDENCE_ALLOW_EXTERNAL_DRILLS:-false}"
+PLAYWRIGHT_VERSION_TIMEOUT_SECONDS="${SOURCELENS_RELEASE_EVIDENCE_PLAYWRIGHT_VERSION_TIMEOUT_SECONDS:-20}"
+PUBLIC_REPO_SOURCE_LOCATION_PROBES_REQUIRED="false"
 RUN_ID_MAX_CHARS="64"
 
 failures=0
@@ -104,16 +129,260 @@ validate_optional_mode() {
   esac
 }
 
+validate_positive_integer_config() {
+  local key="$1"
+  local value="$2"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+    echo "$key must be a positive integer" >&2
+    exit 1
+  }
+}
+
+validate_release_evidence_profile() {
+  case "$(to_lower "$(normalize_config_value "$RELEASE_EVIDENCE_PROFILE")")" in
+    local|ci|release|nightly)
+      RELEASE_EVIDENCE_PROFILE="$(to_lower "$(normalize_config_value "$RELEASE_EVIDENCE_PROFILE")")"
+      ;;
+    *)
+      echo "SOURCELENS_RELEASE_EVIDENCE_PROFILE must be local, ci, release, or nightly" >&2
+      exit 1
+      ;;
+  esac
+}
+
+validate_release_evidence_target_env() {
+  case "$(to_lower "$(normalize_config_value "$RELEASE_EVIDENCE_TARGET_ENV")")" in
+    local|staging|prod)
+      RELEASE_EVIDENCE_TARGET_ENV="$(to_lower "$(normalize_config_value "$RELEASE_EVIDENCE_TARGET_ENV")")"
+      ;;
+    *)
+      echo "SOURCELENS_RELEASE_EVIDENCE_TARGET_ENV must be local, staging, or prod" >&2
+      exit 1
+      ;;
+  esac
+}
+
+assert_no_profile_include_overrides() {
+  local env_name
+  for env_name in \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_SMOKE_UI \
+    SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12 \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN; do
+    if [[ -n "${!env_name+x}" ]]; then
+      echo "$env_name cannot be used with SOURCELENS_RELEASE_EVIDENCE_PROFILE=$RELEASE_EVIDENCE_PROFILE; use profile=local for granular include overrides" >&2
+      exit 1
+    fi
+  done
+}
+
+set_profile_default() {
+  local variable_name="$1"
+  local env_name="$2"
+  local default_value="$3"
+  if [[ -z "${!env_name+x}" ]]; then
+    printf -v "$variable_name" '%s' "$default_value"
+  fi
+}
+
+apply_release_evidence_profile() {
+  validate_release_evidence_profile
+  case "$RELEASE_EVIDENCE_PROFILE" in
+    local)
+      return
+      ;;
+    ci)
+      assert_no_profile_include_overrides
+      INCLUDE_VERIFY=false
+      INCLUDE_PREFLIGHT=false
+      INCLUDE_SMOKE=false
+      INCLUDE_PUBLIC_REPO_SMOKE=false
+      PUBLIC_REPO_SMOKE_UI=false
+      PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION=false
+      INCLUDE_FILE_BOUND_REPAIR_SMOKE=false
+      INCLUDE_AUTOREPAIR_PATCH_SMOKE=false
+      INCLUDE_PATCH_READY_UI_SMOKE=false
+      INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE=false
+      INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE=false
+      INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE=false
+      INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE=false
+      INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE=false
+      INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=false
+      INCLUDE_AUDIT_WORKBENCH_SMOKE=false
+      INCLUDE_PHASE12=false
+      INCLUDE_SANDBOX_DRILL=false
+      INCLUDE_GITHUB_APP_DRILL=false
+      INCLUDE_GITHUB_WEBHOOK_DRILL=false
+      INCLUDE_LLM_PROVIDER_RUN=false
+      ;;
+    release)
+      assert_no_profile_include_overrides
+      INCLUDE_VERIFY=true
+      INCLUDE_PREFLIGHT=true
+      INCLUDE_SMOKE=true
+      INCLUDE_PUBLIC_REPO_SMOKE=true
+      PUBLIC_REPO_SMOKE_UI=true
+      PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION=true
+      INCLUDE_FILE_BOUND_REPAIR_SMOKE=true
+      INCLUDE_AUTOREPAIR_PATCH_SMOKE=true
+      INCLUDE_PATCH_READY_UI_SMOKE=true
+      INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE=true
+      INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE=true
+      INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE=true
+      INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE=true
+      INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE=true
+      INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=auto
+      INCLUDE_AUDIT_WORKBENCH_SMOKE=true
+      INCLUDE_PHASE12=auto
+      INCLUDE_SANDBOX_DRILL=auto
+      INCLUDE_GITHUB_APP_DRILL=auto
+      INCLUDE_GITHUB_WEBHOOK_DRILL=auto
+      INCLUDE_LLM_PROVIDER_RUN=auto
+      ;;
+    nightly)
+      assert_no_profile_include_overrides
+      INCLUDE_VERIFY=true
+      INCLUDE_PREFLIGHT=true
+      INCLUDE_SMOKE=true
+      INCLUDE_PUBLIC_REPO_SMOKE=true
+      PUBLIC_REPO_SMOKE_UI=true
+      PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION=true
+      INCLUDE_FILE_BOUND_REPAIR_SMOKE=true
+      INCLUDE_AUTOREPAIR_PATCH_SMOKE=true
+      INCLUDE_PATCH_READY_UI_SMOKE=true
+      INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE=true
+      INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE=true
+      INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE=true
+      INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE=true
+      INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE=true
+      INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=auto
+      INCLUDE_AUDIT_WORKBENCH_SMOKE=true
+      INCLUDE_PHASE12=true
+      INCLUDE_SANDBOX_DRILL=true
+      INCLUDE_GITHUB_APP_DRILL=auto
+      INCLUDE_GITHUB_WEBHOOK_DRILL=auto
+      INCLUDE_LLM_PROVIDER_RUN=auto
+      ;;
+  esac
+}
+
+set_profile_derived_requirements() {
+  case "$RELEASE_EVIDENCE_PROFILE" in
+    release|nightly)
+      PUBLIC_REPO_SOURCE_LOCATION_PROBES_REQUIRED="true"
+      ;;
+    *)
+      PUBLIC_REPO_SOURCE_LOCATION_PROBES_REQUIRED="false"
+      ;;
+  esac
+}
+
 validate_include_modes() {
+  validate_release_evidence_profile
   validate_bool_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY "$INCLUDE_VERIFY"
   validate_bool_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT "$INCLUDE_PREFLIGHT"
   validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE "$INCLUDE_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE "$INCLUDE_PUBLIC_REPO_SMOKE"
+  validate_bool_mode SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_SMOKE_UI "$PUBLIC_REPO_SMOKE_UI"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION "$PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE "$INCLUDE_FILE_BOUND_REPAIR_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE "$INCLUDE_AUTOREPAIR_PATCH_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE "$INCLUDE_PATCH_READY_UI_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE "$INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE "$INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE "$INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE "$INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE "$INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE "$INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE"
+  validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE "$INCLUDE_AUDIT_WORKBENCH_SMOKE"
   validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12 "$INCLUDE_PHASE12"
   validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL "$INCLUDE_SANDBOX_DRILL"
   validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL "$INCLUDE_GITHUB_APP_DRILL"
   validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL "$INCLUDE_GITHUB_WEBHOOK_DRILL"
   validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN "$INCLUDE_LLM_PROVIDER_RUN"
   validate_bool_mode SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT "$WORKTREE_INVENTORY_STRICT"
+  validate_bool_mode SOURCELENS_RELEASE_EVIDENCE_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES "$AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES"
+  validate_release_evidence_target_env
+  validate_bool_mode SOURCELENS_RELEASE_EVIDENCE_ALLOW_MUTATING_PROD "$ALLOW_MUTATING_PROD"
+  validate_bool_mode SOURCELENS_RELEASE_EVIDENCE_ALLOW_EXTERNAL_DRILLS "$ALLOW_EXTERNAL_DRILLS"
+  validate_positive_integer_config SOURCELENS_RELEASE_EVIDENCE_PLAYWRIGHT_VERSION_TIMEOUT_SECONDS "$PLAYWRIGHT_VERSION_TIMEOUT_SECONDS"
+  if is_true "$PUBLIC_REPO_SMOKE_UI" && is_false "$INCLUDE_PUBLIC_REPO_SMOKE"; then
+    echo "SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_SMOKE_UI=true requires SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE to be true or auto" >&2
+    exit 1
+  fi
+  if mode_required "$PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION" && is_false "$INCLUDE_PUBLIC_REPO_SMOKE"; then
+    echo "SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION=true requires SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE to be true or auto" >&2
+    exit 1
+  fi
+}
+
+run_command_with_timeout() {
+  local seconds="$1"
+  local status
+  local restore_errexit=false
+  shift
+  validate_positive_integer_config command_timeout "$seconds"
+  case "$-" in
+    *e*) restore_errexit=true ;;
+  esac
+  set +e
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+    status=$?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
+    status=$?
+  else
+    node -e '
+const { spawn } = require("node:child_process");
+const seconds = Number(process.argv[1]);
+const command = process.argv[2];
+const args = process.argv.slice(3);
+if (!Number.isInteger(seconds) || seconds <= 0 || !command) process.exit(127);
+let timedOut = false;
+const child = spawn(command, args, { stdio: "inherit" });
+const timer = setTimeout(() => {
+  timedOut = true;
+  child.kill("SIGTERM");
+  setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+}, seconds * 1000);
+child.on("exit", (code, signal) => {
+  clearTimeout(timer);
+  if (timedOut) process.exit(124);
+  if (signal) process.exit(128);
+  process.exit(code ?? 1);
+});
+child.on("error", error => {
+  clearTimeout(timer);
+  console.error(error.message);
+  process.exit(127);
+});
+' "$seconds" "$@"
+    status=$?
+  fi
+  if [[ "$restore_errexit" == "true" ]]; then
+    set -e
+  else
+    set +e
+  fi
+  return "$status"
 }
 
 resolve_path() {
@@ -239,6 +508,178 @@ mode_enabled() {
 mode_required() {
   local mode="$1"
   is_true "$mode"
+}
+
+bool_env_value() {
+  local value="$1"
+  if is_true "$value"; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
+base_url_host() {
+  local value="$1"
+  local host
+  value="$(normalize_base_url "$value")"
+  value="${value#*://}"
+  value="${value%%/*}"
+  value="${value#*@}"
+  host="$value"
+  if [[ "$host" == \[*\]* ]]; then
+    host="${host#\[}"
+    host="${host%%\]*}"
+  else
+    host="${host%%:*}"
+  fi
+  printf '%s\n' "$(to_lower "$host")"
+}
+
+is_loopback_base_url() {
+  local host
+  host="$(base_url_host "$1")"
+  case "$host" in
+    localhost|127.*|::1|0:0:0:0:0:0:0:1)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+base_url_port() {
+  local value="$1"
+  local scheme
+  local authority
+  local remainder
+  value="$(normalize_base_url "$value")"
+  scheme="${value%%://*}"
+  authority="${value#*://}"
+  authority="${authority%%/*}"
+  authority="${authority#*@}"
+  if [[ "$authority" == \[*\]* ]]; then
+    remainder="${authority#*\]}"
+    if [[ "$remainder" == :* ]]; then
+      printf '%s\n' "${remainder#:}"
+      return
+    fi
+  elif [[ "$authority" == *:* ]]; then
+    printf '%s\n' "${authority##*:}"
+    return
+  fi
+  case "$(to_lower "$scheme")" in
+    http) printf '80\n' ;;
+    https) printf '443\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+
+profile_runs_mutating_smokes() {
+  case "$RELEASE_EVIDENCE_PROFILE" in
+    release|nightly) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+release_evidence_runs_backend_smokes() {
+  mode_enabled "$INCLUDE_SMOKE" \
+    || mode_enabled "$INCLUDE_PUBLIC_REPO_SMOKE" \
+    || mode_enabled "$INCLUDE_FILE_BOUND_REPAIR_SMOKE" \
+    || mode_enabled "$INCLUDE_AUTOREPAIR_PATCH_SMOKE" \
+    || mode_enabled "$INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE" \
+    || mode_enabled "$INCLUDE_AUDIT_WORKBENCH_SMOKE"
+}
+
+is_unsafe_local_backend_runtime_command() {
+  local command_line="$1"
+  [[ "$command_line" == *"backend-spring/target/classes"* ]] \
+    || [[ "$command_line" == *"spring-boot:run"* ]] \
+    || [[ "$command_line" == *"backend-spring/target/"*"source-lens-backend"*".jar"* ]]
+}
+
+validate_loopback_backend_runtime_boundary() {
+  local base_url
+  local port
+  local listener
+  local listener_pids
+  local listener_pid
+  local listener_command
+  base_url="$(normalize_base_url "$(config_value SOURCELENS_BASE_URL)")"
+  if [[ -z "$base_url" ]] || ! release_evidence_runs_backend_smokes || ! is_loopback_base_url "$base_url"; then
+    return
+  fi
+  port="$(base_url_port "$base_url")"
+  if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
+    echo "SOURCELENS_BASE_URL=$base_url must include a numeric port when release evidence targets a loopback backend smoke" >&2
+    exit 1
+  fi
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "lsof is required to verify loopback backend runtime before release evidence backend smoke" >&2
+    echo "Use SERVER_PORT=$port make backend-jar so release evidence targets .sourcelens-runtime/backend instead of target/classes or backend-spring/target/*.jar" >&2
+    exit 1
+  fi
+
+  listener="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -z "$listener" ]]; then
+    return
+  fi
+  listener_pids="$(printf '%s\n' "$listener" | awk 'NR > 1 && $2 ~ /^[0-9]+$/ { print $2 }' | LC_ALL=C sort -u)"
+  while IFS= read -r listener_pid; do
+    [[ -n "$listener_pid" ]] || continue
+    listener_command="$(ps -p "$listener_pid" -o command= 2>/dev/null || true)"
+    if is_unsafe_local_backend_runtime_command "$listener_command"; then
+      echo "SOURCELENS_BASE_URL points to an unsafe local backend runtime: $base_url" >&2
+      echo "$listener" >&2
+      echo >&2
+      echo "The listener command is: $listener_command" >&2
+      echo "Do not run release evidence backend smoke against target/classes, mvn spring-boot:run, or backend-spring/target/*.jar; Maven clean can break those runtimes mid-run." >&2
+      echo "Run: cd backend-spring && mvn -DskipTests package" >&2
+      echo "Then run: SERVER_PORT=$port make backend-jar" >&2
+      echo "The expected stable runtime is under .sourcelens-runtime/backend." >&2
+      exit 1
+    fi
+  done <<< "$listener_pids"
+}
+
+validate_mutating_target_boundary() {
+  local base_url
+  base_url="$(normalize_base_url "$(config_value SOURCELENS_BASE_URL)")"
+  if ! profile_runs_mutating_smokes || [[ -z "$base_url" ]]; then
+    return
+  fi
+  if is_loopback_base_url "$base_url"; then
+    return
+  fi
+  case "$RELEASE_EVIDENCE_TARGET_ENV" in
+    staging)
+      return
+      ;;
+    prod)
+      if is_true "$ALLOW_MUTATING_PROD"; then
+        return
+      fi
+      echo "SOURCELENS_RELEASE_EVIDENCE_PROFILE=$RELEASE_EVIDENCE_PROFILE targets non-local SOURCELENS_BASE_URL=$base_url with target_env=prod; set SOURCELENS_RELEASE_EVIDENCE_ALLOW_MUTATING_PROD=true only for a dedicated production smoke tenant" >&2
+      exit 1
+      ;;
+    *)
+      echo "SOURCELENS_RELEASE_EVIDENCE_PROFILE=$RELEASE_EVIDENCE_PROFILE runs mutating smoke steps against non-local SOURCELENS_BASE_URL=$base_url; set SOURCELENS_RELEASE_EVIDENCE_TARGET_ENV=staging or prod explicitly" >&2
+      exit 1
+      ;;
+  esac
+}
+
+external_drills_allowed() {
+  [[ "$RELEASE_EVIDENCE_PROFILE" == "local" ]] || is_true "$ALLOW_EXTERNAL_DRILLS"
+}
+
+public_repo_smoke_cleanup_value() {
+  if profile_runs_mutating_smokes; then
+    printf 'true\n'
+  else
+    bool_env_value "${SOURCELENS_PUBLIC_REPO_SMOKE_CLEANUP:-false}"
+  fi
 }
 
 append_summary() {
@@ -395,7 +836,9 @@ sensitive_config_keys() {
       SOURCELENS_SMOKE_TOKEN \
       OPENAI_API_KEY
     sensitive_keys_from_env_file
-    sensitive_keys_from_process_env
+    if is_true "${SOURCELENS_RELEASE_EVIDENCE_SCAN_PROCESS_ENV_SECRETS:-false}"; then
+      sensitive_keys_from_process_env
+    fi
   } | awk 'NF && !seen[$0]++'
 }
 
@@ -478,11 +921,19 @@ redact_value_in_file() {
 sanitize_log_file() {
   local file="$1"
   local key
+  local keys_file
   local value
+  keys_file="$(mktemp "${TMPDIR:-/tmp}/sourcelens-sensitive-keys.XXXXXX")" \
+    || {
+      echo "could not create sensitive key list temp file" >&2
+      exit 1
+    }
+  sensitive_config_keys > "$keys_file"
   while IFS= read -r key; do
     value="$(config_value "$key")"
     redact_value_in_file "$file" "$value"
-  done < <(sensitive_config_keys)
+  done < "$keys_file"
+  rm -f "$keys_file"
   return 0
 }
 
@@ -496,6 +947,7 @@ run_step() {
   local finished_at
   local exit_code
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '==> %s [%s] started; log=%s\n' "$title" "$slug" "$(basename "$log_file")"
   {
     printf 'title: %s\n' "$title"
     printf 'started_at: %s\n' "$started_at"
@@ -515,11 +967,14 @@ run_step() {
   } >> "$log_file"
   sanitize_log_file "$log_file"
   if [[ "$exit_code" == "0" ]]; then
+    printf '==> %s [%s] OK\n' "$title" "$slug"
     record_status "OK" "$title" "$slug" "$exit_code" "$(basename "$log_file")" "completed"
   elif is_true "$required"; then
+    printf '==> %s [%s] FAIL exit=%s\n' "$title" "$slug" "$exit_code"
     failures=$((failures + 1))
     record_status "FAIL" "$title" "$slug" "$exit_code" "$(basename "$log_file")" "required step failed"
   else
+    printf '==> %s [%s] WARN exit=%s\n' "$title" "$slug" "$exit_code"
     warnings=$((warnings + 1))
     record_status "WARN" "$title" "$slug" "$exit_code" "$(basename "$log_file")" "optional step failed"
   fi
@@ -1172,17 +1627,35 @@ write_git_metadata() {
   {
     printf 'run_id: %s\n' "$RUN_ID"
     printf 'created_at: %s\n' "$CREATED_AT"
+    printf 'release_evidence_profile_schema: %s\n' "$RELEASE_EVIDENCE_PROFILE_SCHEMA_VERSION"
+    printf 'release_evidence_profile: %s\n' "$RELEASE_EVIDENCE_PROFILE"
+    printf 'release_evidence_profile_source: %s\n' "$RELEASE_EVIDENCE_PROFILE_SOURCE"
     printf 'root_dir: %s\n' "$ROOT_DIR"
     printf 'env_file: %s\n' "$ENV_FILE"
     printf 'include_verify: %s\n' "$INCLUDE_VERIFY"
     printf 'include_preflight: %s\n' "$INCLUDE_PREFLIGHT"
     printf 'include_smoke: %s\n' "$INCLUDE_SMOKE"
+    printf 'include_public_repo_smoke: %s\n' "$INCLUDE_PUBLIC_REPO_SMOKE"
+    printf 'public_repo_smoke_ui: %s\n' "$(bool_env_value "$PUBLIC_REPO_SMOKE_UI")"
+    printf 'public_repo_report_evidence_qa_citation: %s\n' "$PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION"
+    printf 'public_repo_source_location_probes_required: %s\n' "$PUBLIC_REPO_SOURCE_LOCATION_PROBES_REQUIRED"
+    printf 'include_file_bound_repair_smoke: %s\n' "$INCLUDE_FILE_BOUND_REPAIR_SMOKE"
+    printf 'include_autorepair_patch_smoke: %s\n' "$INCLUDE_AUTOREPAIR_PATCH_SMOKE"
+    printf 'include_patch_ready_ui_smoke: %s\n' "$INCLUDE_PATCH_READY_UI_SMOKE"
+    printf 'include_dashboard_next_action_ui_smoke: %s\n' "$INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE"
+    printf 'include_report_evidence_drawer_ui_smoke: %s\n' "$INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE"
+    printf 'include_scan_governance_timeline_ui_smoke: %s\n' "$INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE"
+    printf 'include_agent_chat_audit_ui_smoke: %s\n' "$INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE"
+    printf 'include_agent_chat_closure_rail_ui_smoke: %s\n' "$INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE"
+    printf 'include_agent_chat_tool_audit_smoke: %s\n' "$INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE"
+    printf 'include_audit_workbench_smoke: %s\n' "$INCLUDE_AUDIT_WORKBENCH_SMOKE"
     printf 'include_phase12: %s\n' "$INCLUDE_PHASE12"
     printf 'include_sandbox_drill: %s\n' "$INCLUDE_SANDBOX_DRILL"
     printf 'include_github_app_drill: %s\n' "$INCLUDE_GITHUB_APP_DRILL"
     printf 'include_github_webhook_drill: %s\n' "$INCLUDE_GITHUB_WEBHOOK_DRILL"
     printf 'include_llm_provider_run: %s\n' "$INCLUDE_LLM_PROVIDER_RUN"
     printf 'worktree_inventory_strict: %s\n' "$WORKTREE_INVENTORY_STRICT"
+    printf 'audit_workbench_smoke_require_samples: %s\n' "$(bool_env_value "$AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES")"
     printf 'llm_provider_run_file: %s\n' "$manifest_llm_provider_run_file"
     printf 'llm_raw_output_dir: %s\n' "$manifest_llm_raw_output_dir"
     printf 'git_head: '
@@ -1226,11 +1699,16 @@ write_worktree_inventory() {
 }
 
 run_preflights() {
+  local preflight_static_gates
+  preflight_static_gates="true"
+  if is_true "$INCLUDE_VERIFY"; then
+    preflight_static_gates="false"
+  fi
   run_step \
     "Production preflight (warn-only)" \
     "prod-preflight" \
     true \
-    env SOURCELENS_PREFLIGHT_ENV_FILE="$ENV_FILE" SOURCELENS_PREFLIGHT_WARN_ONLY=true ./scripts/production-preflight.sh
+    env SOURCELENS_PREFLIGHT_ENV_FILE="$ENV_FILE" SOURCELENS_PREFLIGHT_WARN_ONLY=true SOURCELENS_PREFLIGHT_INCLUDE_STATIC_GATES="$preflight_static_gates" ./scripts/production-preflight.sh
   run_step \
     "Backup/restore preflight (warn-only)" \
     "backup-preflight" \
@@ -1278,6 +1756,302 @@ run_smoke_if_available() {
     "smoke" \
     true \
     env SOURCELENS_SMOKE_ENV_FILE="$ENV_FILE" ./scripts/smoke-test.sh
+}
+
+run_public_repo_smoke_if_available() {
+  local base_url
+  base_url="$(normalize_base_url "$(config_value SOURCELENS_BASE_URL)")"
+  if is_false "$INCLUDE_PUBLIC_REPO_SMOKE"; then
+    record_skip "Public repo analysis smoke" "public-repo-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false"
+    return
+  fi
+  if [[ -z "$base_url" ]]; then
+    if mode_required "$INCLUDE_PUBLIC_REPO_SMOKE"; then
+      record_required_missing "Public repo analysis smoke" "public-repo-smoke" "SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=true"
+    else
+      record_skip "Public repo analysis smoke" "public-repo-smoke" "SOURCELENS_BASE_URL is not configured"
+    fi
+    return
+  fi
+  run_step \
+    "Public repo analysis smoke" \
+    "public-repo-smoke" \
+    true \
+    env SOURCELENS_BASE_URL="$base_url" SOURCELENS_PUBLIC_REPO_SMOKE_UI="$(bool_env_value "$PUBLIC_REPO_SMOKE_UI")" SOURCELENS_PUBLIC_REPO_SMOKE_REPORT_EVIDENCE_QA_CITATION="$(normalize_config_value "$PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION")" SOURCELENS_PUBLIC_REPO_SMOKE_CLEANUP="$(public_repo_smoke_cleanup_value)" ./scripts/public-repo-analysis-smoke.sh
+}
+
+run_file_bound_repair_smoke_if_available() {
+  local base_url
+  base_url="$(normalize_base_url "$(config_value SOURCELENS_BASE_URL)")"
+  if is_false "$INCLUDE_FILE_BOUND_REPAIR_SMOKE"; then
+    record_skip "File-bound repair smoke" "file-bound-repair-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false"
+    return
+  fi
+  if [[ -z "$base_url" ]]; then
+    if mode_required "$INCLUDE_FILE_BOUND_REPAIR_SMOKE"; then
+      record_required_missing "File-bound repair smoke" "file-bound-repair-smoke" "SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=true"
+    else
+      record_skip "File-bound repair smoke" "file-bound-repair-smoke" "SOURCELENS_BASE_URL is not configured"
+    fi
+    return
+  fi
+  run_step \
+    "File-bound repair smoke" \
+    "file-bound-repair-smoke" \
+    true \
+    env SOURCELENS_BASE_URL="$base_url" ./scripts/file-bound-repair-smoke.sh
+}
+
+run_autorepair_patch_smoke_if_available() {
+  local base_url
+  base_url="$(normalize_base_url "$(config_value SOURCELENS_BASE_URL)")"
+  if is_false "$INCLUDE_AUTOREPAIR_PATCH_SMOKE"; then
+    record_skip "AutoRepair patch readiness smoke" "autorepair-patch-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false"
+    return
+  fi
+  if [[ -z "$base_url" ]]; then
+    if mode_required "$INCLUDE_AUTOREPAIR_PATCH_SMOKE"; then
+      record_required_missing "AutoRepair patch readiness smoke" "autorepair-patch-smoke" "SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=true"
+    else
+      record_skip "AutoRepair patch readiness smoke" "autorepair-patch-smoke" "SOURCELENS_BASE_URL is not configured"
+    fi
+    return
+  fi
+  run_step \
+    "AutoRepair patch readiness smoke" \
+    "autorepair-patch-smoke" \
+    true \
+    env SOURCELENS_BASE_URL="$base_url" ./scripts/autorepair-patch-smoke.sh
+}
+
+playwright_smoke_available() {
+  local config_file="$1"
+  local spec_file="$2"
+  local local_playwright="${ROOT_DIR}/web-console/node_modules/.bin/playwright"
+  command -v node >/dev/null 2>&1 || return 1
+  [[ -f "${ROOT_DIR}/web-console/package.json" ]] || return 1
+  [[ -f "${ROOT_DIR}/web-console/${config_file}" ]] || return 1
+  [[ -f "${ROOT_DIR}/web-console/${spec_file}" ]] || return 1
+  if [[ -x "$local_playwright" ]]; then
+    (cd "${ROOT_DIR}/web-console" && "$local_playwright" --version >/dev/null 2>&1)
+    return
+  fi
+  command -v npm >/dev/null 2>&1 || return 1
+  (cd "${ROOT_DIR}/web-console" && run_command_with_timeout "$PLAYWRIGHT_VERSION_TIMEOUT_SECONDS" npm exec -- playwright --version >/dev/null 2>&1)
+}
+
+patch_ready_ui_smoke_available() {
+  playwright_smoke_available \
+    playwright.patch-ready.config.ts \
+    tests/patch-ready-smoke.spec.ts
+}
+
+run_patch_ready_ui_smoke_if_available() {
+  if is_false "$INCLUDE_PATCH_READY_UI_SMOKE"; then
+    record_skip "PATCH_READY browser UI smoke (mocked)" "patch-ready-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false"
+    return
+  fi
+  if ! patch_ready_ui_smoke_available; then
+    if mode_required "$INCLUDE_PATCH_READY_UI_SMOKE"; then
+      run_step "PATCH_READY browser UI smoke (mocked)" "patch-ready-ui-smoke" true \
+        bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make patch-ready-ui-smoke'
+    else
+      record_skip "PATCH_READY browser UI smoke (mocked)" "patch-ready-ui-smoke" "node/npm or Playwright browser smoke dependencies are not available"
+    fi
+    return
+  fi
+  run_step \
+    "PATCH_READY browser UI smoke (mocked)" \
+    "patch-ready-ui-smoke" \
+    true \
+    bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make patch-ready-ui-smoke'
+}
+
+dashboard_next_action_ui_smoke_available() {
+  playwright_smoke_available \
+    playwright.dashboard-next-action.config.ts \
+    tests/dashboard-next-action-smoke.spec.ts
+}
+
+run_dashboard_next_action_ui_smoke_if_available() {
+  if is_false "$INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE"; then
+    record_skip "Dashboard next action browser UI smoke (mocked)" "dashboard-next-action-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE=false"
+    return
+  fi
+  if ! dashboard_next_action_ui_smoke_available; then
+    if mode_required "$INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE"; then
+      run_step "Dashboard next action browser UI smoke (mocked)" "dashboard-next-action-ui-smoke" true \
+        bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; export SOURCELENS_DASHBOARD_NEXT_ACTION_UI_ARTIFACT_DIR="$1"; make dashboard-next-action-ui-smoke' _ "${RUN_DIR}/dashboard-next-action-ui-smoke"
+    else
+      record_skip "Dashboard next action browser UI smoke (mocked)" "dashboard-next-action-ui-smoke" "node/npm or Playwright browser smoke dependencies are not available"
+    fi
+    return
+  fi
+  run_step \
+    "Dashboard next action browser UI smoke (mocked)" \
+    "dashboard-next-action-ui-smoke" \
+    true \
+    bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; export SOURCELENS_DASHBOARD_NEXT_ACTION_UI_ARTIFACT_DIR="$1"; make dashboard-next-action-ui-smoke' _ "${RUN_DIR}/dashboard-next-action-ui-smoke"
+}
+
+report_evidence_drawer_ui_smoke_available() {
+  playwright_smoke_available \
+    playwright.report-evidence-drawer.config.ts \
+    tests/report-evidence-drawer-smoke.spec.ts
+}
+
+run_report_evidence_drawer_ui_smoke_if_available() {
+  if is_false "$INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE"; then
+    record_skip "Report evidence drawer browser UI smoke (mocked)" "report-evidence-drawer-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE=false"
+    return
+  fi
+  if ! report_evidence_drawer_ui_smoke_available; then
+    if mode_required "$INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE"; then
+      run_step "Report evidence drawer browser UI smoke (mocked)" "report-evidence-drawer-ui-smoke" true \
+        bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make report-evidence-drawer-ui-smoke'
+    else
+      record_skip "Report evidence drawer browser UI smoke (mocked)" "report-evidence-drawer-ui-smoke" "node/npm or Playwright browser smoke dependencies are not available"
+    fi
+    return
+  fi
+  run_step \
+    "Report evidence drawer browser UI smoke (mocked)" \
+    "report-evidence-drawer-ui-smoke" \
+    true \
+    bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make report-evidence-drawer-ui-smoke'
+}
+
+scan_governance_timeline_ui_smoke_available() {
+  playwright_smoke_available \
+    playwright.scan-governance-timeline.config.ts \
+    tests/scan-governance-timeline-smoke.spec.ts
+}
+
+run_scan_governance_timeline_ui_smoke_if_available() {
+  if is_false "$INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE"; then
+    record_skip "Scan governance timeline browser UI smoke (mocked)" "scan-governance-timeline-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE=false"
+    return
+  fi
+  if ! scan_governance_timeline_ui_smoke_available; then
+    if mode_required "$INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE"; then
+      run_step "Scan governance timeline browser UI smoke (mocked)" "scan-governance-timeline-ui-smoke" true \
+        bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make scan-governance-timeline-ui-smoke'
+    else
+      record_skip "Scan governance timeline browser UI smoke (mocked)" "scan-governance-timeline-ui-smoke" "node/npm or Playwright browser smoke dependencies are not available"
+    fi
+    return
+  fi
+  run_step \
+    "Scan governance timeline browser UI smoke (mocked)" \
+    "scan-governance-timeline-ui-smoke" \
+    true \
+    bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make scan-governance-timeline-ui-smoke'
+}
+
+agent_chat_audit_ui_smoke_available() {
+  playwright_smoke_available \
+    playwright.agent-chat-audit.config.ts \
+    tests/agent-chat-audit-smoke.spec.ts
+}
+
+run_agent_chat_audit_ui_smoke_if_available() {
+  if is_false "$INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE"; then
+    record_skip "AgentChat audit browser UI smoke (mocked)" "agent-chat-audit-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE=false"
+    return
+  fi
+  if ! agent_chat_audit_ui_smoke_available; then
+    if mode_required "$INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE"; then
+      run_step "AgentChat audit browser UI smoke (mocked)" "agent-chat-audit-ui-smoke" true \
+        bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make agent-chat-audit-ui-smoke'
+    else
+      record_skip "AgentChat audit browser UI smoke (mocked)" "agent-chat-audit-ui-smoke" "node/npm or Playwright browser smoke dependencies are not available"
+    fi
+    return
+  fi
+  run_step \
+    "AgentChat audit browser UI smoke (mocked)" \
+    "agent-chat-audit-ui-smoke" \
+    true \
+    bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make agent-chat-audit-ui-smoke'
+}
+
+agent_chat_closure_rail_ui_smoke_available() {
+  playwright_smoke_available \
+    playwright.agent-chat-closure-rail.config.ts \
+    tests/agent-chat-closure-rail-smoke.spec.ts
+}
+
+run_agent_chat_closure_rail_ui_smoke_if_available() {
+  if is_false "$INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE"; then
+    record_skip "AgentChat closure rail browser UI smoke (mocked)" "agent-chat-closure-rail-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE=false"
+    return
+  fi
+  if ! agent_chat_closure_rail_ui_smoke_available; then
+    if mode_required "$INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE"; then
+      run_step "AgentChat closure rail browser UI smoke (mocked)" "agent-chat-closure-rail-ui-smoke" true \
+        bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make agent-chat-closure-rail-ui-smoke'
+    else
+      record_skip "AgentChat closure rail browser UI smoke (mocked)" "agent-chat-closure-rail-ui-smoke" "node/npm or Playwright browser smoke dependencies are not available"
+    fi
+    return
+  fi
+  run_step \
+    "AgentChat closure rail browser UI smoke (mocked)" \
+    "agent-chat-closure-rail-ui-smoke" \
+    true \
+    bash -c 'unset SL_UI_SMOKE_BASE_URL; export CI=true; make agent-chat-closure-rail-ui-smoke'
+}
+
+run_agent_chat_tool_audit_smoke_if_available() {
+  local base_url
+  base_url="$(normalize_base_url "$(config_value SOURCELENS_BASE_URL)")"
+  if is_false "$INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE"; then
+    record_skip "AgentChat tool audit backend smoke" "agent-chat-tool-audit-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=false"
+    return
+  fi
+  if [[ -z "$base_url" ]]; then
+    if mode_required "$INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE"; then
+      record_required_missing "AgentChat tool audit backend smoke" "agent-chat-tool-audit-smoke" "SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=true"
+    else
+      record_skip "AgentChat tool audit backend smoke" "agent-chat-tool-audit-smoke" "SOURCELENS_BASE_URL is not configured"
+    fi
+    return
+  fi
+  if ! is_loopback_base_url "$base_url"; then
+    if mode_required "$INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE"; then
+      record_required_missing "AgentChat tool audit backend smoke" "agent-chat-tool-audit-smoke" "SOURCELENS_BASE_URL must target localhost/127.0.0.1/::1 when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=true"
+    else
+      record_skip "AgentChat tool audit backend smoke" "agent-chat-tool-audit-smoke" "SOURCELENS_BASE_URL is not loopback; local-only smoke skipped"
+    fi
+    return
+  fi
+  run_step \
+    "AgentChat tool audit backend smoke" \
+    "agent-chat-tool-audit-smoke" \
+    true \
+    env SOURCELENS_BASE_URL="$base_url" ./scripts/agent-chat-tool-audit-smoke.sh
+}
+
+run_audit_workbench_smoke_if_available() {
+  local base_url
+  base_url="$(normalize_base_url "$(config_value SOURCELENS_BASE_URL)")"
+  if is_false "$INCLUDE_AUDIT_WORKBENCH_SMOKE"; then
+    record_skip "Audit workbench smoke" "audit-workbench-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false"
+    return
+  fi
+  if [[ -z "$base_url" ]]; then
+    if mode_required "$INCLUDE_AUDIT_WORKBENCH_SMOKE"; then
+      record_required_missing "Audit workbench smoke" "audit-workbench-smoke" "SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=true"
+    else
+      record_skip "Audit workbench smoke" "audit-workbench-smoke" "SOURCELENS_BASE_URL is not configured"
+    fi
+    return
+  fi
+  run_step \
+    "Audit workbench smoke" \
+    "audit-workbench-smoke" \
+    true \
+    env SOURCELENS_BASE_URL="$base_url" SOURCELENS_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES="$(bool_env_value "$AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES")" ./scripts/audit-workbench-smoke.sh
 }
 
 run_phase12_if_available() {
@@ -1370,6 +2144,10 @@ run_github_app_drill_if_available() {
     fi
     return
   fi
+  if ! external_drills_allowed; then
+    record_skip "GitHub App read-only drill" "github-app-drill" "SOURCELENS_RELEASE_EVIDENCE_ALLOW_EXTERNAL_DRILLS=true is required to run auto GitHub App drill outside local profile"
+    return
+  fi
   if ! command -v curl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
     if mode_required "$INCLUDE_GITHUB_APP_DRILL"; then
       run_step "GitHub App read-only drill" "github-app-drill" true \
@@ -1403,6 +2181,10 @@ run_github_webhook_drill_if_available() {
     else
       record_skip "GitHub webhook drill" "github-webhook-drill" "SOURCELENS_BASE_URL or GITHUB_APP_WEBHOOK_SECRET is not configured"
     fi
+    return
+  fi
+  if ! external_drills_allowed; then
+    record_skip "GitHub webhook drill" "github-webhook-drill" "SOURCELENS_RELEASE_EVIDENCE_ALLOW_EXTERNAL_DRILLS=true is required to run auto GitHub webhook drill outside local profile"
     return
   fi
   if ! command -v curl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
@@ -1709,9 +2491,13 @@ write_evidence_checksum_manifest() {
 }
 
 validate_run_id
+apply_release_evidence_profile
+set_profile_derived_requirements
 validate_include_modes
 validate_env_file_boundary
 validate_release_metadata_inputs
+validate_mutating_target_boundary
+validate_loopback_backend_runtime_boundary
 init_output
 write_git_metadata
 write_worktree_inventory
@@ -1736,6 +2522,72 @@ if mode_enabled "$INCLUDE_SMOKE"; then
   run_smoke_if_available
 else
   record_skip "Smoke test" "smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_PUBLIC_REPO_SMOKE"; then
+  run_public_repo_smoke_if_available
+else
+  record_skip "Public repo analysis smoke" "public-repo-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_FILE_BOUND_REPAIR_SMOKE"; then
+  run_file_bound_repair_smoke_if_available
+else
+  record_skip "File-bound repair smoke" "file-bound-repair-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_AUTOREPAIR_PATCH_SMOKE"; then
+  run_autorepair_patch_smoke_if_available
+else
+  record_skip "AutoRepair patch readiness smoke" "autorepair-patch-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_PATCH_READY_UI_SMOKE"; then
+  run_patch_ready_ui_smoke_if_available
+else
+  record_skip "PATCH_READY browser UI smoke (mocked)" "patch-ready-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE"; then
+  run_dashboard_next_action_ui_smoke_if_available
+else
+  record_skip "Dashboard next action browser UI smoke (mocked)" "dashboard-next-action-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE"; then
+  run_report_evidence_drawer_ui_smoke_if_available
+else
+  record_skip "Report evidence drawer browser UI smoke (mocked)" "report-evidence-drawer-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE"; then
+  run_scan_governance_timeline_ui_smoke_if_available
+else
+  record_skip "Scan governance timeline browser UI smoke (mocked)" "scan-governance-timeline-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE"; then
+  run_agent_chat_audit_ui_smoke_if_available
+else
+  record_skip "AgentChat audit browser UI smoke (mocked)" "agent-chat-audit-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE"; then
+  run_agent_chat_closure_rail_ui_smoke_if_available
+else
+  record_skip "AgentChat closure rail browser UI smoke (mocked)" "agent-chat-closure-rail-ui-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE"; then
+  run_agent_chat_tool_audit_smoke_if_available
+else
+  record_skip "AgentChat tool audit backend smoke" "agent-chat-tool-audit-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=false"
+fi
+
+if mode_enabled "$INCLUDE_AUDIT_WORKBENCH_SMOKE"; then
+  run_audit_workbench_smoke_if_available
+else
+  record_skip "Audit workbench smoke" "audit-workbench-smoke" "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false"
 fi
 
 if mode_enabled "$INCLUDE_PHASE12"; then

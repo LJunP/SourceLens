@@ -121,6 +121,121 @@ class AgentTaskServiceTest {
     }
 
     @Test
+    void create_shouldBindExistingConversationWhenRequested() {
+        when(conversationMapper.selectById(88L)).thenReturn(Conversation.builder()
+                .id(88L)
+                .projectId(10L)
+                .agentTaskId(null)
+                .title("已有代码理解对话")
+                .status("ACTIVE")
+                .createdBy(1L)
+                .build());
+        doAnswer(invocation -> {
+            AgentTask task = invocation.getArgument(0);
+            task.setId(77L);
+            return 1;
+        }).when(agentTaskMapper).insert(any(AgentTask.class));
+        when(conversationMapper.update(any(Conversation.class), any())).thenReturn(1);
+
+        CreateAgentTaskRequest req = new CreateAgentTaskRequest();
+        req.setProjectId(10L);
+        req.setConversationId(88L);
+        req.setScanTaskId(null);
+        req.setTaskType("CUSTOM");
+        req.setTitle("代码理解交接复核");
+
+        AgentTask task = agentTaskService.create(req, 1L);
+
+        assertEquals(77L, task.getId());
+        assertEquals(88L, task.getConversationId());
+        verify(conversationMapper, never()).insert(any(Conversation.class));
+        ArgumentCaptor<Conversation> conversationCaptor = ArgumentCaptor.forClass(Conversation.class);
+        verify(conversationMapper).update(conversationCaptor.capture(), any());
+        assertEquals(88L, conversationCaptor.getValue().getId());
+        assertEquals(77L, conversationCaptor.getValue().getAgentTaskId());
+        verify(agentTaskMapper, never()).updateById(any(AgentTask.class));
+        verify(executionTaskService).create(10L, null, "AGENT", "AGENT_TASK", 77L, 1L);
+    }
+
+    @Test
+    void create_shouldRejectConversationFromOtherProject() {
+        when(conversationMapper.selectById(88L)).thenReturn(Conversation.builder()
+                .id(88L)
+                .projectId(99L)
+                .agentTaskId(null)
+                .status("ACTIVE")
+                .createdBy(1L)
+                .build());
+
+        CreateAgentTaskRequest req = new CreateAgentTaskRequest();
+        req.setProjectId(10L);
+        req.setConversationId(88L);
+        req.setTaskType("CUSTOM");
+        req.setTitle("跨项目对话绑定");
+
+        BizException ex = assertThrows(BizException.class, () -> agentTaskService.create(req, 1L));
+
+        assertEquals("BAD_REQUEST", ex.getCode());
+        assertEquals("指定对话不属于当前项目", ex.getMessage());
+        verify(agentTaskMapper, never()).insert(any(AgentTask.class));
+        verify(conversationMapper, never()).updateById(any(Conversation.class));
+    }
+
+    @Test
+    void create_shouldRejectAlreadyBoundConversation() {
+        when(conversationMapper.selectById(88L)).thenReturn(Conversation.builder()
+                .id(88L)
+                .projectId(10L)
+                .agentTaskId(66L)
+                .status("ACTIVE")
+                .createdBy(1L)
+                .build());
+
+        CreateAgentTaskRequest req = new CreateAgentTaskRequest();
+        req.setProjectId(10L);
+        req.setConversationId(88L);
+        req.setTaskType("CUSTOM");
+        req.setTitle("重复绑定对话");
+
+        BizException ex = assertThrows(BizException.class, () -> agentTaskService.create(req, 1L));
+
+        assertEquals("CONFLICT", ex.getCode());
+        assertEquals("指定对话已绑定 Agent 任务", ex.getMessage());
+        verify(agentTaskMapper, never()).insert(any(AgentTask.class));
+        verify(conversationMapper, never()).updateById(any(Conversation.class));
+        verify(conversationMapper, never()).update(any(Conversation.class), any());
+    }
+
+    @Test
+    void create_shouldRejectConcurrentConversationBinding() {
+        when(conversationMapper.selectById(88L)).thenReturn(Conversation.builder()
+                .id(88L)
+                .projectId(10L)
+                .agentTaskId(null)
+                .status("ACTIVE")
+                .createdBy(1L)
+                .build());
+        doAnswer(invocation -> {
+            AgentTask task = invocation.getArgument(0);
+            task.setId(77L);
+            return 1;
+        }).when(agentTaskMapper).insert(any(AgentTask.class));
+        when(conversationMapper.update(any(Conversation.class), any())).thenReturn(0);
+
+        CreateAgentTaskRequest req = new CreateAgentTaskRequest();
+        req.setProjectId(10L);
+        req.setConversationId(88L);
+        req.setTaskType("CUSTOM");
+        req.setTitle("并发绑定对话");
+
+        BizException ex = assertThrows(BizException.class, () -> agentTaskService.create(req, 1L));
+
+        assertEquals("CONFLICT", ex.getCode());
+        assertEquals("指定对话已绑定 Agent 任务", ex.getMessage());
+        verify(executionTaskService, never()).create(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
     void create_shouldAcceptRequestedSuccessfulScanTaskInSameProject() {
         when(scanTaskMapper.selectById(42L)).thenReturn(ScanTask.builder()
                 .id(42L)

@@ -1,15 +1,19 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import type { ReactNode } from 'react'
-import { Alert, Button, Card, Descriptions, Empty, Input, Modal, Radio, Select, Spin, Table, Tag, Typography } from 'antd'
+import { Alert, Card, Descriptions, Input, Modal, Radio, Select, Table, Tag, Typography } from 'antd'
 import {
   BranchesOutlined,
   CheckCircleOutlined,
   DatabaseOutlined,
   FileSearchOutlined,
+  ReloadOutlined,
   SafetyCertificateOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
+import { formatApiError } from '../api/client'
 import { analysisApi, DependencyGraph, GraphNode, GraphEdge } from '../api/analysis'
+import ActionButton from '../components/ui/ActionButton'
+import StateBlock from '../components/ui/StateBlock'
 
 const { Text } = Typography
 
@@ -110,7 +114,7 @@ export default function DependencyGraphView({ scanTaskId }: Props) {
     })
   }
 
-  useEffect(() => {
+  const loadGraph = useCallback(() => {
     let cancelled = false
     setLoading(true)
     setError(null)
@@ -123,9 +127,9 @@ export default function DependencyGraphView({ scanTaskId }: Props) {
         setGraph(nextGraph)
         setViewMode(nextGraph.nodes.length > LARGE_GRAPH_TABLE_THRESHOLD ? 'table' : 'graph')
       })
-      .catch(() => {
+      .catch(error => {
         if (cancelled) return
-        setError('依赖图谱加载失败，请稍后重试。')
+        setError(formatApiError(error, '加载依赖图谱失败'))
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -134,6 +138,8 @@ export default function DependencyGraphView({ scanTaskId }: Props) {
       cancelled = true
     }
   }, [scanTaskId])
+
+  useEffect(() => loadGraph(), [loadGraph])
 
   // 过滤节点和边
   const filteredData = useMemo(() => {
@@ -443,9 +449,16 @@ export default function DependencyGraphView({ scanTaskId }: Props) {
     setSelectedNode(null)
   }, [visualData])
 
-  if (loading) return <div style={{ textAlign: 'center', padding: 60 }}><Spin size="large" /></div>
-  if (error) return <Alert type="error" showIcon message={error} />
-  if (!graph || graph.nodes.length === 0) return <Empty description="暂无依赖图谱数据" />
+  if (loading) return <StateBlock tone="loading" title="正在加载依赖图谱" description="系统正在读取符号节点、依赖边和架构洞察。" />
+  if (error) return (
+    <StateBlock
+      tone="error"
+      title="依赖图谱加载失败"
+      description={error}
+      action={<ActionButton icon={<ReloadOutlined spin={loading} />} loading={loading} onClick={loadGraph} label="重新加载图谱" />}
+    />
+  )
+  if (!graph || graph.nodes.length === 0) return <StateBlock title="暂无依赖图谱数据" description="成功扫描并生成符号关系后会展示依赖图谱。" />
 
   const { summary } = graph
   const relatedEdges = selectedNode
@@ -474,7 +487,7 @@ export default function DependencyGraphView({ scanTaskId }: Props) {
               <Radio.Button value="graph">图谱视图</Radio.Button>
               <Radio.Button value="table">表格视图</Radio.Button>
             </Radio.Group>
-            <Button type="primary" onClick={exportMermaid}>导出 Mermaid</Button>
+            <ActionButton type="primary" onClick={exportMermaid} label="导出 Mermaid" />
           </div>
         </div>
 
@@ -570,13 +583,14 @@ export default function DependencyGraphView({ scanTaskId }: Props) {
               <Select.Option key={k} value={k}>{k} ({summary.byRelation[k]})</Select.Option>
             ))}
           </Select>
-          <Button onClick={() => {
-            setKindFilter('ALL')
-            setRelFilter('ALL')
-            setSelectedNode(null)
-          }}>
-            重置筛选
-          </Button>
+          <ActionButton
+            onClick={() => {
+              setKindFilter('ALL')
+              setRelFilter('ALL')
+              setSelectedNode(null)
+            }}
+            label="重置筛选"
+          />
         </div>
       </Card>
 

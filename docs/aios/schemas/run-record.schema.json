@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sourcelens.local/schemas/aios/run-record-v1.json",
+  "title": "SourceLens AIOS RunRecord v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "task_id", "dataset_version", "adapter_id", "adapter_version",
+    "environment_snapshot_id", "system_configuration_id", "repetition_id", "started_at", "ended_at",
+    "terminal_status", "stop_reason_code", "invalid_run_reason", "error_taxonomy", "trace_ref",
+    "patch_ref", "test_artifact_refs", "verification_ref", "usage", "policy_violations", "artifact_checksums"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "run_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "task_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "dataset_version": { "type": "string", "minLength": 1 },
+    "adapter_id": { "enum": ["B0", "B1", "B2", "A0"] },
+    "adapter_version": { "type": "string", "minLength": 1 },
+    "environment_snapshot_id": { "type": "string", "minLength": 1 },
+    "system_configuration_id": { "type": "string", "minLength": 1 },
+    "repetition_id": { "type": "integer", "minimum": 1 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "ended_at": { "type": "string", "format": "date-time" },
+    "terminal_status": { "enum": ["completed", "failed", "timed_out", "budget_exhausted", "policy_blocked", "invalid_infrastructure", "cancelled"] },
+    "stop_reason_code": { "enum": ["agent_complete", "test_failure", "tool_error", "model_error", "wall_clock_timeout", "token_budget", "tool_budget", "cost_budget", "policy_violation", "infrastructure_failure", "human_cancel", "uncaught_exception"] },
+    "invalid_run_reason": { "type": ["string", "null"], "enum": [null, "shared_harness_failure", "environment_materialization_failure", "evaluator_unavailable", "corrupt_fixture"] },
+    "error_taxonomy": {
+      "type": "array", "uniqueItems": true,
+      "items": { "enum": ["task_understanding", "localization", "planning", "tool_use", "patch_generation", "build", "test", "verification", "policy", "evidence", "infrastructure", "unknown"] }
+    },
+    "trace_ref": { "type": "string", "minLength": 1 },
+    "patch_ref": { "type": ["string", "null"] },
+    "test_artifact_refs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "verification_ref": { "type": ["string", "null"] },
+    "usage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["input_tokens", "output_tokens", "tool_calls", "retries", "human_interventions", "cost_usd", "latency_ms"],
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "tool_calls": { "type": "integer", "minimum": 0 },
+        "retries": { "type": "integer", "minimum": 0 },
+        "human_interventions": { "type": "integer", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 },
+        "latency_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "policy_violations": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "artifact_checksums": { "type": "object", "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "terminal_status": { "const": "invalid_infrastructure" } } },
+      "then": { "properties": { "invalid_run_reason": { "type": "string" } } },
+      "else": { "properties": { "invalid_run_reason": { "type": "null" } } }
+    }
+  ]
+}

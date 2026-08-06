@@ -1,0 +1,223 @@
+schema_version: 2
+strategy_version: "2.3"
+generated_at: "2026-07-10T22:34:00+08:00"
+status: P0_REVIEW_REQUIRED
+
+decision_vocabulary:
+  KEEP: Preserve without planned behavior change in the current migration.
+  REFACTOR: Preserve useful behavior or evidence while changing boundaries or implementation.
+  QUARANTINE: Preserve but prohibit capability claims or mainline dependency until separately proven.
+  FREEZE: Preserve in place and stop expansion during the declared phase.
+  BUILD_NEW: The required asset does not currently exist and must be created in its assigned future phase.
+  CANDIDATE_ARCHIVE: Preserve during P0; archive only after dependency review, regression evidence and Founder approval.
+
+rules:
+  - P0 decisions do not delete, move, clean, stash or revert inherited assets.
+  - Path scopes are non-overlapping ownership scopes; cross-cutting requirements and future assets do not claim file ownership.
+  - CANDIDATE_ARCHIVE is not approval to move or delete a file.
+  - Existing functionality remains inherited capability until a phase independently verifies its replacement.
+  - A BUILD_NEW asset cannot be represented as complete by relabeling an inherited artifact.
+
+assets:
+  - id: STRATEGY_LEGACY
+    scope_kind: paths
+    scope:
+      - docs/PROJECT_PLAN.md
+      - docs/PHASE_REQUIREMENTS.md
+      - docs/TOP_LEVEL_PRODUCT_OPERATING_DEFINITIONS.md
+      - docs/PRODUCT_POSITIONING_AND_ACCESS_MODEL.md
+      - docs/REFACTOR_ROADMAP.md
+      - docs/PRODUCT_METRICS_AND_FEEDBACK.md
+    decision: FREEZE
+    default_agent_context: EXCLUDED
+    context_rule: exact_task_contract_reference_required
+    rationale: Pre-v2.3 product and phase definitions conflict with the frozen year-one outcome.
+    target: Preserve as historical input; current strategy lives only in docs/aios/STRATEGIC_CONSTITUTION.md.
+
+  - id: GOVERNANCE_ENTRY
+    scope_kind: paths
+    scope:
+      - docs/TEAM_OPERATING_MODEL.md
+      - docs/SOURCELENS_OPERATING_SYSTEM.md
+    decision: REFACTOR
+    status: APPLIED_IN_P0
+    rationale: The inherited 11-plus-5 model lacked strict context, ownership and verification separation.
+    target: Seven governance roles plus temporary single-context workers under Master Execution Protocol v1.0.
+
+  - id: HISTORICAL_LEDGERS
+    scope_kind: paths
+    scope:
+      - docs/PRODUCT_PROGRESS_LOG.md
+      - docs/AGENT_ACTIVITY_LOG.md
+      - docs/AGENT_DECISION_REGISTER.md
+    decision: KEEP
+    default_agent_context: EXCLUDED
+    context_rule: exact_task_contract_or_adr_reference_required
+    rationale: These preserve history and decision rationale but do not own current facts.
+    target: Retain history; current facts live in the Truth Registry and new rationale remains append-only.
+
+  - id: DUPLICATE_STATUS_DOCS
+    scope_kind: paths
+    scope:
+      - docs/AGENT_STATUS_BOARD.md
+      - docs/CODEX_HANDOFF.md
+      - docs/QUALITY_SCORECARD.md
+      - docs/WORK_INTAKE_AND_BACKLOG.md
+    decision: CANDIDATE_ARCHIVE
+    default_agent_context: EXCLUDED
+    context_rule: exact_task_contract_reference_required
+    rationale: These large manually synchronized documents duplicate state and have drifted.
+    target: Keep in place during P0; archive only after all live references migrate and regression checks pass.
+
+  - id: RUST_ANALYZER
+    scope_kind: paths
+    scope:
+      - analyzer-rust
+    decision: REFACTOR
+    preserve: true
+    rationale: Existing scanning, framework detection and structured artifacts are reusable Environment Intelligence assets.
+    target: Add immutable source identity, language-quality characterization and evaluation adapters.
+
+  - id: JAVA_AST_AND_CODE_GRAPH
+    scope_kind: path_patterns
+    scope:
+      - backend-spring/src/main/java/com/sourcelens/module/analysis/service/JavaAstParser.java
+      - backend-spring/src/main/java/com/sourcelens/module/analysis/service/JavaFallbackAnalyzer.java
+      - backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeGraphPersistenceService.java
+      - backend-spring/src/main/java/com/sourcelens/module/analysis/service/AnalysisArtifactBuilder.java
+    decision: REFACTOR
+    preserve: true
+    rationale: Java AST, symbol and relation extraction is the strongest inherited repository-understanding asset.
+    target: Measure relation quality and bind every context claim to an immutable repository revision.
+
+  - id: NON_JAVA_ANALYSIS_CLAIM
+    scope_kind: capability
+    scope:
+      - semantic parity for JavaScript, TypeScript, Python, Rust and other non-Java repositories
+    decision: QUARANTINE
+    rationale: Parsing or file discovery exists, but semantic quality parity is not established.
+    target: Do not market broad language support until language-specific hidden evaluations pass.
+
+  - id: CODE_CHUNKS_AND_RETRIEVAL
+    scope_kind: path_patterns
+    scope:
+      - backend-spring/src/main/java/com/sourcelens/module/analysis/**/*CodeChunk*
+      - backend-spring/src/main/java/com/sourcelens/module/agent/service/CodeQaRetrievalService.java
+      - backend-spring/src/test/resources/p6-code-qa-retrieval-eval-cases.json
+    decision: REFACTOR
+    preserve: true
+    rationale: Hybrid retrieval, citations and code chunks are useful P2 foundations; the current corpus is regression-only.
+    target: Add simple-retrieval baselines, task-conditioned context evaluation and protected hidden tasks.
+
+  - id: AGENT_RUNTIME
+    scope_kind: path_patterns
+    scope:
+      - backend-spring/src/main/java/com/sourcelens/module/agent/service/AgentTaskService.java
+      - backend-spring/src/main/java/com/sourcelens/module/agent/service/AgentToolCallService.java
+      - backend-spring/src/main/java/com/sourcelens/module/agent/tool
+      - backend-spring/src/main/java/com/sourcelens/module/agent/entity
+    decision: REFACTOR
+    preserve: true
+    rationale: The bounded conversation/tool loop lacks durable task graph, checkpoint/resume and strict action controls.
+    target: P3 single-Agent planner/executor/state runtime built around the frozen Evaluation Protocol.
+
+  - id: EXECUTION_ARTIFACT_AUDIT
+    scope_kind: paths
+    scope:
+      - backend-spring/src/main/java/com/sourcelens/module/execution
+      - backend-spring/src/main/java/com/sourcelens/module/artifact
+      - backend-spring/src/main/java/com/sourcelens/module/audit
+    decision: REFACTOR
+    preserve: true
+    rationale: Attempts, artifacts and audit events are valuable trust primitives but are not yet fail-closed evidence custody.
+    target: Bind actions and artifacts to task, Agent, canonical source, policy decision and verified checksum.
+
+  - id: AUTOREPAIR
+    scope_kind: paths
+    scope:
+      - backend-spring/src/main/java/com/sourcelens/module/autorepair
+    decision: REFACTOR
+    preserve: true
+    rationale: Current PATCH_READY can be reached without build/test or independent patch verification.
+    target: Make it a candidate-patch producer inside the P4 isolated execution and evidence pipeline.
+
+  - id: PATCH_EVIDENCE_PACKAGE
+    scope_kind: future_asset
+    scope:
+      - task-specific immutable Patch Evidence Package schema, generator, verifier and replay command
+    decision: BUILD_NEW
+    rationale: Platform release evidence exists, but task-specific immutable patch evidence does not.
+    target: Implement source identity, tests, independent verifier, risk, approval and rollback without reusing release authority labels.
+
+  - id: CORE_USER_WORKFLOW_UI
+    scope_kind: paths
+    scope:
+      - web-console/src/pages/Projects.tsx
+      - web-console/src/pages/ProjectDetail.tsx
+      - web-console/src/pages/ScanTaskDetail.tsx
+      - web-console/src/pages/AgentChat.tsx
+    decision: REFACTOR
+    preserve: true
+    rationale: Existing UI exposes many features but not one coherent issue-to-evidence experiment flow.
+    target: Build a bounded research console only after backend task, trace and evidence contracts stabilize.
+
+  - id: BROAD_UI_AND_GOVERNANCE_CONSOLES
+    scope_kind: product_track
+    scope:
+      - broad P9 page expansion, decorative redesign and enterprise governance-console work outside the year-one evidence loop
+    decision: FREEZE
+    rationale: Broad surface expansion is not the year-one critical path and major frontend files are already oversized.
+    target: Permit only approved security/accessibility containment and later P4 evidence-loop prerequisites.
+
+  - id: TRUST_REQUIREMENTS
+    scope_kind: cross_cutting_requirement
+    scope:
+      - source identity, filesystem boundary, tool exit semantics, sandbox, raw custody, LLM egress, approval and rollback
+    decision: REFACTOR
+    preserve: true
+    rationale: Existing controls and negative tests are useful, but multiple fail-open and non-isolated paths remain.
+    target: Minimum fail-closed trust before model-initiated writes, then adversarial hardening in P5.
+
+  - id: RELEASE_EVIDENCE
+    scope_kind: paths
+    scope:
+      - scripts/release-evidence.sh
+      - scripts/verify-release-evidence.sh
+      - release-evidence
+    decision: REFACTOR
+    preserve: true
+    rationale: Useful local platform regression evidence was generated from a dirty worktree and is not patch or production proof.
+    target: Bind exact accepted source state and keep platform release evidence separate from Patch Evidence Packages.
+
+  - id: GITHUB_ENTERPRISE_SAAS
+    scope_kind: product_track
+    scope:
+      - GitHub App installation, webhook delivery, remote branch push, pull request, enterprise authorization and SaaS expansion
+    implementation_refs:
+      - backend-spring/src/main/java/com/sourcelens/module/repository/**/*GitHub*
+      - backend-spring/src/main/java/com/sourcelens/module/repository/controller/RepositoryController.java
+      - backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairPrService.java
+      - backend-spring/src/main/resources/application.yml
+      - backend-spring/src/main/resources/db/migration/V018__add_github_app_installations.sql
+      - backend-spring/src/main/resources/db/migration/V019__add_github_webhook_deliveries.sql
+      - backend-spring/src/main/resources/db/migration/V021__add_github_webhook_delivery_projects.sql
+      - backend-spring/src/main/resources/db/migration/V027__normalize_github_webhook_delivery_collation.sql
+    decision: FREEZE
+    rationale: GitHub App, webhook, remote PR, RBAC, multi-tenant and SaaS expansion are year-one non-goals.
+    target: Preserve inherited code; do not execute remote writes or expand integration before a Founder-approved phase change.
+
+  - id: MEMORY_AND_LEARNING
+    scope_kind: future_asset
+    scope:
+      - measured working, project and experience memory with ablation evidence
+    decision: BUILD_NEW
+    rationale: Transcript replay is not a measured memory or learning system.
+    target: P7 experiments only after baseline, runtime reliability and contamination controls exist.
+
+  - id: MULTI_AGENT_ORGANIZATION_RUNTIME
+    scope_kind: future_asset
+    scope:
+      - product runtime for Agent identity, delegation, coordination and organization memory
+    decision: FREEZE
+    rationale: Codex governance roles do not prove multi-Agent product value or runtime implementation.
+    target: P8 single-versus-multi-Agent research before any P9 organization runtime implementation.

@@ -1,5 +1,7 @@
 # SourceLens 后端与 Agent 工程每日成长计划
 
+> AIOS v2.3 状态：`PERSONAL LEARNING PLAN / NOT PROJECT AUTHORITY`。本文可用于个人学习，不得向当前 Phase、技术栈或 Codex 任务注入要求。
+
 ```text
 
 ```
@@ -524,4 +526,3 @@ Agent/大模型：
 ```text
 今天必须让 SourceLens 比昨天更像一个真实产品。
 ```
-

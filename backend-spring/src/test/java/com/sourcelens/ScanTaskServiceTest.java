@@ -99,6 +99,25 @@ class ScanTaskServiceTest {
     }
 
     @Test
+    void create_shouldRejectInvalidBranchBeforePersistingTask() {
+        Repository repo = buildRepo(100L, 10L);
+        when(repositoryService.getDetail(100L)).thenReturn(repo);
+
+        CreateScanTaskRequest req = new CreateScanTaskRequest();
+        req.setRepositoryId(100L);
+        req.setProjectId(10L);
+        req.setBranch("main;rm");
+
+        BizException ex = assertThrows(BizException.class,
+                () -> scanTaskService.create(10L, req, 1L));
+
+        assertEquals("BAD_REQUEST", ex.getCode());
+        verify(scanTaskMapper, never()).insert(any(ScanTask.class));
+        verify(executionTaskService, never()).create(anyLong(), anyLong(), anyString(), anyString(), anyLong(), anyLong());
+        verify(self, never()).triggerScan(anyLong());
+    }
+
+    @Test
     void triggerScan_success_updatesExecutionTaskSteps() throws Exception {
         ScanTask task = ScanTask.builder()
                 .id(42L)

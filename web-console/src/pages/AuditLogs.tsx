@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Badge,
-  Button,
   Card,
   Drawer,
   Form,
@@ -13,7 +12,6 @@ import {
   Table,
   Tabs,
   Tag,
-  Tooltip,
   Typography,
 } from 'antd'
 import type { BadgeProps } from 'antd'
@@ -33,18 +31,36 @@ import {
 import { auditApi, AuditLog, AuditLogQuery } from '../api/audit'
 import { agentToolCallApi, AgentToolCall, AgentToolCallQuery } from '../api/agentToolCall'
 import { githubWebhookDeliveryApi, GitHubWebhookDelivery, GitHubWebhookDeliveryQuery } from '../api/githubWebhookDelivery'
+import type { AutoRepairProvenance } from '../api/autoRepair'
 import { formatApiError } from '../api/client'
+import ActionButton from '../components/ui/ActionButton'
+import IconActionButton from '../components/ui/IconActionButton'
+import { createSelectableTableRowProps } from '../components/ui/selectableTableRow'
+import { redactJsonOrText } from '../utils/displayRedaction'
 
 const { Text, Paragraph } = Typography
 
 interface Props {
   projectId: number
   initialToolScanTaskId?: number
+  initialToolConversationId?: number
+  initialAuditFilters?: Partial<AuditLogQuery>
 }
 
 type SignalTone = 'ready' | 'warning' | 'danger'
 type AuditSourceKey = 'audit' | 'tools' | 'deliveries'
 type AuditSourceErrors = Partial<Record<AuditSourceKey, string>>
+
+interface AuditInvestigationStep {
+  key: string
+  icon: ReactNode
+  label: string
+  status: string
+  detail: string
+  tone: SignalTone
+  actionLabel: string
+  onAction: () => void
+}
 
 const STATUS_COLOR: Record<string, string> = {
   SUCCESS: 'success',
@@ -70,6 +86,7 @@ const RESOURCE_OPTIONS = [
   'PROJECT',
   'REPOSITORY',
   'SCAN_TASK',
+  'ARTIFACT',
   'AUTO_REPAIR',
   'GITHUB_APP_INSTALLATION',
 ]
@@ -86,17 +103,12 @@ function formatDuration(value?: number | null) {
   return `${value}ms`
 }
 
-function tryFormatJson(value?: string | null) {
-  if (!value) return '-'
-  try {
-    return JSON.stringify(JSON.parse(value), null, 2)
-  } catch {
-    return value
-  }
+function formatRedactedJson(value?: string | null) {
+  return redactJsonOrText(value, '-')
 }
 
 function compactJson(value?: string | null) {
-  const formatted = tryFormatJson(value)
+  const formatted = formatRedactedJson(value)
   return formatted.length > 140 ? `${formatted.slice(0, 140)}...` : formatted
 }
 
@@ -156,7 +168,47 @@ function buildGovernanceSignal(auditFailed: number, toolFailed: number, delivery
   }
 }
 
-export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
+function matchesInitialAuditFilters(item: AuditLog, filters?: Partial<AuditLogQuery>) {
+  if (!filters?.auditLogId && !filters?.resourceId) return false
+  if (filters.auditLogId && item.id !== filters.auditLogId) return false
+  if (filters.resourceId && item.resourceId !== filters.resourceId) return false
+  if (filters.resourceType && item.resourceType !== filters.resourceType) return false
+  if (filters.action && item.action !== filters.action) return false
+  if (filters.status && item.status !== filters.status) return false
+  return true
+}
+
+function initialAuditTargetLabel(filters?: Partial<AuditLogQuery>) {
+  if (!filters?.auditLogId && !filters?.resourceId) return '目标审计事件'
+  const parts = [
+    filters.auditLogId ? `Audit #${filters.auditLogId}` : undefined,
+    filters.resourceType || (filters.resourceId ? '资源' : undefined),
+    filters.resourceId ? `#${filters.resourceId}` : undefined,
+    filters.action,
+    filters.status,
+  ].filter(Boolean)
+  return parts.join(' / ')
+}
+
+function hasSubmittedAuditFilters(filters: AuditLogQuery, initialFilters?: Partial<AuditLogQuery>) {
+  return Boolean(
+    initialFilters?.auditLogId ||
+    filters.resourceType ||
+    filters.resourceId ||
+    filters.action?.trim() ||
+    filters.status
+  )
+}
+
+function hasSubmittedToolFilters(filters: AgentToolCallQuery) {
+  return Boolean(filters.toolName?.trim() || filters.conversationId || filters.scanTaskId || filters.success != null)
+}
+
+function hasSubmittedDeliveryFilters(filters: GitHubWebhookDeliveryQuery) {
+  return Boolean(filters.eventType?.trim() || filters.status)
+}
+
+export default function AuditLogs({ projectId, initialToolScanTaskId, initialToolConversationId, initialAuditFilters }: Props) {
   const navigate = useNavigate()
   const [form] = Form.useForm<AuditLogQuery>()
   const [toolForm] = Form.useForm<AgentToolCallQuery>()
@@ -174,6 +226,20 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
   const [toolPagination, setToolPagination] = useState({ page: 1, pageSize: 20, total: 0 })
   const [deliveryPagination, setDeliveryPagination] = useState({ page: 1, pageSize: 20, total: 0 })
   const [sourceErrors, setSourceErrors] = useState<AuditSourceErrors>({})
+  const [auditDeepLinkMiss, setAuditDeepLinkMiss] = useState(false)
+  const [auditQueryScoped, setAuditQueryScoped] = useState(false)
+  const [toolQueryScoped, setToolQueryScoped] = useState(false)
+  const [deliveryQueryScoped, setDeliveryQueryScoped] = useState(false)
+  const hasInitialAuditFilters = Boolean(
+    initialAuditFilters?.resourceType ||
+    initialAuditFilters?.auditLogId ||
+    initialAuditFilters?.resourceId ||
+    initialAuditFilters?.action ||
+    initialAuditFilters?.status
+  )
+  const hasInitialToolFilters = Boolean(initialToolScanTaskId || initialToolConversationId)
+  const [activeTab, setActiveTab] = useState(hasInitialAuditFilters ? 'audit-logs' : hasInitialToolFilters ? 'agent-tool-calls' : 'audit-logs')
+  const appliedInitialAuditKeyRef = useRef<string | null>(null)
 
   const setSourceError = useCallback((source: AuditSourceKey, error: string | null) => {
     setSourceErrors(prev => {
@@ -191,30 +257,48 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
     setLoading(true)
     setSourceError('audit', null)
     const filters = form.getFieldsValue()
+    setAuditQueryScoped(hasSubmittedAuditFilters(filters, initialAuditFilters))
     auditApi.listProjectLogs(projectId, {
       page,
       pageSize,
-      resourceType: filters.resourceType,
+        resourceType: filters.resourceType,
+        auditLogId: initialAuditFilters?.auditLogId,
+        resourceId: filters.resourceId,
       action: filters.action?.trim() || undefined,
       status: filters.status,
     })
       .then(res => {
         const data = res.data.data
-        setLogs(data.items || [])
+        const items = data.items || []
+        setLogs(items)
         setPagination({ page: data.page, pageSize: data.pageSize, total: data.total })
+        const initialKey = initialAuditFilters ? JSON.stringify(initialAuditFilters) : null
+        if (initialKey && appliedInitialAuditKeyRef.current !== initialKey && (initialAuditFilters?.auditLogId || initialAuditFilters?.resourceId)) {
+          const matched = items.find(item => matchesInitialAuditFilters(item, initialAuditFilters))
+          if (matched) {
+            setSelected(matched)
+            setAuditDeepLinkMiss(false)
+            appliedInitialAuditKeyRef.current = initialKey
+          } else {
+            setSelected(null)
+            setAuditDeepLinkMiss(true)
+          }
+        }
       })
       .catch(error => setSourceError('audit', formatApiError(error, '加载审计日志失败')))
       .finally(() => setLoading(false))
-  }, [form, projectId, setSourceError])
+  }, [form, initialAuditFilters, projectId, setSourceError])
 
   const loadToolCalls = useCallback((page = 1, pageSize = 20) => {
     setToolLoading(true)
     setSourceError('tools', null)
     const filters = toolForm.getFieldsValue()
+    setToolQueryScoped(hasSubmittedToolFilters(filters))
     agentToolCallApi.listProjectCalls(projectId, {
       page,
       pageSize,
       toolName: filters.toolName?.trim() || undefined,
+      conversationId: filters.conversationId,
       scanTaskId: filters.scanTaskId,
       success: filters.success,
     })
@@ -231,6 +315,7 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
     setDeliveryLoading(true)
     setSourceError('deliveries', null)
     const filters = deliveryForm.getFieldsValue()
+    setDeliveryQueryScoped(hasSubmittedDeliveryFilters(filters))
     githubWebhookDeliveryApi.listProjectDeliveries(projectId, {
       page,
       pageSize,
@@ -251,14 +336,22 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
     setToolCalls([])
     setDeliveries([])
     setSourceErrors({})
+    setAuditDeepLinkMiss(false)
     setPagination({ page: 1, pageSize: 20, total: 0 })
     setToolPagination({ page: 1, pageSize: 20, total: 0 })
     setDeliveryPagination({ page: 1, pageSize: 20, total: 0 })
-    toolForm.setFieldsValue({ scanTaskId: initialToolScanTaskId })
+    form.setFieldsValue({
+      resourceType: initialAuditFilters?.resourceType,
+      resourceId: initialAuditFilters?.resourceId,
+      action: initialAuditFilters?.action,
+      status: initialAuditFilters?.status,
+    })
+    toolForm.setFieldsValue({ conversationId: initialToolConversationId, scanTaskId: initialToolScanTaskId })
+    setActiveTab(hasInitialAuditFilters ? 'audit-logs' : hasInitialToolFilters ? 'agent-tool-calls' : 'audit-logs')
     loadLogs(1, 20)
     loadToolCalls(1, 20)
     loadDeliveries(1, 20)
-  }, [initialToolScanTaskId, loadDeliveries, loadLogs, loadToolCalls, projectId, toolForm])
+  }, [form, hasInitialAuditFilters, hasInitialToolFilters, initialAuditFilters, initialToolConversationId, initialToolScanTaskId, loadDeliveries, loadLogs, loadToolCalls, projectId, toolForm])
 
   const refreshAll = () => {
     loadLogs(pagination.page, pagination.pageSize)
@@ -270,6 +363,7 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
     if (!record.resourceType || !record.resourceId) return null
     if (record.resourceType === 'SCAN_TASK') return `/scan-tasks/${record.resourceId}`
     if (record.resourceType === 'PROJECT') return `/projects/${record.resourceId}`
+    if (record.resourceType === 'ARTIFACT') return `/artifacts?projectId=${projectId}&artifactId=${record.resourceId}`
     if (record.resourceType === 'AUTO_REPAIR') return `/auto-repairs?projectId=${projectId}&repairId=${record.resourceId}`
     if (record.resourceType === 'REPOSITORY') return `/projects/${projectId}`
     if (record.resourceType === 'GITHUB_APP_INSTALLATION') return `/projects/${projectId}`
@@ -289,6 +383,24 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
     if (record.scanTaskId) navigate(`/scan-tasks/${record.scanTaskId}`)
   }
 
+  const selectAuditLog = useCallback((record: AuditLog) => {
+    setSelected(record)
+    setSelectedToolCall(null)
+    setSelectedDelivery(null)
+  }, [])
+
+  const selectToolCall = useCallback((record: AgentToolCall) => {
+    setSelected(null)
+    setSelectedToolCall(record)
+    setSelectedDelivery(null)
+  }, [])
+
+  const selectDelivery = useCallback((record: GitHubWebhookDelivery) => {
+    setSelected(null)
+    setSelectedToolCall(null)
+    setSelectedDelivery(record)
+  }, [])
+
   const stats = useMemo(() => {
     const auditFailed = logs.filter(log => log.status === 'FAILED').length
     const toolFailed = toolCalls.filter(call => !call.success).length
@@ -304,6 +416,13 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
       : null
     return { auditFailed, toolFailed, privilegedTools, deliveryRisk, slowEvents, avgDuration }
   }, [deliveries, logs, toolCalls])
+
+  const selectedAuditDetailId = selected ? `audit-log-detail-${selected.id}` : undefined
+  const selectedAuditTitleId = selected ? `audit-log-detail-title-${selected.id}` : undefined
+  const selectedToolDetailId = selectedToolCall ? `agent-tool-call-detail-${selectedToolCall.id}` : undefined
+  const selectedToolTitleId = selectedToolCall ? `agent-tool-call-detail-title-${selectedToolCall.id}` : undefined
+  const selectedDeliveryDetailId = selectedDelivery ? `github-webhook-delivery-detail-${selectedDelivery.id}` : undefined
+  const selectedDeliveryTitleId = selectedDelivery ? `github-webhook-delivery-detail-title-${selectedDelivery.id}` : undefined
 
   const sourceErrorCount = Object.values(sourceErrors).filter(Boolean).length
   const governanceSignal = useMemo(
@@ -343,6 +462,114 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
       retry: () => loadDeliveries(deliveryPagination.page, deliveryPagination.pageSize),
     },
   ]
+  const visibleAuditEventCount = logs.length + toolCalls.length + deliveries.length
+  const totalAuditEventCount = pagination.total + toolPagination.total + deliveryPagination.total
+  const hasScopedAuditQuery = auditQueryScoped || toolQueryScoped || deliveryQueryScoped || hasInitialAuditFilters || hasInitialToolFilters
+  const auditDecisionGateStatus = sourceErrorCount || auditDeepLinkMiss
+    ? 'BLOCKED'
+    : totalAuditEventCount > visibleAuditEventCount || hasScopedAuditQuery
+      ? 'REVIEW'
+      : 'READY'
+  const auditDecisionGateTone: SignalTone = auditDecisionGateStatus === 'READY'
+    ? 'ready'
+    : auditDecisionGateStatus === 'BLOCKED'
+      ? 'danger'
+      : 'warning'
+  const auditDecisionGateReason = auditDecisionGateStatus === 'BLOCKED'
+    ? '存在不可用审计源或精确深链未命中，当前页面不能作为完整审计结论。'
+    : auditDecisionGateStatus === 'REVIEW'
+      ? '当前视图受分页、筛选或深链范围影响，只能证明当前结果窗口，需要结合全量查询或指定资源复核。'
+      : '三类审计源当前页均可读取，且没有筛选/深链收窄；可作为当前项目审计工作台的初步健康信号。'
+  const auditStatusLineLabel = sourceErrorCount
+    ? '审计源需复核'
+    : loading || toolLoading || deliveryLoading
+      ? '审计源加载中'
+      : '审计源可读取'
+  const resourceTraceCount = logs.filter(log => getAuditResourcePath(log)).length
+    + toolCalls.filter(call => call.conversationId || call.scanTaskId).length
+    + deliveries.length
+  const investigationSteps = useMemo<AuditInvestigationStep[]>(() => {
+    const failureCount = stats.auditFailed + stats.toolFailed + stats.deliveryRisk
+    const privilegedRisk = stats.privilegedTools > 0
+    const hasRedactedEvidence = Boolean(logs.length || toolCalls.length || deliveries.length)
+    const hasTraceTargets = resourceTraceCount > 0
+    return [
+      {
+        key: 'risk-detection',
+        icon: failureCount ? <WarningOutlined /> : <SafetyCertificateOutlined />,
+        label: '风险发现',
+        status: failureCount ? `${failureCount} 个待复核事件` : sourceErrorCount ? '审计源异常' : '当前窗口健康',
+        detail: sourceErrorCount
+          ? '至少一个审计源不可用，先恢复数据源再判断风险。'
+          : failureCount
+            ? '失败审计、失败工具调用或异常 delivery 已进入调查范围。'
+            : '当前结果窗口没有失败事件，继续观察高权限和慢事件。',
+        tone: sourceErrorCount || failureCount ? 'danger' : privilegedRisk || stats.slowEvents ? 'warning' : 'ready',
+        actionLabel: failureCount || sourceErrorCount ? '查看失败源' : '查看审计表',
+        onAction: () => {
+          if (sourceErrors.audit || stats.auditFailed) setActiveTab('audit-logs')
+          else if (sourceErrors.tools || stats.toolFailed || privilegedRisk) setActiveTab('agent-tool-calls')
+          else if (sourceErrors.deliveries || stats.deliveryRisk) setActiveTab('github-webhook-deliveries')
+          else setActiveTab('audit-logs')
+        },
+      },
+      {
+        key: 'evidence-redaction',
+        icon: <SearchOutlined />,
+        label: '证据脱敏',
+        status: hasRedactedEvidence ? '显示层脱敏' : '等待证据',
+        detail: hasRedactedEvidence
+          ? '输入、工具参数和 delivery 结果只展示脱敏 JSON，原始块默认收起。'
+          : '三类审计源暂无可展示证据，不能形成完整调查结论。',
+        tone: hasRedactedEvidence ? 'ready' : 'warning',
+        actionLabel: '检查 JSON',
+        onAction: () => setActiveTab('audit-logs'),
+      },
+      {
+        key: 'resource-trace',
+        icon: <LinkOutlined />,
+        label: '资源追踪',
+        status: hasTraceTargets ? `${resourceTraceCount} 个可追踪入口` : '缺少资源入口',
+        detail: hasTraceTargets
+          ? '审计事件、工具调用和 delivery 可回跳关联资源、对话、扫描或产物。'
+          : '当前窗口缺少可跳转资源，后续需要补充 resourceType/resourceId 绑定。',
+        tone: hasTraceTargets ? 'ready' : 'warning',
+        actionLabel: '查看追踪入口',
+        onAction: () => setActiveTab('audit-logs'),
+      },
+      {
+        key: 'review-closure',
+        icon: auditDecisionGateStatus === 'READY' ? <CheckCircleOutlined /> : <ClockCircleOutlined />,
+        label: '复盘处置',
+        status: auditDecisionGateStatus,
+        detail: auditDecisionGateStatus === 'READY'
+          ? '三源可读取且当前窗口未收窄，可作为初步健康信号。'
+          : auditDecisionGateStatus === 'BLOCKED'
+            ? '存在不可用审计源或精确深链未命中，必须先关闭阻塞项。'
+            : '当前视图受筛选、分页或深链影响，只能作为范围内复盘证据。',
+        tone: auditDecisionGateTone,
+        actionLabel: auditDecisionGateStatus === 'BLOCKED' ? '重新加载' : '查看门禁',
+        onAction: auditDecisionGateStatus === 'BLOCKED' ? refreshAll : () => setActiveTab('audit-logs'),
+      },
+    ]
+  }, [
+    auditDecisionGateStatus,
+    auditDecisionGateTone,
+    deliveries.length,
+    logs.length,
+    refreshAll,
+    resourceTraceCount,
+    sourceErrorCount,
+    sourceErrors.audit,
+    sourceErrors.deliveries,
+    sourceErrors.tools,
+    stats.auditFailed,
+    stats.deliveryRisk,
+    stats.privilegedTools,
+    stats.slowEvents,
+    stats.toolFailed,
+    toolCalls.length,
+  ])
 
   const columns: ColumnsType<AuditLog> = [
     {
@@ -357,10 +584,16 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
       minWidth: 220,
       ellipsis: true,
       render: (value: string, record) => (
-        <Button type="link" className="sl-audit-table-link" onClick={() => setSelected(record)}>
-          <SafetyCertificateOutlined />
-          <span>{value}</span>
-        </Button>
+        <ActionButton
+          type="link"
+          className="sl-audit-table-link"
+          icon={<SafetyCertificateOutlined />}
+          onClick={event => {
+            event.stopPropagation()
+            selectAuditLog(record)
+          }}
+          label={value}
+        />
       ),
     },
     {
@@ -371,9 +604,18 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
         <Space size={6}>
           <Text type="secondary">{record.resourceType || '-'} #{record.resourceId || '-'}</Text>
           {getAuditResourcePath(record) && (
-            <Tooltip title="打开关联资源">
-              <Button size="small" type="text" icon={<LinkOutlined />} onClick={() => openAuditResource(record)} />
-            </Tooltip>
+            <IconActionButton
+              label={`打开审计事件 #${record.id} 关联资源`}
+              tooltip="打开关联资源"
+              size="small"
+              type="text"
+              data-sl-target-url={getAuditResourcePath(record) || undefined}
+              icon={<LinkOutlined />}
+              onClick={event => {
+                event.stopPropagation()
+                openAuditResource(record)
+              }}
+            />
           )}
         </Space>
       ),
@@ -418,10 +660,16 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
       minWidth: 210,
       ellipsis: true,
       render: (value: string, record) => (
-        <Button type="link" className="sl-audit-table-link" onClick={() => setSelectedToolCall(record)}>
-          <ToolOutlined />
-          <span>{value}</span>
-        </Button>
+        <ActionButton
+          type="link"
+          className="sl-audit-table-link"
+          icon={<ToolOutlined />}
+          onClick={event => {
+            event.stopPropagation()
+            selectToolCall(record)
+          }}
+          label={value}
+        />
       ),
     },
     {
@@ -445,9 +693,17 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
       render: (value: number | null, record) => value ? (
         <Space size={6}>
           <Text type="secondary">#{value}</Text>
-          <Tooltip title="打开对话">
-            <Button size="small" type="text" icon={<LinkOutlined />} onClick={() => openToolConversation(record)} />
-          </Tooltip>
+          <IconActionButton
+            label={`打开工具调用 #${record.id} 对话`}
+            tooltip="打开对话"
+            size="small"
+            type="text"
+            icon={<LinkOutlined />}
+            onClick={event => {
+              event.stopPropagation()
+              openToolConversation(record)
+            }}
+          />
         </Space>
       ) : '-',
     },
@@ -458,9 +714,17 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
       render: (value: number | null, record) => value ? (
         <Space size={6}>
           <Tag color="blue">#{value}</Tag>
-          <Tooltip title="打开扫描报告">
-            <Button size="small" type="text" icon={<LinkOutlined />} onClick={() => openToolScanTask(record)} />
-          </Tooltip>
+          <IconActionButton
+            label={`打开工具调用 #${record.id} 扫描报告`}
+            tooltip="打开扫描报告"
+            size="small"
+            type="text"
+            icon={<LinkOutlined />}
+            onClick={event => {
+              event.stopPropagation()
+              openToolScanTask(record)
+            }}
+          />
         </Space>
       ) : '-',
     },
@@ -492,10 +756,16 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
       minWidth: 260,
       ellipsis: true,
       render: (value: string, record) => (
-        <Button type="link" className="sl-audit-table-link" onClick={() => setSelectedDelivery(record)}>
-          <GithubOutlined />
-          <span>{value}</span>
-        </Button>
+        <ActionButton
+          type="link"
+          className="sl-audit-table-link"
+          icon={<GithubOutlined />}
+          onClick={event => {
+            event.stopPropagation()
+            selectDelivery(record)
+          }}
+          label={value}
+        />
       ),
     },
     {
@@ -520,10 +790,15 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
   ]
 
   const renderJsonBlock = (title: string, value?: string | null) => (
-    <div className="sl-audit-json-block">
-      <Text type="secondary">{title}</Text>
-      <pre>{tryFormatJson(value)}</pre>
-    </div>
+    <details className="sl-audit-json-block">
+      <summary>
+        <span>{title}</span>
+        <em>原始 JSON 默认收起</em>
+      </summary>
+      <pre className="sl-audit-json-redacted" aria-label={`${title} 脱敏 JSON`}>
+        {formatRedactedJson(value)}
+      </pre>
+    </details>
   )
 
   return (
@@ -536,15 +811,19 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
             把关键动作、Agent 工具调用、GitHub Webhook Delivery 汇总到同一条追责链路中，方便定位失败、复核权限、追踪资源影响。
           </p>
           <div className="sl-audit-status-line">
-            <span><span className="sl-live-dot" />审计链路在线</span>
+            <span><span className="sl-live-dot" />{auditStatusLineLabel}</span>
             <span>项目 #{projectId}</span>
             <span>三类审计源</span>
+            {initialToolConversationId && <span>conv #{initialToolConversationId}</span>}
             {initialToolScanTaskId && <span>scan #{initialToolScanTaskId}</span>}
           </div>
           <div className="sl-audit-actions">
-            <Button icon={<ReloadOutlined />} onClick={refreshAll} loading={loading || toolLoading || deliveryLoading}>
-              刷新全部
-            </Button>
+            <ActionButton
+              icon={<ReloadOutlined />}
+              onClick={refreshAll}
+              loading={loading || toolLoading || deliveryLoading}
+              label="刷新全部"
+            />
           </div>
         </div>
 
@@ -599,6 +878,43 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
         </div>
       </div>
 
+      <section
+        className={`sl-audit-decision-gate sl-audit-decision-gate-${auditDecisionGateTone}`}
+        aria-label="审计判定门禁说明"
+      >
+        <div className="sl-audit-decision-gate-head">
+          <SafetyCertificateOutlined />
+          <div>
+            <span>Audit Decision Gate</span>
+            <strong>审计判定门禁说明</strong>
+          </div>
+          <Tag color={auditDecisionGateTone === 'ready' ? 'green' : auditDecisionGateTone === 'danger' ? 'red' : 'gold'}>
+            {auditDecisionGateStatus}
+          </Tag>
+        </div>
+        <p>{auditDecisionGateReason}</p>
+        <div className="sl-audit-decision-gate-grid">
+          <div>
+            <span>数据源完整性</span>
+            <strong>{sourceErrorCount ? `${sourceErrorCount} 个审计源不可用` : '三源可读取'}</strong>
+          </div>
+          <div>
+            <span>当前结果窗口</span>
+            <strong>{visibleAuditEventCount}/{totalAuditEventCount} 条</strong>
+          </div>
+          <div>
+            <span>深链状态</span>
+            <strong>{auditDeepLinkMiss ? '精确目标未命中' : hasScopedAuditQuery ? '已按筛选或深链收窄' : '未收窄'}</strong>
+          </div>
+          <div>
+            <span>Raw 证据边界</span>
+            <strong>只展示脱敏摘要，原始 JSON 默认收起</strong>
+          </div>
+        </div>
+      </section>
+
+      <AuditInvestigationLoopPanel steps={investigationSteps} />
+
       <section className="sl-audit-source-health" aria-label="审计数据源状态">
         {sourceHealth.map(source => {
           const status = source.error ? 'danger' : source.loading ? 'warning' : 'ready'
@@ -618,7 +934,7 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
               {source.error && (
                 <div className="sl-audit-source-error">
                   <span>{source.error}</span>
-                  <Button size="small" icon={<ReloadOutlined />} onClick={source.retry}>重试</Button>
+                  <ActionButton size="small" icon={<ReloadOutlined />} onClick={source.retry} label="重试" />
                 </div>
               )}
             </div>
@@ -626,9 +942,18 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
         })}
       </section>
 
+      {auditDeepLinkMiss && (
+        <div className="sl-audit-inline-error sl-audit-deep-link-miss" role="status">
+          <WarningOutlined />
+          <span>未找到目标审计事件：{initialAuditTargetLabel(initialAuditFilters)}。当前筛选已应用，可重试或调整筛选条件。</span>
+          <ActionButton size="small" icon={<ReloadOutlined />} onClick={() => loadLogs(1, pagination.pageSize)} label="重新查询" />
+        </div>
+      )}
+
       <Card className="sl-audit-workbench-card">
         <Tabs
-          defaultActiveKey={initialToolScanTaskId ? 'agent-tool-calls' : 'audit-logs'}
+          activeKey={activeTab}
+          onChange={setActiveTab}
           items={[
             {
               key: 'audit-logs',
@@ -644,6 +969,9 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
                         options={RESOURCE_OPTIONS.map(value => ({ value, label: value }))}
                       />
                     </Form.Item>
+                    <Form.Item name="resourceId" label="资源 ID">
+                      <InputNumber min={1} precision={0} style={{ width: '100%' }} placeholder="例如 AutoRepair ID" />
+                    </Form.Item>
                     <Form.Item name="status" label="状态">
                       <Select
                         allowClear
@@ -655,19 +983,24 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
                       <Input allowClear placeholder="按动作关键词查询" />
                     </Form.Item>
                     <div className="sl-audit-filter-actions">
-                      <Button type="primary" icon={<SearchOutlined />} onClick={() => loadLogs(1, pagination.pageSize)}>
-                        查询
-                      </Button>
-                      <Button onClick={() => { form.resetFields(); loadLogs(1, pagination.pageSize) }}>
-                        重置
-                      </Button>
+                      <ActionButton type="primary" icon={<SearchOutlined />} onClick={() => loadLogs(1, pagination.pageSize)} label="查询" />
+                      <ActionButton onClick={() => { form.resetFields(); loadLogs(1, pagination.pageSize) }} label="重置" />
                     </div>
                   </Form>
                   {sourceErrors.audit && (
                     <AuditSourceError message={sourceErrors.audit} onRetry={() => loadLogs(pagination.page, pagination.pageSize)} />
                   )}
                   <Table
+                    className="sl-audit-table-card sl-selectable-table-card"
                     rowKey="id"
+                    onRow={record => createSelectableTableRowProps({
+                      record,
+                      selected: selected?.id === record.id,
+                      onSelect: selectAuditLog,
+                      controlsId: selectedAuditDetailId,
+                      label: `AuditLog #${record.id} ${record.action} ${selected?.id === record.id ? '已选中' : '查看详情'}`,
+                      className: selected?.id === record.id ? 'sl-audit-row-selected' : '',
+                    })}
                     loading={loading}
                     columns={columns}
                     dataSource={logs}
@@ -693,6 +1026,9 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
                     <Form.Item name="toolName" label="工具名">
                       <Input allowClear placeholder="按工具名查询" />
                     </Form.Item>
+                    <Form.Item name="conversationId" label="对话 ID">
+                      <InputNumber min={1} precision={0} style={{ width: '100%' }} placeholder="Conversation ID" />
+                    </Form.Item>
                     <Form.Item name="scanTaskId" label="扫描任务">
                       <InputNumber min={1} precision={0} style={{ width: '100%' }} placeholder="ScanTask ID" />
                     </Form.Item>
@@ -707,19 +1043,24 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
                       />
                     </Form.Item>
                     <div className="sl-audit-filter-actions">
-                      <Button type="primary" icon={<SearchOutlined />} onClick={() => loadToolCalls(1, toolPagination.pageSize)}>
-                        查询
-                      </Button>
-                      <Button onClick={() => { toolForm.resetFields(); loadToolCalls(1, toolPagination.pageSize) }}>
-                        重置
-                      </Button>
+                      <ActionButton type="primary" icon={<SearchOutlined />} onClick={() => loadToolCalls(1, toolPagination.pageSize)} label="查询" />
+                      <ActionButton onClick={() => { toolForm.resetFields(); loadToolCalls(1, toolPagination.pageSize) }} label="重置" />
                     </div>
                   </Form>
                   {sourceErrors.tools && (
                     <AuditSourceError message={sourceErrors.tools} onRetry={() => loadToolCalls(toolPagination.page, toolPagination.pageSize)} />
                   )}
                   <Table
+                    className="sl-audit-table-card sl-selectable-table-card"
                     rowKey="id"
+                    onRow={record => createSelectableTableRowProps({
+                      record,
+                      selected: selectedToolCall?.id === record.id,
+                      onSelect: selectToolCall,
+                      controlsId: selectedToolDetailId,
+                      label: `AgentToolCall #${record.id} ${record.toolName} ${selectedToolCall?.id === record.id ? '已选中' : '查看详情'}`,
+                      className: selectedToolCall?.id === record.id ? 'sl-audit-row-selected' : '',
+                    })}
                     loading={toolLoading}
                     columns={toolColumns}
                     dataSource={toolCalls}
@@ -757,19 +1098,24 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
                       />
                     </Form.Item>
                     <div className="sl-audit-filter-actions">
-                      <Button type="primary" icon={<SearchOutlined />} onClick={() => loadDeliveries(1, deliveryPagination.pageSize)}>
-                        查询
-                      </Button>
-                      <Button onClick={() => { deliveryForm.resetFields(); loadDeliveries(1, deliveryPagination.pageSize) }}>
-                        重置
-                      </Button>
+                      <ActionButton type="primary" icon={<SearchOutlined />} onClick={() => loadDeliveries(1, deliveryPagination.pageSize)} label="查询" />
+                      <ActionButton onClick={() => { deliveryForm.resetFields(); loadDeliveries(1, deliveryPagination.pageSize) }} label="重置" />
                     </div>
                   </Form>
                   {sourceErrors.deliveries && (
                     <AuditSourceError message={sourceErrors.deliveries} onRetry={() => loadDeliveries(deliveryPagination.page, deliveryPagination.pageSize)} />
                   )}
                   <Table
+                    className="sl-audit-table-card sl-selectable-table-card"
                     rowKey="id"
+                    onRow={record => createSelectableTableRowProps({
+                      record,
+                      selected: selectedDelivery?.id === record.id,
+                      onSelect: selectDelivery,
+                      controlsId: selectedDeliveryDetailId,
+                      label: `GitHubWebhookDelivery #${record.id} ${record.deliveryId} ${selectedDelivery?.id === record.id ? '已选中' : '查看详情'}`,
+                      className: selectedDelivery?.id === record.id ? 'sl-audit-row-selected' : '',
+                    })}
                     loading={deliveryLoading}
                     columns={deliveryColumns}
                     dataSource={deliveries}
@@ -791,13 +1137,18 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
 
       <Drawer
         className="sl-audit-drawer"
-        title={selected ? `审计事件 #${selected.id}` : '审计事件'}
+        title={selected ? <span id={selectedAuditTitleId}>审计事件 #{selected.id}</span> : '审计事件'}
         open={!!selected}
         onClose={() => setSelected(null)}
-        width={680}
+        width="min(680px, 92vw)"
       >
         {selected && (
-          <div className="sl-audit-drawer-stack">
+          <div
+            id={selectedAuditDetailId}
+            role="region"
+            aria-labelledby={selectedAuditTitleId}
+            className="sl-audit-drawer-stack"
+          >
             <div className={`sl-audit-drawer-signal sl-audit-drawer-${selected.status === 'FAILED' ? 'danger' : 'ready'}`}>
               <div>
                 <span>Audit Event</span>
@@ -806,9 +1157,20 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
               <Badge status={getStatusBadge(selected.status)} text={selected.status} />
             </div>
             {getAuditResourcePath(selected) && (
-              <Button icon={<LinkOutlined />} onClick={() => openAuditResource(selected)}>
-                打开关联资源
-              </Button>
+              <ActionButton
+                data-sl-target-url={getAuditResourcePath(selected) || undefined}
+                icon={<LinkOutlined />}
+                onClick={() => openAuditResource(selected)}
+                label="打开关联资源"
+              />
+            )}
+            {isCandidateReceiptAudit(selected) && (
+              <AuditCandidateReceiptReviewPanel
+                projectId={projectId}
+                log={selected}
+                provenance={candidateProvenanceFromAudit(selected)}
+                onNavigate={navigate}
+              />
             )}
             <div className="sl-audit-drawer-grid">
               <div><span>资源</span><strong>{selected.resourceType || '-'} #{selected.resourceId || '-'}</strong></div>
@@ -831,13 +1193,18 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
 
       <Drawer
         className="sl-audit-drawer"
-        title={selectedToolCall ? `工具调用 #${selectedToolCall.id}` : '工具调用'}
+        title={selectedToolCall ? <span id={selectedToolTitleId}>工具调用 #{selectedToolCall.id}</span> : '工具调用'}
         open={!!selectedToolCall}
         onClose={() => setSelectedToolCall(null)}
-        width={680}
+        width="min(680px, 92vw)"
       >
         {selectedToolCall && (
-          <div className="sl-audit-drawer-stack">
+          <div
+            id={selectedToolDetailId}
+            role="region"
+            aria-labelledby={selectedToolTitleId}
+            className="sl-audit-drawer-stack"
+          >
             <div className={`sl-audit-drawer-signal sl-audit-drawer-${selectedToolCall.success ? 'ready' : 'danger'}`}>
               <div>
                 <span>Agent Tool Call</span>
@@ -846,14 +1213,10 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
               <Badge status={selectedToolCall.success ? 'success' : 'error'} text={selectedToolCall.success ? 'SUCCESS' : 'FAILED'} />
             </div>
             {selectedToolCall.conversationId && (
-              <Button icon={<LinkOutlined />} onClick={() => openToolConversation(selectedToolCall)}>
-                打开对话
-              </Button>
+              <ActionButton icon={<LinkOutlined />} onClick={() => openToolConversation(selectedToolCall)} label="打开对话" />
             )}
             {selectedToolCall.scanTaskId && (
-              <Button icon={<LinkOutlined />} onClick={() => openToolScanTask(selectedToolCall)}>
-                打开扫描报告
-              </Button>
+              <ActionButton icon={<LinkOutlined />} onClick={() => openToolScanTask(selectedToolCall)} label="打开扫描报告" />
             )}
             <div className="sl-audit-drawer-grid">
               <div><span>权限</span><strong><Tag color={getPermissionColor(selectedToolCall.permissionLevel)}>{selectedToolCall.permissionLevel}</Tag></strong></div>
@@ -877,13 +1240,18 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
 
       <Drawer
         className="sl-audit-drawer"
-        title={selectedDelivery ? `Webhook Delivery #${selectedDelivery.id}` : 'Webhook Delivery'}
+        title={selectedDelivery ? <span id={selectedDeliveryTitleId}>Webhook Delivery #{selectedDelivery.id}</span> : 'Webhook Delivery'}
         open={!!selectedDelivery}
         onClose={() => setSelectedDelivery(null)}
-        width={680}
+        width="min(680px, 92vw)"
       >
         {selectedDelivery && (
-          <div className="sl-audit-drawer-stack">
+          <div
+            id={selectedDeliveryDetailId}
+            role="region"
+            aria-labelledby={selectedDeliveryTitleId}
+            className="sl-audit-drawer-stack"
+          >
             <div className={`sl-audit-drawer-signal sl-audit-drawer-${getDeliveryTone(selectedDelivery.status)}`}>
               <div>
                 <span>GitHub Webhook Delivery</span>
@@ -909,6 +1277,173 @@ export default function AuditLogs({ projectId, initialToolScanTaskId }: Props) {
   )
 }
 
+function AuditInvestigationLoopPanel({ steps }: { steps: AuditInvestigationStep[] }) {
+  return (
+    <section className="sl-audit-investigation-loop" aria-label="审计调查闭环">
+      <div className="sl-audit-investigation-head">
+        <div>
+          <span>Audit Investigation Loop</span>
+          <strong>审计调查闭环</strong>
+        </div>
+        <Tag>四段处置</Tag>
+      </div>
+      <div className="sl-audit-investigation-grid">
+        {steps.map((step, index) => (
+          <article
+            className={`sl-audit-investigation-step sl-audit-investigation-step-${step.tone}`}
+            data-sl-audit-investigation-step={step.key}
+            key={step.key}
+          >
+            <div className="sl-audit-investigation-step-head">
+              <div className="sl-audit-investigation-step-icon">{step.icon}</div>
+              <span>{String(index + 1).padStart(2, '0')}</span>
+            </div>
+            <div className="sl-audit-investigation-step-copy">
+              <span>{step.label}</span>
+              <strong>{step.status}</strong>
+              <p>{step.detail}</p>
+            </div>
+            <ActionButton size="small" type="text" onClick={step.onAction} label={step.actionLabel} />
+          </article>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function AuditCandidateReceiptReviewPanel({
+  projectId,
+  log,
+  provenance,
+  onNavigate,
+}: {
+  projectId: number
+  log: AuditLog
+  provenance: AutoRepairProvenance | null
+  onNavigate: (url: string) => void
+}) {
+  const sourceType = String(provenance?.sourceType || 'UNKNOWN_SOURCE')
+  const scanTaskId = candidateReceiptScanTaskId(log, provenance)
+  const repairId = log.resourceId || undefined
+  const repairUrl = repairId ? auditAutoRepairUrl(projectId, repairId, scanTaskId) : ''
+  const reportUrl = scanTaskId ? `/scan-tasks/${scanTaskId}` : ''
+  const qaUrl = scanTaskId ? auditCandidateReceiptQaUrl(projectId, scanTaskId, log, provenance) : ''
+  const gate = provenance?.repairEvidenceGate || 'REVIEW'
+  const gateTone = gate === 'READY' ? 'ready' : gate === 'BLOCKED' ? 'danger' : 'warning'
+
+  return (
+    <section
+      className={`sl-audit-candidate-receipt sl-audit-candidate-receipt-${gateTone}`}
+      aria-label="审计候选凭证复核"
+    >
+      <div className="sl-audit-candidate-receipt-head">
+        <div>
+          <span>Candidate Receipt Review</span>
+          <strong>候选来源凭证复核</strong>
+        </div>
+        <Tag color={gateTone === 'ready' ? 'green' : gateTone === 'danger' ? 'red' : 'gold'}>{gate}</Tag>
+      </div>
+      <div className="sl-audit-candidate-receipt-grid">
+        <div><span>来源类型</span><strong>{sourceType}</strong></div>
+        <div><span>扫描</span><strong>{scanTaskId ? `#${scanTaskId}` : '-'}</strong></div>
+        <div><span>目标文件</span><strong>{provenance?.filePath || provenance?.sourceEvidenceFilePath || '-'}</strong></div>
+        <div><span>门禁来源</span><strong>{provenance?.repairEvidenceGateSource || '-'}</strong></div>
+      </div>
+      <p>
+        {provenance?.repairEvidenceGateReason || '从审计事件解析候选来源凭证，复核时应回到同一报告、QA 问答和 AutoRepair 详情交叉确认。'}
+      </p>
+      <div className="sl-audit-candidate-receipt-actions">
+        {repairUrl && (
+          <ActionButton
+            size="small"
+            icon={<LinkOutlined />}
+            data-sl-target-url={repairUrl}
+            onClick={() => onNavigate(repairUrl)}
+            label="打开修复详情"
+          />
+        )}
+        {scanTaskId && (
+          <ActionButton
+            size="small"
+            icon={<SafetyCertificateOutlined />}
+            data-sl-target-url={reportUrl}
+            onClick={() => onNavigate(reportUrl)}
+            label="打开来源报告"
+          />
+        )}
+        {scanTaskId && (
+          <ActionButton
+            size="small"
+            icon={<SearchOutlined />}
+            data-sl-target-url={qaUrl}
+            onClick={() => onNavigate(qaUrl)}
+            label="QA 复核来源"
+          />
+        )}
+      </div>
+    </section>
+  )
+}
+
+function isCandidateReceiptAudit(log: AuditLog) {
+  return log.resourceType === 'AUTO_REPAIR' && log.action === 'AUTO_REPAIR_CANDIDATE_CREATED'
+}
+
+function parseAuditInputObject(log: AuditLog): any {
+  if (!log.inputJson) return null
+  try {
+    return JSON.parse(log.inputJson)
+  } catch {
+    return null
+  }
+}
+
+function candidateProvenanceFromAudit(log: AuditLog): AutoRepairProvenance | null {
+  const input = parseAuditInputObject(log)
+  const provenance = input?.provenance
+  if (!provenance || typeof provenance !== 'object') return null
+  return provenance as AutoRepairProvenance
+}
+
+function positiveNumber(value: unknown): number | undefined {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+}
+
+function candidateReceiptScanTaskId(log: AuditLog, provenance: AutoRepairProvenance | null) {
+  return positiveNumber(provenance?.scanTaskId) || positiveNumber(parseAuditInputObject(log)?.scanTaskId)
+}
+
+function auditAutoRepairUrl(projectId: number, repairId: number, scanTaskId?: number) {
+  const params = new URLSearchParams()
+  params.set('projectId', String(projectId))
+  params.set('repairId', String(repairId))
+  if (scanTaskId) {
+    params.set('scanTaskId', String(scanTaskId))
+  }
+  return `/auto-repairs?${params.toString()}`
+}
+
+function auditCandidateReceiptQaUrl(
+  projectId: number,
+  scanTaskId: number,
+  log: AuditLog,
+  provenance: AutoRepairProvenance | null,
+) {
+  const params = new URLSearchParams()
+  params.set('tab', 'qa')
+  params.set('scanTaskId', String(scanTaskId))
+  params.set('question', [
+    `请复核 AuditLog #${log.id} 中 AUTO_REPAIR_CANDIDATE_CREATED 的候选来源凭证。`,
+    `AutoRepair：#${log.resourceId || '-'}`,
+    `来源类型：${provenance?.sourceType || 'UNKNOWN_SOURCE'}`,
+    `目标文件：${provenance?.filePath || provenance?.sourceEvidenceFilePath || '-'}`,
+    `候选门禁：${provenance?.repairEvidenceGate || 'REVIEW'}`,
+    '请确认该候选是否仍能由同一扫描报告、QA 引用和审计留痕支持。',
+  ].join('\n'))
+  return `/projects/${projectId}?${params.toString()}`
+}
+
 function AuditSourceError({
   message,
   onRetry,
@@ -920,9 +1455,7 @@ function AuditSourceError({
     <div className="sl-audit-inline-error" role="alert">
       <WarningOutlined />
       <span>{message}</span>
-      <Button size="small" icon={<ReloadOutlined />} onClick={onRetry}>
-        重试
-      </Button>
+      <ActionButton size="small" icon={<ReloadOutlined />} onClick={onRetry} label="重试" />
     </div>
   )
 }

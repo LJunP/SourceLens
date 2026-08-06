@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.sourcelens.module.analysis.entity.CodeRelationEntity;
+import com.sourcelens.module.analysis.entity.CodeSymbol;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -51,6 +53,7 @@ public class JavaFallbackAnalyzer {
             ArrayNode symbols = mapper.createArrayNode();
             ArrayNode relations = mapper.createArrayNode();
             detectStructure(repoDir, mapper, root, symbols, relations, parsedAstMap);
+            root.set("graph", buildAstGraph(mapper, parsedAstMap));
 
             ObjectNode codeQuality = mapper.createObjectNode();
             codeQuality.put("total_classes", 0);
@@ -98,6 +101,7 @@ public class JavaFallbackAnalyzer {
         ArrayNode configurations = mapper.createArrayNode();
         ArrayNode dbEntities = mapper.createArrayNode();
         ArrayNode apiRoutes = mapper.createArrayNode();
+        AstParseStats astParseStats = new AstParseStats();
 
         try (Stream<Path> walk = Files.walk(repoDir.toPath(), 15)) {
             walk.filter(Files::isRegularFile)
@@ -109,6 +113,7 @@ public class JavaFallbackAnalyzer {
                     .forEach(javaFile -> {
                         String relPath = repoDir.toPath().relativize(javaFile).toString();
                         JavaAstParser.ParseResult res = javaAstParser.parseFile(javaFile, relPath, 0L);
+                        astParseStats.record(relPath, res);
                         parsedAstMap.put(relPath, res);
                         res.controllers.forEach(item -> addJson(controllers, mapper, item));
                         res.services.forEach(item -> addJson(services, mapper, item));
@@ -123,9 +128,13 @@ public class JavaFallbackAnalyzer {
             log.error("AST 增强 structure 失败", e);
             return;
         }
+        if (parsedAstMap != null && !parsedAstMap.isEmpty()) {
+            enrichInterfaceImplementationCallRelations(parsedAstMap);
+        }
 
         if (scanResult.isObject()) {
             ObjectNode root = (ObjectNode) scanResult;
+            root.set("java_ast_diagnostics", astParseStats.toJson(mapper));
             ObjectNode structure = mapper.createObjectNode();
             if (scanResult.has("structure") && scanResult.get("structure").has("directories")) {
                 structure.set("directories", scanResult.get("structure").get("directories"));
@@ -154,6 +163,10 @@ public class JavaFallbackAnalyzer {
             structure.set("api_routes", apiRoutes);
             structure.set("entry_points", mapper.createArrayNode());
             root.set("structure", structure);
+            if (parsedAstMap != null && !parsedAstMap.isEmpty()) {
+                replaceAstSymbolsAndRelations(mapper, root.withArray("symbols"), root.withArray("relations"), parsedAstMap);
+                root.set("graph", buildAstGraph(mapper, parsedAstMap));
+            }
         }
     }
 
@@ -284,6 +297,7 @@ public class JavaFallbackAnalyzer {
     private void detectStructure(File repoDir, ObjectMapper mapper, ObjectNode root,
                                  ArrayNode symbols, ArrayNode relations,
                                  Map<String, JavaAstParser.ParseResult> parsedAstMap) {
+        AstParseStats astParseStats = new AstParseStats();
         ObjectNode structure = mapper.createObjectNode();
         ObjectNode dirs = mapper.createObjectNode();
         List<Path> srcMainPaths = findAllSrcMainDirs(repoDir);
@@ -346,7 +360,11 @@ public class JavaFallbackAnalyzer {
         ArrayNode apiRoutes = mapper.createArrayNode();
 
         scanJavaFiles(repoDir, srcMainPaths, mapper, controllers, services, repositories, entities,
-                mappers, configurations, dbEntities, apiRoutes, symbols, relations, parsedAstMap);
+                mappers, configurations, dbEntities, apiRoutes, symbols, relations, parsedAstMap, astParseStats);
+        if (parsedAstMap != null && !parsedAstMap.isEmpty()) {
+            enrichInterfaceImplementationCallRelations(parsedAstMap);
+            replaceAstSymbolsAndRelations(mapper, symbols, relations, parsedAstMap);
+        }
 
         structure.set("controllers", controllers);
         structure.set("services", services);
@@ -359,6 +377,34 @@ public class JavaFallbackAnalyzer {
         structure.set("directories", dirs);
         structure.set("entry_points", mapper.createArrayNode());
         root.set("structure", structure);
+        root.set("java_ast_diagnostics", astParseStats.toJson(mapper));
+    }
+
+    private static class AstParseStats {
+        private int totalFiles;
+        private int parsedFiles;
+        private final List<String> failedFilePaths = new ArrayList<>();
+
+        void record(String relPath, JavaAstParser.ParseResult result) {
+            totalFiles++;
+            if (result != null && result.parseSucceeded) {
+                parsedFiles++;
+                return;
+            }
+            failedFilePaths.add(relPath);
+        }
+
+        ObjectNode toJson(ObjectMapper mapper) {
+            ObjectNode diagnostics = mapper.createObjectNode();
+            diagnostics.put("total_java_files", totalFiles);
+            diagnostics.put("parsed_java_files", parsedFiles);
+            diagnostics.put("failed_java_files", failedFilePaths.size());
+            ArrayNode failedPaths = mapper.createArrayNode();
+            failedFilePaths.forEach(failedPaths::add);
+            diagnostics.set("failed_file_paths", failedPaths);
+            diagnostics.put("status", failedFilePaths.isEmpty() ? "OK" : "PARTIAL");
+            return diagnostics;
+        }
     }
 
     private ArrayNode toStringArray(List<String> list, ObjectMapper mapper) {
@@ -369,6 +415,208 @@ public class JavaFallbackAnalyzer {
 
     private void addJson(ArrayNode array, ObjectMapper mapper, Object value) {
         array.add(mapper.valueToTree(value));
+    }
+
+    private void replaceAstSymbolsAndRelations(ObjectMapper mapper,
+                                               ArrayNode symbols,
+                                               ArrayNode relations,
+                                               Map<String, JavaAstParser.ParseResult> parsedAstMap) {
+        symbols.removeAll();
+        relations.removeAll();
+        parsedAstMap.values().forEach(result -> {
+            result.symbols.forEach(item -> addSymbolJson(symbols, mapper, item));
+            result.relations.forEach(item -> addRelationJson(relations, mapper, item));
+        });
+    }
+
+    private ObjectNode buildAstGraph(ObjectMapper mapper, Map<String, JavaAstParser.ParseResult> parsedAstMap) {
+        ObjectNode graph = mapper.createObjectNode();
+        ArrayNode nodes = mapper.createArrayNode();
+        ArrayNode edges = mapper.createArrayNode();
+        if (parsedAstMap == null || parsedAstMap.isEmpty()) {
+            graph.set("nodes", nodes);
+            graph.set("edges", edges);
+            return graph;
+        }
+
+        Set<String> nodeIds = new LinkedHashSet<>();
+        Set<String> edgeIds = new LinkedHashSet<>();
+        parsedAstMap.values().forEach(result -> {
+            result.symbols.forEach(symbol -> {
+                String symbolId = symbol.getSymbolId();
+                if (symbolId == null || symbolId.isBlank() || !nodeIds.add(symbolId)) {
+                    return;
+                }
+                ObjectNode node = mapper.createObjectNode();
+                node.put("id", symbolId);
+                node.put("label", nullToEmpty(symbol.getName()));
+                node.put("kind", nullToEmpty(symbol.getKind()));
+                node.put("file_path", nullToEmpty(symbol.getFilePath()));
+                node.put("line_number", symbol.getLineNumber() == null ? 0 : symbol.getLineNumber());
+                nodes.add(node);
+            });
+            result.relations.forEach(relation -> {
+                String sourceId = relation.getSourceId();
+                String targetId = relation.getTargetId();
+                if (sourceId == null || sourceId.isBlank() || targetId == null || targetId.isBlank()) {
+                    return;
+                }
+                String type = nullToEmpty(relation.getRelationType());
+                String edgeId = sourceId + "|" + targetId + "|" + type;
+                if (!edgeIds.add(edgeId)) {
+                    return;
+                }
+                ObjectNode edge = mapper.createObjectNode();
+                edge.put("source", sourceId);
+                edge.put("target", targetId);
+                edge.put("type", type);
+                edge.put("file_path", nullToEmpty(relation.getFilePath()));
+                edge.put("line_number", relation.getLineNumber() == null ? 0 : relation.getLineNumber());
+                edges.add(edge);
+            });
+        });
+        graph.set("nodes", nodes);
+        graph.set("edges", edges);
+        return graph;
+    }
+
+    private void addSymbolJson(ArrayNode array, ObjectMapper mapper, CodeSymbol symbol) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("symbol_id", nullToEmpty(symbol.getSymbolId()));
+        node.put("name", nullToEmpty(symbol.getName()));
+        node.put("kind", nullToEmpty(symbol.getKind()));
+        node.put("package", nullToEmpty(symbol.getPackage_()));
+        node.put("file_path", nullToEmpty(symbol.getFilePath()));
+        node.put("line_number", symbol.getLineNumber() == null ? 0 : symbol.getLineNumber());
+        if (symbol.getEndLine() != null) {
+            node.put("end_line", symbol.getEndLine());
+        }
+        if (symbol.getReturnType() != null) {
+            node.put("return_type", symbol.getReturnType());
+        }
+        if (symbol.getParentClass() != null) {
+            node.put("parent_class", symbol.getParentClass());
+        }
+        array.add(node);
+    }
+
+    private void addRelationJson(ArrayNode array, ObjectMapper mapper, CodeRelationEntity relation) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("source_id", nullToEmpty(relation.getSourceId()));
+        node.put("target_id", nullToEmpty(relation.getTargetId()));
+        node.put("relation_type", nullToEmpty(relation.getRelationType()));
+        node.put("file_path", nullToEmpty(relation.getFilePath()));
+        node.put("line_number", relation.getLineNumber() == null ? 0 : relation.getLineNumber());
+        array.add(node);
+    }
+
+    private String nullToEmpty(String value) {
+        return value == null ? "" : value;
+    }
+
+    private void enrichInterfaceImplementationCallRelations(Map<String, JavaAstParser.ParseResult> parsedAstMap) {
+        Map<String, List<String>> implementationsByInterface = new LinkedHashMap<>();
+        Set<String> methodSymbols = new LinkedHashSet<>();
+        Set<String> relationKeys = new LinkedHashSet<>();
+
+        parsedAstMap.values().forEach(result -> {
+            result.symbols.stream()
+                    .filter(symbol -> "METHOD".equals(symbol.getKind()))
+                    .map(CodeSymbol::getSymbolId)
+                    .filter(Objects::nonNull)
+                    .forEach(methodSymbols::add);
+            result.relations.forEach(relation -> {
+                relationKeys.add(relationKey(relation));
+                if ("IMPLEMENTS".equals(relation.getRelationType())
+                        && relation.getSourceId() != null
+                        && relation.getTargetId() != null) {
+                    implementationsByInterface
+                            .computeIfAbsent(relation.getTargetId(), ignored -> new ArrayList<>())
+                            .add(relation.getSourceId());
+                }
+            });
+        });
+
+        parsedAstMap.values().forEach(result -> {
+            List<CodeRelationEntity> additions = new ArrayList<>();
+            for (CodeRelationEntity relation : result.relations) {
+                if (!"CALLS".equals(relation.getRelationType()) || relation.getTargetId() == null) {
+                    continue;
+                }
+                String targetClassId = methodSymbolToClassId(relation.getTargetId());
+                if (targetClassId == null) {
+                    continue;
+                }
+                List<String> implementations = implementationsByInterface.getOrDefault(targetClassId, List.of())
+                        .stream()
+                        .distinct()
+                        .toList();
+                if (implementations.size() != 1) {
+                    continue;
+                }
+                String methodName = methodSymbolToMethodName(relation.getTargetId());
+                if (methodName == null) {
+                    continue;
+                }
+                String implementationTargetId = classIdToMethodSymbolId(implementations.get(0), methodName);
+                if (!methodSymbols.contains(implementationTargetId)) {
+                    continue;
+                }
+                CodeRelationEntity implementationCall = CodeRelationEntity.builder()
+                        .scanTaskId(relation.getScanTaskId())
+                        .sourceId(relation.getSourceId())
+                        .targetId(implementationTargetId)
+                        .relationType("CALLS")
+                        .filePath(relation.getFilePath())
+                        .lineNumber(relation.getLineNumber())
+                        .build();
+                String key = relationKey(implementationCall);
+                if (relationKeys.add(key)) {
+                    additions.add(implementationCall);
+                }
+            }
+            result.relations.addAll(additions);
+        });
+    }
+
+    private String relationKey(CodeRelationEntity relation) {
+        return String.join("|",
+                relation.getSourceId() == null ? "" : relation.getSourceId(),
+                relation.getTargetId() == null ? "" : relation.getTargetId(),
+                relation.getRelationType() == null ? "" : relation.getRelationType());
+    }
+
+    private String methodSymbolToClassId(String methodSymbolId) {
+        int hash = methodSymbolId == null ? -1 : methodSymbolId.lastIndexOf('#');
+        if (hash <= 0) {
+            return null;
+        }
+        String classPart = methodSymbolId.substring(0, hash);
+        int classDot = classPart.lastIndexOf('.');
+        if (classDot <= 0) {
+            return "#" + classPart;
+        }
+        return classPart.substring(0, classDot) + "#" + classPart.substring(classDot + 1);
+    }
+
+    private String methodSymbolToMethodName(String methodSymbolId) {
+        int hash = methodSymbolId == null ? -1 : methodSymbolId.lastIndexOf('#');
+        if (hash < 0 || hash + 1 >= methodSymbolId.length()) {
+            return null;
+        }
+        String method = methodSymbolId.substring(hash + 1);
+        if (method.endsWith("()")) {
+            method = method.substring(0, method.length() - 2);
+        }
+        return method.isBlank() ? null : method;
+    }
+
+    private String classIdToMethodSymbolId(String classId, String methodName) {
+        int separator = classId == null ? -1 : classId.lastIndexOf('#');
+        if (separator < 0) {
+            return (classId == null ? "" : classId) + "#" + methodName + "()";
+        }
+        return classId.substring(0, separator) + "." + classId.substring(separator + 1) + "#" + methodName + "()";
     }
 
     private void scanDirectoryNames(Path javaBase, Path repoRoot,
@@ -402,7 +650,8 @@ public class JavaFallbackAnalyzer {
                                ArrayNode entities, ArrayNode mappers, ArrayNode configurations,
                                ArrayNode dbEntities, ArrayNode apiRoutes,
                                ArrayNode symbols, ArrayNode relations,
-                               Map<String, JavaAstParser.ParseResult> parsedAstMap) {
+                               Map<String, JavaAstParser.ParseResult> parsedAstMap,
+                               AstParseStats astParseStats) {
         Set<String> processed = new HashSet<>();
         for (Path srcMain : srcMainPaths) {
             Path javaBase = srcMain.resolve("java");
@@ -418,6 +667,7 @@ public class JavaFallbackAnalyzer {
                                 if (!processed.add(absPath)) return;
                                 String relPath = repoDir.toPath().relativize(javaFile).toString();
                                 JavaAstParser.ParseResult res = javaAstParser.parseFile(javaFile, relPath, 0L);
+                                astParseStats.record(relPath, res);
                                 if (parsedAstMap != null) {
                                     parsedAstMap.put(relPath, res);
                                 }

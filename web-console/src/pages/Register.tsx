@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
-import { Form, Input, Button, Card, message, Typography } from 'antd'
+import { Form, Input, Card, message, Typography } from 'antd'
 import { UserOutlined, LockOutlined, MailOutlined } from '@ant-design/icons'
 import { useAuth } from '../contexts/AuthContext'
 import { showApiError } from '../api/client'
+import ActionButton from '../components/ui/ActionButton'
 
 export default function Register() {
   const [loading, setLoading] = useState(false)
@@ -38,7 +39,7 @@ export default function Register() {
             <Input.Password prefix={<LockOutlined />} placeholder="密码" />
           </Form.Item>
           <Form.Item>
-            <Button type="primary" htmlType="submit" loading={loading} block>注册</Button>
+            <ActionButton type="primary" htmlType="submit" loading={loading} block label="注册" />
           </Form.Item>
           <div style={{ textAlign: 'center' }}>
             已有账号？ <Link to="/login">去登录</Link>

@@ -1,4 +1,4 @@
-import { Alert, Descriptions, Empty, List, Space, Table, Tabs, Tag, Typography } from 'antd'
+import { Alert, Descriptions, List, Space, Table, Tabs, Tag, Typography } from 'antd'
 import {
   ApiOutlined,
   BranchesOutlined,
@@ -10,6 +10,8 @@ import {
 } from '@ant-design/icons'
 import type { ArtifactPreviewResponse, ArtifactRecord } from '../api/artifact'
 import type { ReactNode } from 'react'
+import StateBlock from './ui/StateBlock'
+import { redactDisplayValue, redactSensitiveText } from '../utils/displayRedaction'
 
 const { Text } = Typography
 
@@ -25,27 +27,29 @@ export default function ArtifactPreviewRenderer({ record, preview }: Props) {
 
   if (!parsed.ok) {
     return (
-      <pre className="sl-code-block sl-artifact-preview">
+      <pre className="sl-code-block sl-artifact-preview sl-artifact-redacted-preview" aria-label="redacted artifact preview">
         {formatPreview(preview.text, record.contentType)}
       </pre>
     )
   }
 
+  const redactedData = redactDisplayValue(parsed.data)
+
   if (!isRecord(parsed.data)) {
     return (
-      <pre className="sl-code-block sl-artifact-preview">
-        {JSON.stringify(parsed.data, null, 2)}
+      <pre className="sl-code-block sl-artifact-preview sl-artifact-redacted-preview" aria-label="redacted artifact preview">
+        {JSON.stringify(redactedData, null, 2)}
       </pre>
     )
   }
 
   return (
-    <div className="sl-artifact-smart-preview">
-      {renderByType(record.artifactType, parsed.data)}
+    <div className="sl-artifact-smart-preview sl-artifact-redacted-preview" aria-label="redacted artifact preview">
+      {renderByType(record.artifactType, asRecord(redactedData))}
       <details className="sl-artifact-raw-json">
         <summary>原始 JSON</summary>
-        <pre className="sl-code-block sl-artifact-preview">
-          {JSON.stringify(parsed.data, null, 2)}
+        <pre className="sl-code-block sl-artifact-preview sl-artifact-redacted-raw-json" aria-label="redacted raw artifact JSON">
+          {JSON.stringify(redactedData, null, 2)}
         </pre>
       </details>
     </div>
@@ -273,7 +277,7 @@ function GenericObjectPreview({ data }: { data: JsonRecord }) {
 
 function ApiRouteTable({ routes }: { routes: JsonRecord[] }) {
   if (!routes.length) {
-    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可读 API 路由" />
+    return <StateBlock compact title="暂无可读 API 路由" description="当前产物没有返回可展示的接口目录。" />
   }
   return (
     <Table
@@ -298,7 +302,7 @@ function DbEntityTable({ entities, invalidCount }: { entities: JsonRecord[]; inv
     return (
       <Space direction="vertical" size={12} style={{ width: '100%' }}>
         {invalidCount > 0 && <LegacyDataAlert count={invalidCount} label="数据库实体" />}
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可读数据库实体" />
+        <StateBlock compact title="暂无可读数据库实体" description="当前产物没有返回可展示的数据实体。" />
       </Space>
     )
   }
@@ -345,7 +349,7 @@ function RiskAndSuggestionList({
           )}
         />
       ) : (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="未识别到显著风险" />
+        <StateBlock compact tone="success" title="未识别到显著风险" description="当前风险报告没有返回显著风险项。" />
       )}
       {debts.length > 0 && (
         <List
@@ -395,10 +399,10 @@ function PreviewTile({
   return (
     <div className={`sl-artifact-preview-tile ${tone ? `sl-artifact-preview-tile-${tone}` : ''}`}>
       <div className="sl-artifact-preview-tile-head">
-        <span>{label}</span>
+        <span className="sl-artifact-preview-tile-label">{label}</span>
         {icon}
       </div>
-      <strong>{value}</strong>
+      <strong className="sl-artifact-preview-tile-value">{value}</strong>
     </div>
   )
 }
@@ -475,12 +479,12 @@ function renderValue(value: unknown) {
 function formatPreview(text: string, contentType: string | null) {
   if ((contentType || '').toLowerCase().includes('json')) {
     try {
-      return JSON.stringify(JSON.parse(text), null, 2)
+      return JSON.stringify(redactDisplayValue(JSON.parse(text)), null, 2)
     } catch {
-      return text
+      return redactSensitiveText(text)
     }
   }
-  return text
+  return redactSensitiveText(text)
 }
 
 function riskColor(severity?: string) {

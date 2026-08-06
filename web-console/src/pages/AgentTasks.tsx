@@ -1,17 +1,21 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
-  Card, Table, Tag, Typography, Button, Space, Select, Descriptions, Tabs,
-  Tooltip, Badge, Modal, Form, Input, InputNumber, message, Empty, Alert, Progress, Popconfirm
+  Card, Table, Tag, Typography, Space, Select, Descriptions, Tabs,
+  Badge, Modal, Form, Input, InputNumber, message, Alert, Progress, Popconfirm
 } from 'antd'
 import {
   RobotOutlined, PlayCircleOutlined, StopOutlined, PlusOutlined,
   CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined,
-  SyncOutlined, MessageOutlined, SafetyCertificateOutlined
+  SyncOutlined, MessageOutlined, SafetyCertificateOutlined, ReloadOutlined
 } from '@ant-design/icons'
 import { agentTaskApi, AgentTask, AgentTaskStep } from '../api/agentTask'
-import { showApiError } from '../api/client'
+import { formatApiError, showApiError } from '../api/client'
 import ArtifactLinkButton from '../components/ArtifactLinkButton'
+import ActionButton from '../components/ui/ActionButton'
+import IconActionButton from '../components/ui/IconActionButton'
+import { createSelectableTableRowProps } from '../components/ui/selectableTableRow'
+import StateBlock from '../components/ui/StateBlock'
 import TaskTimeline from '../components/TaskTimeline'
 
 const { Text } = Typography
@@ -54,6 +58,28 @@ interface AgentTaskHealthSignal {
   }>
 }
 
+interface AgentTaskActionGate {
+  status: 'READY' | 'REVIEW' | 'BLOCKED'
+  tone: AgentTone
+  summary: string
+  reason: string
+  checks: Array<{
+    label: string
+    value: string
+    tone: AgentTone
+  }>
+}
+
+interface AgentTaskLifecycleStage {
+  key: string
+  stage: string
+  title: string
+  status: string
+  description: string
+  tone: AgentTone
+  icon: React.ReactNode
+}
+
 interface Props {
   projectId: number
 }
@@ -63,27 +89,37 @@ export default function AgentTasks({ projectId }: Props) {
   const [searchParams] = useSearchParams()
   const [tasks, setTasks] = useState<AgentTask[]>([])
   const [loading, setLoading] = useState(true)
+  const [taskListError, setTaskListError] = useState<string | null>(null)
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState<string | undefined>(undefined)
   const [selectedTask, setSelectedTask] = useState<AgentTask | null>(null)
   const [steps, setSteps] = useState<AgentTaskStep[]>([])
   const [stepsLoading, setStepsLoading] = useState(false)
+  const [stepsError, setStepsError] = useState<string | null>(null)
   const [createModalOpen, setCreateModalOpen] = useState(false)
   const [createSubmitting, setCreateSubmitting] = useState(false)
   const [createForm] = Form.useForm()
   const requestedScanTaskId = parsePositiveNumber(searchParams.get('scanTaskId'))
+  const requestedTaskId = parsePositiveNumber(searchParams.get('taskId'))
   const openCreate = searchParams.get('openCreate') === '1'
   const prefilledCreateKeyRef = useRef<string | null>(null)
+  const appliedRequestedTaskIdRef = useRef<number | null>(null)
+  const stepsRequestSeqRef = useRef(0)
 
   const fetchTasks = () => {
     setLoading(true)
+    setTaskListError(null)
     agentTaskApi.listByProject(projectId, page, 20, statusFilter, requestedScanTaskId)
       .then(res => {
         setTasks(res.data.data.items || [])
         setTotal(res.data.data.total)
+        setTaskListError(null)
       })
-      .catch(error => showApiError(error, '加载任务失败'))
+      .catch(error => {
+        setTaskListError(formatApiError(error, '加载任务失败'))
+        showApiError(error, '加载任务失败')
+      })
       .finally(() => setLoading(false))
   }
 
@@ -113,17 +149,54 @@ export default function AgentTasks({ projectId }: Props) {
   }, [createForm, openCreate, projectId, requestedScanTaskId, searchParams])
 
   const fetchSteps = (taskId: number) => {
+    const requestSeq = stepsRequestSeqRef.current + 1
+    stepsRequestSeqRef.current = requestSeq
     setStepsLoading(true)
+    setStepsError(null)
     agentTaskApi.listSteps(taskId)
-      .then(res => setSteps(res.data.data || []))
-      .catch(error => showApiError(error, '加载步骤失败'))
-      .finally(() => setStepsLoading(false))
+      .then(res => {
+        if (stepsRequestSeqRef.current !== requestSeq) return
+        setSteps(res.data.data || [])
+        setStepsError(null)
+      })
+      .catch(error => {
+        if (stepsRequestSeqRef.current !== requestSeq) return
+        setStepsError(formatApiError(error, '加载步骤失败'))
+        showApiError(error, '加载步骤失败')
+      })
+      .finally(() => {
+        if (stepsRequestSeqRef.current === requestSeq) {
+          setStepsLoading(false)
+        }
+      })
   }
 
   const handleSelectTask = (task: AgentTask) => {
     setSelectedTask(task)
+    setSteps([])
+    setStepsError(null)
     fetchSteps(task.id)
   }
+
+  useEffect(() => {
+    if (!requestedTaskId || appliedRequestedTaskIdRef.current === requestedTaskId) return
+    const matched = tasks.find(task => task.id === requestedTaskId)
+    if (matched) {
+      appliedRequestedTaskIdRef.current = requestedTaskId
+      handleSelectTask(matched)
+      return
+    }
+    if (loading) return
+    appliedRequestedTaskIdRef.current = requestedTaskId
+    agentTaskApi.detail(requestedTaskId)
+      .then(res => {
+        const detail = res.data.data
+        if (!detail) return
+        setTasks(prev => prev.some(task => task.id === detail.id) ? prev : [detail, ...prev])
+        handleSelectTask(detail)
+      })
+      .catch(error => showApiError(error, '加载指定 Agent 任务失败'))
+  }, [loading, requestedTaskId, tasks])
 
   const openScanTask = (scanTaskId?: number | null) => {
     if (scanTaskId) navigate(`/scan-tasks/${scanTaskId}`)
@@ -180,9 +253,29 @@ export default function AgentTasks({ projectId }: Props) {
     failedCount: tasks.filter(task => task.status === 'FAILED').length,
     highPriorityCount: tasks.filter(task => task.priority === 'HIGH').length,
     terminalCount: tasks.filter(task => TERMINAL_STATUSES.includes(task.status)).length,
+    scanBoundCount: tasks.filter(task => Boolean(task.scanTaskId)).length,
+    conversationBoundCount: tasks.filter(task => Boolean(task.conversationId)).length,
   }
   const selectedProgress = selectedTask ? agentTaskProgress(selectedTask, steps) : 0
   const selectedHealth = selectedTask ? buildAgentTaskHealthSignal(selectedTask, steps) : null
+  const selectedActionGate = selectedTask ? buildAgentTaskActionGate(selectedTask) : null
+  const lifecycleStages = useMemo(
+    () => buildAgentTaskLifecycleStages(tasks, summary, selectedTask, steps),
+    [selectedTask, steps, summary, tasks],
+  )
+  const selectedDetailId = selectedTask ? `agent-task-detail-${selectedTask.id}` : undefined
+  const selectedTitleId = selectedTask ? `agent-task-detail-title-${selectedTask.id}` : undefined
+  const taskListEmptyText = taskListError ? (
+    <StateBlock
+      compact
+      tone="error"
+      title="Agent 任务加载失败"
+      description={taskListError}
+      action={<ActionButton size="small" icon={<ReloadOutlined />} loading={loading} onClick={fetchTasks} label="重试加载" />}
+    />
+  ) : (
+    <StateBlock compact title="暂无 Agent 任务" description="创建架构审查、风险扫描或变更影响任务后会在这里追踪步骤。" />
+  )
 
   const columns = [
     {
@@ -197,9 +290,15 @@ export default function AgentTasks({ projectId }: Props) {
       key: 'title',
       ellipsis: true,
       render: (title: string, record: AgentTask) => (
-        <Button type="link" style={{ padding: 0 }} onClick={() => handleSelectTask(record)}>
-          {title}
-        </Button>
+        <ActionButton
+          type="link"
+          className="sl-inline-link"
+          onClick={(event) => {
+            event.stopPropagation()
+            handleSelectTask(record)
+          }}
+          label={title}
+        />
       ),
     },
     {
@@ -215,17 +314,16 @@ export default function AgentTasks({ projectId }: Props) {
       key: 'scanTaskId',
       width: 110,
       render: (scanTaskId: number | null, record: AgentTask) => scanTaskId ? (
-        <Button
+        <ActionButton
           type="link"
           size="small"
-          style={{ padding: 0 }}
+          className="sl-inline-link"
           onClick={(event) => {
             event.stopPropagation()
             openScanTask(record.scanTaskId)
           }}
-        >
-          #{scanTaskId}
-        </Button>
+          label={`#${scanTaskId}`}
+        />
       ) : (
         <Text type="secondary">-</Text>
       ),
@@ -259,15 +357,32 @@ export default function AgentTasks({ projectId }: Props) {
       key: 'action',
       width: 180,
       render: (_: unknown, record: AgentTask) => (
-        <Space size="small">
+        <Space size="small" onClick={(event) => event.stopPropagation()}>
           {record.conversationId && (
-            <Tooltip title="打开对话"><Button size="small" type="primary" icon={<MessageOutlined />} onClick={(e) => { e.stopPropagation(); navigate(`/agent-chat/${record.conversationId}`) }} /></Tooltip>
+            <IconActionButton
+              label={`打开 Agent 任务 #${record.id} 对话`}
+              tooltip="打开对话"
+              size="small"
+              type="primary"
+              icon={<MessageOutlined />}
+              onClick={(event) => { event.stopPropagation(); navigate(`/agent-chat/${record.conversationId}`) }}
+            />
           )}
           <span onClick={(e) => e.stopPropagation()}>
             <ArtifactLinkButton projectId={projectId} ownerType="AGENT_TASK" ownerId={record.id} />
           </span>
           {record.status === 'PENDING' && (
-            <Tooltip title="启动"><Button size="small" type="primary" icon={<PlayCircleOutlined />} onClick={() => handleStart(record.id)} /></Tooltip>
+            <IconActionButton
+              label={`启动 Agent 任务 #${record.id}`}
+              tooltip="启动"
+              size="small"
+              type="primary"
+              icon={<PlayCircleOutlined />}
+              onClick={(event) => {
+                event.stopPropagation()
+                handleStart(record.id)
+              }}
+            />
           )}
           {record.status === 'RUNNING' && (
             <Popconfirm
@@ -277,12 +392,26 @@ export default function AgentTasks({ projectId }: Props) {
               cancelText="返回"
               onConfirm={() => handleCancel(record.id)}
             >
-              <Tooltip title="取消">
-                <Button size="small" danger icon={<StopOutlined />} />
-              </Tooltip>
+              <IconActionButton
+                label={`取消 Agent 任务 #${record.id}`}
+                tooltip="取消"
+                size="small"
+                danger
+                icon={<StopOutlined />}
+                onClick={(event) => event.stopPropagation()}
+              />
             </Popconfirm>
           )}
-          <Tooltip title="详情"><Button size="small" onClick={() => handleSelectTask(record)}>详情</Button></Tooltip>
+          <ActionButton
+            size="small"
+            className="sl-agent-detail-action"
+            onClick={(event) => {
+              event.stopPropagation()
+              handleSelectTask(record)
+            }}
+            aria-label={`查看 Agent 任务 #${record.id} 详情`}
+            label="详情"
+          />
         </Space>
       ),
     },
@@ -305,15 +434,20 @@ export default function AgentTasks({ projectId }: Props) {
             {requestedScanTaskId && <span>scan #{requestedScanTaskId}</span>}
           </div>
           <div className="sl-agent-actions">
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => {
-              createForm.resetFields()
-              createForm.setFieldsValue({
-                taskType: 'ARCHITECTURE_REVIEW',
-                priority: 'MEDIUM',
-                scanTaskId: requestedScanTaskId || undefined,
-              })
-              setCreateModalOpen(true)
-            }}>创建任务</Button>
+            <ActionButton
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => {
+                createForm.resetFields()
+                createForm.setFieldsValue({
+                  taskType: 'ARCHITECTURE_REVIEW',
+                  priority: 'MEDIUM',
+                  scanTaskId: requestedScanTaskId || undefined,
+                })
+                setCreateModalOpen(true)
+              }}
+              label="创建任务"
+            />
             <Select
               allowClear
               placeholder="筛选状态"
@@ -347,6 +481,8 @@ export default function AgentTasks({ projectId }: Props) {
         <AgentStat icon={<ClockCircleOutlined />} label="高优先级" value={summary.highPriorityCount} footnote="优先复盘队列" tone={summary.highPriorityCount > 0 ? 'warning' : 'idle'} />
       </div>
 
+      <AgentTaskLifecycleLoop stages={lifecycleStages} />
+
       <Modal
         title="创建 Agent 任务"
         open={createModalOpen}
@@ -379,13 +515,22 @@ export default function AgentTasks({ projectId }: Props) {
       </Modal>
 
       <div className={`sl-agent-workbench ${selectedTask ? 'sl-agent-workbench-with-detail' : ''}`}>
-        <Card className="sl-section-card sl-agent-table-card" title={<span className="sl-card-title"><RobotOutlined /> Agent 任务列表</span>}>
+        <Card className="sl-section-card sl-agent-table-card sl-selectable-table-card" title={<span className="sl-card-title"><RobotOutlined /> Agent 任务列表</span>}>
+          {taskListError && tasks.length > 0 && (
+            <StateBlock
+              compact
+              tone="error"
+              title="Agent 任务刷新失败"
+              description={taskListError}
+              action={<ActionButton size="small" icon={<ReloadOutlined />} loading={loading} onClick={fetchTasks} label="重试加载" />}
+            />
+          )}
           <Table
             dataSource={tasks}
             columns={columns}
             rowKey="id"
             loading={loading}
-            locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无 Agent 任务" /> }}
+            locale={{ emptyText: taskListEmptyText }}
             pagination={{
               current: page,
               total,
@@ -396,17 +541,24 @@ export default function AgentTasks({ projectId }: Props) {
             scroll={{ x: 1040 }}
             size="middle"
             rowClassName={(record) => selectedTask?.id === record.id ? 'sl-agent-row-selected' : ''}
-            onRow={(record) => ({
-              onClick: () => handleSelectTask(record),
+            onRow={(record) => createSelectableTableRowProps({
+              record,
+              selected: selectedTask?.id === record.id,
+              onSelect: handleSelectTask,
+              controlsId: selectedDetailId,
+              label: `AgentTask #${record.id} ${selectedTask?.id === record.id ? '已选中' : '查看详情'}`,
             })}
           />
         </Card>
 
         {selectedTask && (
           <Card
+            id={selectedDetailId}
+            role="region"
+            aria-labelledby={selectedTitleId}
             className="sl-section-card sl-agent-detail-card"
             title={
-              <Space wrap>
+              <Space wrap id={selectedTitleId}>
                 <Tag color={TASK_STATUS_MAP[selectedTask.status]?.color}>{selectedTask.status}</Tag>
                 <span>{selectedTask.title}</span>
               </Space>
@@ -414,10 +566,10 @@ export default function AgentTasks({ projectId }: Props) {
             extra={
               <Space wrap>
                   {selectedTask.conversationId && (
-                    <Button size="small" type="primary" onClick={() => navigate(`/agent-chat/${selectedTask.conversationId}`)}>打开对话</Button>
+                    <ActionButton size="small" type="primary" icon={<MessageOutlined />} onClick={() => navigate(`/agent-chat/${selectedTask.conversationId}`)} label="打开对话" />
                   )}
                   {selectedTask.scanTaskId && (
-                    <Button size="small" onClick={() => openScanTask(selectedTask.scanTaskId)}>打开扫描报告</Button>
+                    <ActionButton size="small" onClick={() => openScanTask(selectedTask.scanTaskId)} label="打开扫描报告" />
                   )}
                   {selectedTask.status === 'RUNNING' && (
                     <Popconfirm
@@ -427,7 +579,7 @@ export default function AgentTasks({ projectId }: Props) {
                       cancelText="返回"
                       onConfirm={() => handleCancel(selectedTask.id)}
                     >
-                      <Button size="small" danger icon={<StopOutlined />}>取消</Button>
+                      <ActionButton size="small" danger icon={<StopOutlined />} label="取消" />
                     </Popconfirm>
                   )}
                   <ArtifactLinkButton
@@ -436,7 +588,7 @@ export default function AgentTasks({ projectId }: Props) {
                   ownerId={selectedTask.id}
                   label="查看产物"
                 />
-                <Button size="small" onClick={() => setSelectedTask(null)}>关闭</Button>
+                <ActionButton size="small" onClick={() => setSelectedTask(null)} label="关闭" />
               </Space>
             }
           >
@@ -444,6 +596,7 @@ export default function AgentTasks({ projectId }: Props) {
               {selectedHealth && (
                 <>
                   <AgentTaskHealthCard signal={selectedHealth} progress={selectedProgress} />
+                  {selectedActionGate && <AgentTaskActionGatePanel gate={selectedActionGate} />}
                   {selectedTask.errorMessage && (
                     <Alert type="error" showIcon message="Agent 任务错误" description={selectedTask.errorMessage} />
                   )}
@@ -454,67 +607,81 @@ export default function AgentTasks({ projectId }: Props) {
                   key: 'info',
                   label: '基本信息',
                   children: (
-                    <Descriptions column={2} bordered size="small">
-                      <Descriptions.Item label="ID">{selectedTask.id}</Descriptions.Item>
-                      <Descriptions.Item label="类型">
-                        <Tag>{TASK_TYPE_LABELS[selectedTask.taskType] || selectedTask.taskType}</Tag>
-                      </Descriptions.Item>
-                      <Descriptions.Item label="优先级">
-                        <Tag color={PRIORITY_COLORS[selectedTask.priority]}>{selectedTask.priority}</Tag>
-                      </Descriptions.Item>
-                      <Descriptions.Item label="项目 ID">{selectedTask.projectId}</Descriptions.Item>
-                      <Descriptions.Item label="关联扫描" span={2}>
-                        {selectedTask.scanTaskId ? (
-                          <Button
-                            type="link"
-                            size="small"
-                            style={{ padding: 0 }}
-                            onClick={() => openScanTask(selectedTask.scanTaskId)}
-                          >
-                            扫描报告 #{selectedTask.scanTaskId}
-                          </Button>
-                        ) : '无'}
-                      </Descriptions.Item>
-                      <Descriptions.Item label="描述" span={2}>
-                        {selectedTask.description || '无'}
-                      </Descriptions.Item>
-                      <Descriptions.Item label="开始时间">
-                        {selectedTask.startedAt ? new Date(selectedTask.startedAt).toLocaleString('zh-CN') : '-'}
-                      </Descriptions.Item>
-                      <Descriptions.Item label="结束时间">
-                        {selectedTask.finishedAt ? new Date(selectedTask.finishedAt).toLocaleString('zh-CN') : '-'}
-                      </Descriptions.Item>
-                      {selectedTask.summary && (
-                        <Descriptions.Item label="摘要" span={2}>
-                          <Text>{selectedTask.summary}</Text>
+                    <>
+                      <Descriptions column={2} bordered size="small">
+                        <Descriptions.Item label="ID">{selectedTask.id}</Descriptions.Item>
+                        <Descriptions.Item label="类型">
+                          <Tag>{TASK_TYPE_LABELS[selectedTask.taskType] || selectedTask.taskType}</Tag>
                         </Descriptions.Item>
-                      )}
-                      {selectedTask.errorMessage && (
-                        <Descriptions.Item label="错误" span={2}>
-                          <Text type="danger">{selectedTask.errorMessage}</Text>
+                        <Descriptions.Item label="优先级">
+                          <Tag color={PRIORITY_COLORS[selectedTask.priority]}>{selectedTask.priority}</Tag>
                         </Descriptions.Item>
-                      )}
-                      {selectedTask.inputJson && (
-                        <Descriptions.Item label="输入" span={2}>
-                          <pre style={{ margin: 0, fontSize: 12, maxHeight: 120, overflow: 'auto' }}>
-                            {(() => { try { return JSON.stringify(JSON.parse(selectedTask.inputJson), null, 2) } catch { return selectedTask.inputJson } })()}
-                          </pre>
+                        <Descriptions.Item label="项目 ID">{selectedTask.projectId}</Descriptions.Item>
+                        <Descriptions.Item label="关联扫描" span={2}>
+                          {selectedTask.scanTaskId ? (
+                            <ActionButton
+                              type="link"
+                              size="small"
+                              className="sl-inline-link"
+                              onClick={() => openScanTask(selectedTask.scanTaskId)}
+                              label={`扫描报告 #${selectedTask.scanTaskId}`}
+                            />
+                          ) : '无'}
                         </Descriptions.Item>
-                      )}
-                      {selectedTask.outputJson && (
-                        <Descriptions.Item label="输出" span={2}>
-                          <pre style={{ margin: 0, fontSize: 12, maxHeight: 200, overflow: 'auto' }}>
-                            {(() => { try { return JSON.stringify(JSON.parse(selectedTask.outputJson), null, 2) } catch { return selectedTask.outputJson } })()}
-                          </pre>
+                        <Descriptions.Item label="描述" span={2}>
+                          {selectedTask.description || '无'}
                         </Descriptions.Item>
+                        <Descriptions.Item label="开始时间">
+                          {selectedTask.startedAt ? new Date(selectedTask.startedAt).toLocaleString('zh-CN') : '-'}
+                        </Descriptions.Item>
+                        <Descriptions.Item label="结束时间">
+                          {selectedTask.finishedAt ? new Date(selectedTask.finishedAt).toLocaleString('zh-CN') : '-'}
+                        </Descriptions.Item>
+                        {selectedTask.summary && (
+                          <Descriptions.Item label="摘要" span={2}>
+                            <Text>{selectedTask.summary}</Text>
+                          </Descriptions.Item>
+                        )}
+                        {selectedTask.errorMessage && (
+                          <Descriptions.Item label="错误" span={2}>
+                            <Text type="danger">{selectedTask.errorMessage}</Text>
+                          </Descriptions.Item>
+                        )}
+                        {selectedTask.inputJson && (
+                          <Descriptions.Item label="输入" span={2}>
+                            <Text type="secondary">已留存，原始输入默认隐藏；请通过审计日志或授权产物复核。</Text>
+                          </Descriptions.Item>
+                        )}
+                        {selectedTask.outputJson && (
+                          <Descriptions.Item label="输出" span={2}>
+                            <Text type="secondary">已留存，原始输出默认隐藏；当前页面仅展示摘要、步骤和可审计产物。</Text>
+                          </Descriptions.Item>
+                        )}
+                      </Descriptions>
+                      {(selectedTask.inputJson || selectedTask.outputJson) && (
+                        <section className="sl-agent-payload-safety" aria-label="原始 Payload 安全边界">
+                          <SafetyCertificateOutlined />
+                          <div>
+                            <span>原始 Payload 默认隐藏</span>
+                            <p>任务输入和输出可能包含 prompt、路径、模型中间内容或工具结果；当前详情只展示摘要、步骤和产物入口，原文必须通过授权审计链路复核。</p>
+                          </div>
+                        </section>
                       )}
-                    </Descriptions>
+                    </>
                   ),
                 },
                 {
                   key: 'steps',
                   label: `执行步骤 (${steps.length})`,
-                  children: (
+                  children: stepsError ? (
+                    <StateBlock
+                      compact
+                      tone="error"
+                      title="执行步骤加载失败"
+                      description={stepsError}
+                      action={<ActionButton size="small" icon={<ReloadOutlined />} loading={stepsLoading} onClick={() => fetchSteps(selectedTask.id)} label="重试加载" />}
+                    />
+                  ) : (
                     <TaskTimeline
                       loading={stepsLoading}
                       items={steps.map(step => ({
@@ -537,6 +704,40 @@ export default function AgentTasks({ projectId }: Props) {
         )}
       </div>
     </div>
+  )
+}
+
+function AgentTaskLifecycleLoop({ stages }: { stages: AgentTaskLifecycleStage[] }) {
+  return (
+    <section className="sl-agent-lifecycle-loop" aria-label="Agent 任务治理闭环">
+      <div className="sl-agent-lifecycle-head">
+        <SafetyCertificateOutlined />
+        <div>
+          <span>DEVELOPER CONTROL PLANE</span>
+          <h2>Agent 任务治理闭环</h2>
+          <p>Agent 任务闭环只能证明任务元数据、步骤、对话、扫描报告和产物入口可追踪，不能证明模型判断正确、工具输出真实、修复/PR/CI 结果正确。</p>
+        </div>
+      </div>
+      <div className="sl-agent-lifecycle-grid">
+        {stages.map(stage => (
+          <article
+            key={stage.key}
+            className={`sl-agent-lifecycle-stage sl-agent-lifecycle-stage-${stage.tone}`}
+            data-sl-agent-lifecycle-stage={stage.key}
+          >
+            <div className="sl-agent-lifecycle-stage-head">
+              <div className="sl-agent-lifecycle-icon">{stage.icon}</div>
+              <div>
+                <span>{stage.stage}</span>
+                <strong>{stage.title}</strong>
+              </div>
+            </div>
+            <div className="sl-agent-lifecycle-status">{stage.status}</div>
+            <p>{stage.description}</p>
+          </article>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -597,6 +798,33 @@ function AgentTaskHealthCard({ signal, progress }: { signal: AgentTaskHealthSign
   )
 }
 
+function AgentTaskActionGatePanel({ gate }: { gate: AgentTaskActionGate }) {
+  return (
+    <section
+      className={`sl-agent-action-gate sl-agent-action-gate-${gate.tone}`}
+      aria-label="Agent 任务动作门禁说明"
+    >
+      <div className="sl-agent-action-gate-head">
+        <SafetyCertificateOutlined />
+        <div>
+          <span>Agent Task Action Gate</span>
+          <strong>{gate.summary}</strong>
+        </div>
+        <Tag color={agentToneColor(gate.tone)}>{gate.status}</Tag>
+      </div>
+      <p>{gate.reason}</p>
+      <div className="sl-agent-action-gate-grid">
+        {gate.checks.map(check => (
+          <div className={`sl-agent-action-gate-check sl-agent-action-gate-check-${check.tone}`} key={check.label}>
+            <span>{check.label}</span>
+            <strong>{check.value}</strong>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function agentTaskProgress(task: AgentTask, steps: AgentTaskStep[]) {
   if (task.status === 'COMPLETED') return 100
   if (task.status === 'FAILED' || task.status === 'CANCELLED') return 100
@@ -607,6 +835,156 @@ function agentTaskProgress(task: AgentTask, steps: AgentTaskStep[]) {
     return Math.max(42, Math.min(92, Math.round((done / steps.length) * 100)))
   }
   return 0
+}
+
+function buildAgentTaskLifecycleStages(
+  tasks: AgentTask[],
+  summary: {
+    activeCount: number
+    completedCount: number
+    failedCount: number
+    highPriorityCount: number
+    terminalCount: number
+    scanBoundCount: number
+    conversationBoundCount: number
+  },
+  selectedTask: AgentTask | null,
+  steps: AgentTaskStep[],
+): AgentTaskLifecycleStage[] {
+  const taskCount = tasks.length
+  const selectedStepCount = selectedTask ? steps.length : 0
+  const selectedToolStepCount = selectedTask ? steps.filter(step => Boolean(step.toolName)).length : 0
+  const selectedHasReviewOutput = Boolean(selectedTask?.summary || selectedTask?.outputJson)
+  const sourceCoverage = taskCount ? Math.round((summary.scanBoundCount / taskCount) * 100) : 0
+  const conversationCoverage = taskCount ? Math.round((summary.conversationBoundCount / taskCount) * 100) : 0
+  const intakeTone: AgentTone = !taskCount ? 'idle' : sourceCoverage >= 70 ? 'ready' : 'warning'
+  const controlTone: AgentTone = summary.failedCount > 0 ? 'danger' : summary.activeCount > 0 ? 'warning' : taskCount ? 'ready' : 'idle'
+  const evidenceTone: AgentTone = !selectedTask ? 'idle' : selectedStepCount > 0 ? 'ready' : 'warning'
+  const handoffTone: AgentTone = summary.failedCount > 0 ? 'danger' : summary.terminalCount > 0 ? 'ready' : summary.activeCount > 0 ? 'warning' : 'idle'
+
+  return [
+    {
+      key: 'task-intake',
+      stage: 'A1',
+      title: '任务入口',
+      status: taskCount ? `${summary.scanBoundCount}/${taskCount} 绑定扫描` : '等待任务',
+      description: taskCount
+        ? `Agent 任务应绑定扫描、对话或明确描述；当前扫描绑定率 ${sourceCoverage}%，对话绑定率 ${conversationCoverage}%。`
+        : '创建架构审查、风险扫描或变更影响任务后，才会形成可治理 Agent 工作单。',
+      tone: intakeTone,
+      icon: <RobotOutlined />,
+    },
+    {
+      key: 'execution-control',
+      stage: 'A2',
+      title: '执行控制',
+      status: `${summary.activeCount} 活跃 · ${summary.highPriorityCount} 高优先级`,
+      description: summary.failedCount > 0
+        ? '存在失败 Agent 任务，必须先复核步骤、错误和上下文，再决定是否重建任务。'
+        : summary.activeCount > 0
+          ? '排队或运行中的任务只能通过显式启动、受控取消和动作门禁推进。'
+          : '当前没有活跃 Agent 任务，后续应从终态复盘或新建任务进入。',
+      tone: controlTone,
+      icon: summary.activeCount > 0 ? <SyncOutlined spin /> : <PlayCircleOutlined />,
+    },
+    {
+      key: 'tool-evidence',
+      stage: 'A3',
+      title: '工具证据',
+      status: selectedTask ? `${selectedStepCount} 步骤 · ${selectedToolStepCount} 工具` : '未选择任务',
+      description: selectedTask
+        ? selectedStepCount > 0
+          ? '选中任务已有步骤或工具调用证据，但 raw payload 默认隐藏，必须通过授权审计链路复核。'
+          : '选中任务缺少步骤证据，不能直接作为 Agent 分析结论。'
+        : '选择一条 Agent 任务后，才能判断步骤、工具、对话和产物入口是否足够。',
+      tone: evidenceTone,
+      icon: <SafetyCertificateOutlined />,
+    },
+    {
+      key: 'review-handoff',
+      stage: 'A4',
+      title: '复盘交接',
+      status: `${summary.terminalCount} 终态 · ${summary.failedCount} 失败`,
+      description: selectedTask
+        ? selectedHasReviewOutput
+          ? '选中任务已有摘要或输出入口，可进入报告、修复候选或对话复盘；仍不能宣称模型判断正确。'
+          : '选中任务缺少摘要或输出入口，必须先补齐复盘证据。'
+        : summary.terminalCount > 0
+          ? '终态任务只开放对话、扫描报告、步骤和产物复盘，不代表业务结论已正确。'
+          : '尚未形成终态任务，不能进行复盘交接或质量宣称。',
+      tone: handoffTone,
+      icon: <MessageOutlined />,
+    },
+  ]
+}
+
+function buildAgentTaskActionGate(task: AgentTask): AgentTaskActionGate {
+  const hasConversation = Boolean(task.conversationId)
+  const hasScan = Boolean(task.scanTaskId)
+  const hasReviewOutput = Boolean(task.outputJson || task.summary)
+  const isPending = task.status === 'PENDING'
+  const isRunning = task.status === 'RUNNING'
+  const isTerminal = TERMINAL_STATUSES.includes(task.status)
+
+  if (isPending) {
+    return {
+      status: 'READY',
+      tone: 'warning',
+      summary: '启动门禁开放，取消门禁关闭',
+      reason: '任务仍处于 PENDING，可由用户显式启动；取消只对 RUNNING 任务开放，避免把未执行任务误标成中断。',
+      checks: [
+        { label: '启动', value: '可执行', tone: 'ready' },
+        { label: '取消', value: '未运行不可取消', tone: 'idle' },
+        { label: '扫描报告', value: hasScan ? `已绑定 #${task.scanTaskId}` : '未绑定', tone: hasScan ? 'ready' : 'warning' },
+        { label: '对话', value: hasConversation ? '可打开' : '未关联', tone: hasConversation ? 'ready' : 'warning' },
+      ],
+    }
+  }
+
+  if (isRunning) {
+    return {
+      status: 'REVIEW',
+      tone: 'warning',
+      summary: '取消门禁开放，启动门禁关闭',
+      reason: '任务正在运行，只允许进入受控取消；再次启动会破坏状态机幂等性，必须保持关闭。',
+      checks: [
+        { label: '启动', value: '运行中不可重复启动', tone: 'idle' },
+        { label: '取消', value: '可在检查点停止', tone: 'ready' },
+        { label: '扫描报告', value: hasScan ? `已绑定 #${task.scanTaskId}` : '未绑定', tone: hasScan ? 'ready' : 'warning' },
+        { label: '对话', value: hasConversation ? '可打开' : '未关联', tone: hasConversation ? 'ready' : 'warning' },
+      ],
+    }
+  }
+
+  if (isTerminal) {
+    return {
+      status: hasReviewOutput ? 'REVIEW' : 'BLOCKED',
+      tone: hasReviewOutput ? 'ready' : 'danger',
+      summary: hasReviewOutput ? '状态变更门禁关闭，复盘入口开放' : '终态缺少复盘输出',
+      reason: hasReviewOutput
+        ? '任务已进入终态，不允许再次启动或取消；后续只能查看对话、扫描报告、步骤和产物证据。'
+        : '任务已进入终态但缺少摘要或输出，不能直接作为复盘证据，需要检查步骤和错误记录。',
+      checks: [
+        { label: '启动/取消', value: '终态关闭', tone: 'idle' },
+        { label: '对话', value: hasConversation ? '可复盘' : '未关联', tone: hasConversation ? 'ready' : 'warning' },
+        { label: '扫描报告', value: hasScan ? `可回跳 #${task.scanTaskId}` : '未绑定', tone: hasScan ? 'ready' : 'warning' },
+        { label: '复盘输出', value: hasReviewOutput ? '有摘要或输出' : '缺失', tone: hasReviewOutput ? 'ready' : 'danger' },
+      ],
+    }
+  }
+
+  return {
+    status: 'BLOCKED',
+    tone: 'danger',
+    summary: '未知状态，动作门禁关闭',
+    reason: `任务状态 ${task.status} 不在已知状态机内，不能执行启动或取消。`,
+    checks: [
+      { label: '启动', value: '关闭', tone: 'danger' },
+      { label: '取消', value: '关闭', tone: 'danger' },
+      { label: '状态', value: task.status, tone: 'danger' },
+      { label: '复核', value: '需要后端状态排查', tone: 'warning' },
+    ],
+  }
 }
 
 function buildAgentTaskHealthSignal(task: AgentTask, steps: AgentTaskStep[]): AgentTaskHealthSignal {

@@ -1,22 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   Alert,
   Badge,
-  Button,
   Card,
-  Empty,
   Form,
   Input,
   message,
   Modal,
   Select,
   Space,
-  Spin,
   Table,
   Tabs,
   Tag,
-  Tooltip,
   Typography,
 } from 'antd'
 import type { BadgeProps } from 'antd'
@@ -43,11 +39,26 @@ import {
 } from '@ant-design/icons'
 import { issueApi, IssueDecomposition, IssueTask } from '../api/issueDecomposition'
 import { showApiError } from '../api/client'
+import ActionButton from '../components/ui/ActionButton'
+import IconActionButton from '../components/ui/IconActionButton'
+import StateBlock from '../components/ui/StateBlock'
+import { createSelectableTableRowProps } from '../components/ui/selectableTableRow'
+import { redactJsonOrText, redactSensitiveText } from '../utils/displayRedaction'
 
 const { Text, Paragraph } = Typography
 const { TextArea } = Input
 
 type SignalTone = 'ready' | 'warning' | 'danger'
+
+type IssueGovernanceStep = {
+  key: string
+  stage: string
+  title: string
+  summary: string
+  evidence: string
+  tone: SignalTone
+  icon: ReactNode
+}
 
 const STATUS_CONFIG: Record<string, { label: string; badge: BadgeProps['status']; icon: ReactNode }> = {
   PENDING: { label: '等待处理', badge: 'default', icon: <ClockCircleOutlined /> },
@@ -104,12 +115,15 @@ function formatDate(value: string | null | undefined) {
 }
 
 function formatJsonPreview(value: string | null | undefined) {
-  if (!value) return '无数据'
-  try {
-    return JSON.stringify(JSON.parse(value), null, 2)
-  } catch {
-    return value
-  }
+  return redactJsonOrText(value, '无数据')
+}
+
+function redactIssuePlanningText(value: string) {
+  return redactSensitiveText(value)
+}
+
+function sanitizeIssueMarkdownExport(value: string | null | undefined) {
+  return redactIssuePlanningText(value || '')
 }
 
 function getPriorityConfig(priority: string | null | undefined) {
@@ -175,6 +189,74 @@ function buildPlanningSignal(
   }
 }
 
+function buildIssueGovernanceSteps(
+  selected: IssueDecomposition | null,
+  taskCount: number,
+  acceptanceCount: number,
+  riskCount: number,
+  dependencyCount: number,
+  impactCount: number,
+  relatedModuleCount: number,
+): IssueGovernanceStep[] {
+  const completed = selected?.status === 'COMPLETED'
+  const failed = selected?.status === 'FAILED'
+  const hasInputContext = !!selected && !!selected.description && (!!selected.businessContext || relatedModuleCount > 0)
+  const hasExecutableBreakdown = completed && taskCount > 0 && impactCount > 0
+  const hasAcceptanceGate = completed && acceptanceCount > 0
+  const hasExecutionHandoff = completed && taskCount > 0 && (!!selected?.suggestedBranch || !!selected?.suggestedCommit)
+
+  return [
+    {
+      key: 'input',
+      stage: 'R1',
+      title: hasInputContext ? '需求输入可复述' : selected ? '需求上下文仍需补充' : '等待选择需求',
+      summary: selected
+        ? hasInputContext
+          ? '标题、描述、业务背景或关联模块已经形成可复述输入，后续拆解可以追溯到明确需求来源。'
+          : '当前记录缺少业务背景或关联模块，拆解前仍需补充目标用户、范围和输入输出。'
+        : '请选择一条 Issue 拆解记录，确认需求描述、业务背景和关联模块是否足以进入拆解。',
+      evidence: selected ? `Issue #${selected.id} · ${getPriorityConfig(selected.priority).label} · 关联模块 ${relatedModuleCount}` : '未选择记录',
+      tone: hasInputContext ? 'ready' : 'warning',
+      icon: <FileTextOutlined />,
+    },
+    {
+      key: 'breakdown',
+      stage: 'R2',
+      title: failed ? '拆解失败阻断' : hasExecutableBreakdown ? '任务拆解可执行' : '拆解产物不足',
+      summary: failed
+        ? '后端未生成可执行拆解，不能把失败结果交给开发或测试。'
+        : hasExecutableBreakdown
+          ? '影响模块、API、数据库或子任务已经沉淀，开发可以按任务粒度推进。'
+          : '拆解尚未完成，或缺少子任务/影响范围，不能直接进入编码。',
+      evidence: `子任务 ${taskCount} · 影响项 ${impactCount}`,
+      tone: failed ? 'danger' : hasExecutableBreakdown ? 'ready' : 'warning',
+      icon: <BranchesOutlined />,
+    },
+    {
+      key: 'acceptance',
+      stage: 'R3',
+      title: hasAcceptanceGate ? '验收门禁已建立' : '验收门禁不足',
+      summary: hasAcceptanceGate
+        ? '验收标准、风险和依赖会作为实现后的检查清单；高风险项仍需优先验证。'
+        : '缺少验收标准时，任务完成无法被稳定证明，不能把拆解当作交付完成。',
+      evidence: `验收 ${acceptanceCount} · 风险 ${riskCount} · 依赖 ${dependencyCount}`,
+      tone: hasAcceptanceGate ? (riskCount > 2 || dependencyCount > 2 ? 'warning' : 'ready') : 'warning',
+      icon: <CheckCircleOutlined />,
+    },
+    {
+      key: 'handoff',
+      stage: 'R4',
+      title: hasExecutionHandoff ? '执行交接可追踪' : '执行交接未闭合',
+      summary: hasExecutionHandoff
+        ? '建议分支、Commit 粒度和子任务可作为开发入口；拆解完成不等于实现完成，仍需测试、CI、PR 审查和审计复盘。'
+        : '还缺少可追踪的分支、Commit 粒度或任务列表，不能把计划直接解释为已开发完成。',
+      evidence: selected ? `分支 ${selected.suggestedBranch || '未设置'} · Commit ${selected.suggestedCommit ? '已建议' : '未建议'}` : '未选择记录',
+      tone: hasExecutionHandoff ? 'ready' : failed ? 'danger' : 'warning',
+      icon: <FlagOutlined />,
+    },
+  ]
+}
+
 export default function IssueDecompositionView({ projectId }: Props) {
   const [items, setItems] = useState<IssueDecomposition[]>([])
   const [loading, setLoading] = useState(true)
@@ -186,6 +268,7 @@ export default function IssueDecompositionView({ projectId }: Props) {
   const [selected, setSelected] = useState<IssueDecomposition | null>(null)
   const [tasks, setTasks] = useState<IssueTask[]>([])
   const [tasksLoading, setTasksLoading] = useState(false)
+  const selectedTaskRequestRef = useRef(0)
   const [form] = Form.useForm()
 
   const fetchItems = useCallback(() => {
@@ -207,15 +290,35 @@ export default function IssueDecompositionView({ projectId }: Props) {
   useEffect(() => { fetchItems() }, [fetchItems])
 
   const fetchTasks = useCallback((id: number) => {
+    const requestId = ++selectedTaskRequestRef.current
     setTasksLoading(true)
     issueApi.listTasks(id)
-      .then(res => setTasks(res.data.data || []))
-      .catch(error => showApiError(error, '加载子任务失败'))
-      .finally(() => setTasksLoading(false))
+      .then(res => {
+        if (selectedTaskRequestRef.current !== requestId) return
+        setTasks(res.data.data || [])
+      })
+      .catch(error => {
+        if (selectedTaskRequestRef.current !== requestId) return
+        showApiError(error, '加载子任务失败')
+      })
+      .finally(() => {
+        if (selectedTaskRequestRef.current !== requestId) return
+        setTasksLoading(false)
+      })
   }, [])
 
   const handleSelect = useCallback((item: IssueDecomposition) => {
+    selectedTaskRequestRef.current += 1
     setSelected(item)
+    setTasks([])
+    setTasksLoading(false)
+  }, [])
+
+  const handleCloseDetail = useCallback(() => {
+    selectedTaskRequestRef.current += 1
+    setSelected(null)
+    setTasks([])
+    setTasksLoading(false)
   }, [])
 
   useEffect(() => {
@@ -223,7 +326,9 @@ export default function IssueDecompositionView({ projectId }: Props) {
     if (selected.status === 'COMPLETED') {
       fetchTasks(selected.id)
     } else {
+      selectedTaskRequestRef.current += 1
       setTasks([])
+      setTasksLoading(false)
     }
   }, [fetchTasks, selected?.id, selected?.status])
 
@@ -248,7 +353,7 @@ export default function IssueDecompositionView({ projectId }: Props) {
   const handleExport = async (id: number) => {
     try {
       const res = await issueApi.exportMarkdown(id)
-      const blob = new Blob([res.data.data], { type: 'text/markdown;charset=utf-8' })
+      const blob = new Blob([sanitizeIssueMarkdownExport(res.data.data)], { type: 'text/markdown;charset=utf-8' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -264,7 +369,7 @@ export default function IssueDecompositionView({ projectId }: Props) {
   const handleCopyMarkdown = async (id: number) => {
     try {
       const res = await issueApi.exportMarkdown(id)
-      await navigator.clipboard.writeText(res.data.data)
+      await navigator.clipboard.writeText(sanitizeIssueMarkdownExport(res.data.data))
       message.success('Markdown 已复制')
     } catch (error) {
       showApiError(error, '复制失败')
@@ -329,6 +434,27 @@ export default function IssueDecompositionView({ projectId }: Props) {
     selectedLists.risks.length,
     selectedLists.dependencies.length,
   ), [selected, selectedLists.acceptance.length, selectedLists.dependencies.length, selectedLists.risks.length, tasks.length])
+  const governanceSteps = useMemo(() => buildIssueGovernanceSteps(
+    selected,
+    tasks.length,
+    selectedLists.acceptance.length,
+    selectedLists.risks.length,
+    selectedLists.dependencies.length,
+    selectedLists.impactModules.length + selectedLists.impactApis.length + selectedLists.impactDb.length,
+    selectedLists.relatedModules.length,
+  ), [
+    selected,
+    selectedLists.acceptance.length,
+    selectedLists.dependencies.length,
+    selectedLists.impactApis.length,
+    selectedLists.impactDb.length,
+    selectedLists.impactModules.length,
+    selectedLists.relatedModules.length,
+    selectedLists.risks.length,
+    tasks.length,
+  ])
+  const selectedDetailId = selected ? `issue-decomposition-detail-${selected.id}` : undefined
+  const selectedTitleId = selected ? `issue-decomposition-detail-title-${selected.id}` : undefined
 
   const issueColumns: ColumnsType<IssueDecomposition> = [
     {
@@ -338,16 +464,15 @@ export default function IssueDecompositionView({ projectId }: Props) {
       minWidth: 260,
       render: (title: string, record) => (
         <div className="sl-issue-title-cell">
-          <Button
+          <ActionButton
             type="link"
             className="sl-issue-table-link"
             onClick={event => {
               event.stopPropagation()
               handleSelect(record)
             }}
-          >
-            {title}
-          </Button>
+            label={title}
+          />
           <span>{record.description || '无需求描述'}</span>
         </div>
       ),
@@ -397,12 +522,26 @@ export default function IssueDecompositionView({ projectId }: Props) {
         <Space size="small" onClick={event => event.stopPropagation()}>
           {record.status === 'COMPLETED' && (
             <>
-              <Tooltip title="复制 Markdown">
-                <Button size="small" icon={<CopyOutlined />} onClick={() => handleCopyMarkdown(record.id)} />
-              </Tooltip>
-              <Tooltip title="导出 Markdown">
-                <Button size="small" icon={<ExportOutlined />} onClick={() => handleExport(record.id)} />
-              </Tooltip>
+              <IconActionButton
+                label={`复制 Issue 拆解 #${record.id} Markdown`}
+                tooltip="复制 Markdown"
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={event => {
+                  event.stopPropagation()
+                  handleCopyMarkdown(record.id)
+                }}
+              />
+              <IconActionButton
+                label={`导出 Issue 拆解 #${record.id} Markdown`}
+                tooltip="导出 Markdown"
+                size="small"
+                icon={<ExportOutlined />}
+                onClick={event => {
+                  event.stopPropagation()
+                  handleExport(record.id)
+                }}
+              />
             </>
           )}
         </Space>
@@ -549,12 +688,8 @@ export default function IssueDecompositionView({ projectId }: Props) {
               onChange={value => { setStatusFilter(value); setPage(1) }}
               options={Object.entries(STATUS_CONFIG).map(([value, cfg]) => ({ label: cfg.label, value }))}
             />
-            <Button icon={<ReloadOutlined />} onClick={fetchItems} loading={loading}>
-              刷新
-            </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowCreate(true)}>
-              新建拆解
-            </Button>
+            <ActionButton icon={<ReloadOutlined />} onClick={fetchItems} loading={loading} label="刷新" />
+            <ActionButton type="primary" icon={<PlusOutlined />} onClick={() => setShowCreate(true)} label="新建拆解" />
           </div>
         </div>
 
@@ -594,15 +729,51 @@ export default function IssueDecompositionView({ projectId }: Props) {
         </div>
       </section>
 
+      <section className="sl-issue-governance-loop" aria-label="Issue 拆解治理闭环">
+        <div className="sl-issue-governance-head">
+          <div>
+            <span>DEVELOPER CONTROL PLANE</span>
+            <h2>Issue 拆解治理闭环</h2>
+          </div>
+          <p>
+            把需求输入、任务拆解、验收门禁和执行交接放到同一条责任链中；拆解结果只能作为开发计划证据，不能证明实现、测试、CI、PR 或 LLM 判断已经正确。
+          </p>
+        </div>
+        <div className="sl-issue-governance-grid">
+          {governanceSteps.map(step => (
+            <article
+              key={step.key}
+              className={`sl-issue-governance-step sl-issue-governance-step-${step.tone}`}
+              data-sl-issue-governance-step={step.key}
+            >
+              <div className="sl-issue-governance-step-head">
+                <div className="sl-issue-governance-icon">{step.icon}</div>
+                <div className="sl-issue-governance-meta">
+                  <span>{step.stage}</span>
+                  <strong>{step.title}</strong>
+                </div>
+              </div>
+              <div className="sl-issue-governance-copy">
+                <h3>{step.title}</h3>
+                <p>{step.summary}</p>
+                <p>{step.evidence}</p>
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
+
       <section className={`sl-issue-workbench ${selected ? 'sl-issue-workbench-with-detail' : ''}`}>
-        <Card className="sl-issue-table-card" title="需求拆解队列">
+        <Card className="sl-issue-table-card sl-selectable-table-card" title="需求拆解队列">
           <Table
+            className="sl-issue-main-table"
             dataSource={items}
             columns={issueColumns}
             rowKey="id"
             loading={loading}
             size="middle"
             scroll={{ x: 850 }}
+            locale={{ emptyText: <StateBlock compact title="暂无需求拆解" description="新建拆解后，影响范围、验收标准和子任务会在这里沉淀。" /> }}
             pagination={{
               current: page,
               total,
@@ -611,24 +782,30 @@ export default function IssueDecompositionView({ projectId }: Props) {
               onChange: setPage,
             }}
             rowClassName={record => record.id === selected?.id ? 'sl-issue-row-selected' : ''}
-            onRow={record => ({
-              onClick: () => handleSelect(record),
-              style: { cursor: 'pointer' },
+            onRow={record => createSelectableTableRowProps({
+              record,
+              selected: selected?.id === record.id,
+              onSelect: handleSelect,
+              controlsId: selectedDetailId,
+              label: `IssueDecomposition #${record.id} ${record.title} ${selected?.id === record.id ? '已选中' : '查看详情'}`,
             })}
           />
         </Card>
 
         {selected && (
           <Card
+            id={selectedDetailId}
+            role="region"
+            aria-labelledby={selectedTitleId}
             className="sl-issue-detail-card"
             title={
-              <Space wrap>
+              <Space wrap id={selectedTitleId}>
                 <Tag color={getPriorityConfig(selected.priority).color}>{getPriorityConfig(selected.priority).label}</Tag>
                 <Badge status={getStatusConfig(selected.status).badge} text={getStatusConfig(selected.status).label} />
                 <Text strong>{selected.title}</Text>
               </Space>
             }
-            extra={<Button size="small" onClick={() => setSelected(null)}>关闭</Button>}
+            extra={<ActionButton size="small" onClick={handleCloseDetail} label="关闭" />}
           >
             <div className="sl-issue-detail-stack">
               <div className={`sl-issue-signal sl-issue-signal-${planningSignal.tone}`}>
@@ -699,24 +876,18 @@ export default function IssueDecompositionView({ projectId }: Props) {
                         {renderChecklist('依赖事项', selectedLists.dependencies, '未识别到外部依赖', 'warning', <BranchesOutlined />)}
                       </div>
                     ) : selected.status === 'PROCESSING' ? (
-                      <div className="sl-issue-running">
-                        <Spin size="large" />
-                        <Text type="secondary">正在生成拆解方案</Text>
-                      </div>
+                      <StateBlock tone="loading" title="正在生成拆解方案" description="系统正在提取影响范围、验收标准、风险和子任务。" />
                     ) : selected.status === 'FAILED' ? (
-                      <Empty description={<Text type="danger">{selected.errorMessage || '拆解失败'}</Text>} />
+                      <StateBlock tone="error" title="拆解失败" description={selected.errorMessage || '后端未返回可用拆解结果。'} />
                     ) : (
-                      <Empty description="等待处理" />
+                      <StateBlock compact title="等待处理" description="拆解任务进入处理队列后会生成完整计划。" />
                     ),
                   },
                   {
                     key: 'tasks',
                     label: `子任务 (${tasks.length})`,
                     children: tasksLoading ? (
-                      <div className="sl-issue-running">
-                        <Spin />
-                        <Text type="secondary">正在加载子任务</Text>
-                      </div>
+                      <StateBlock compact tone="loading" title="正在加载子任务" description="子任务加载完成后会按开发、测试和风险维度展示。" />
                     ) : tasks.length ? (
                       <div className="sl-issue-detail-stack">
                         <div className="sl-issue-task-summary-grid">
@@ -728,6 +899,7 @@ export default function IssueDecompositionView({ projectId }: Props) {
                           <div><span>预估工时</span><strong>{taskStats.estimatedHours.toFixed(1)}h</strong></div>
                         </div>
                         <Table
+                          className="sl-issue-task-table"
                           dataSource={tasks}
                           columns={taskColumns}
                           rowKey="id"
@@ -737,7 +909,11 @@ export default function IssueDecompositionView({ projectId }: Props) {
                         />
                       </div>
                     ) : (
-                      <Empty description={selected.status === 'COMPLETED' ? '暂无子任务' : '拆解完成后生成子任务'} />
+                      <StateBlock
+                        compact
+                        title={selected.status === 'COMPLETED' ? '暂无子任务' : '等待拆解完成'}
+                        description={selected.status === 'COMPLETED' ? '当前拆解结果没有返回可执行子任务。' : '拆解完成后会生成子任务。'}
+                      />
                     ),
                   },
                   {
@@ -746,17 +922,19 @@ export default function IssueDecompositionView({ projectId }: Props) {
                     children: selected.status === 'COMPLETED' ? (
                       <div className="sl-issue-detail-stack">
                         <Space wrap>
-                          <Button size="small" icon={<CopyOutlined />} onClick={() => handleCopyMarkdown(selected.id)}>
-                            复制 Markdown
-                          </Button>
-                          <Button size="small" icon={<ExportOutlined />} onClick={() => handleExport(selected.id)}>
-                            导出 .md
-                          </Button>
+                          <ActionButton size="small" icon={<CopyOutlined />} onClick={() => handleCopyMarkdown(selected.id)} label="复制 Markdown" />
+                          <ActionButton size="small" icon={<ExportOutlined />} onClick={() => handleExport(selected.id)} label="导出 .md" />
                         </Space>
-                        <pre className="sl-issue-source-preview">{formatJsonPreview(selected.outputJson)}</pre>
+                        <Alert
+                          type="info"
+                          showIcon
+                          message="原始结果安全边界"
+                          description="此处预览、复制和导出的 Markdown 会在前端显示层脱敏敏感值；后端原始记录和接口权限仍按服务端安全边界治理。"
+                        />
+                        <pre className="sl-issue-source-preview sl-issue-source-preview-redacted" aria-label="脱敏 Issue 拆解原始结果">{formatJsonPreview(selected.outputJson)}</pre>
                       </div>
                     ) : (
-                      <Empty description="拆解完成后可查看原始结果" />
+                      <StateBlock compact title="等待拆解完成" description="拆解完成后可查看原始结果。" />
                     ),
                   },
                 ]}

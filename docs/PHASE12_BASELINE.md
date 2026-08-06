@@ -1,6 +1,8 @@
 # SourceLens Phase 12 Baseline
 
-状态：阶段 12 进入前的基准采集说明。
+> AIOS v2.3 状态：`LEGACY PERFORMANCE INPUT`。本文的 Phase 12 不是新路线的 P12；其中“不提前引入复杂组件”的原则可复用，当前架构选型仍需实验和 ADR。
+
+状态：迁移前性能输入；不对应AIOS当前P0或未来P12的进入条件。
 
 阶段 12 的目标不是默认引入 Neo4j、pgvector、Temporal 或 analyzer daemon，而是在现有 MySQL、artifact store 和简单异步任务模型出现被证据证明的瓶颈后，再引入专门组件。
 

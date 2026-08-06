@@ -5,6 +5,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
+
+import java.io.IOException;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -47,5 +52,16 @@ class GlobalExceptionHandlerTest {
         mockMvc.perform(get("/dummy/error"))
                 .andExpect(status().isInternalServerError())
                 .andExpect(jsonPath("$.code").value("INTERNAL_ERROR"));
+    }
+
+    @Test
+    void clientAbort_returns499WithoutInternalErrorBody() {
+        var handler = new GlobalExceptionHandler();
+        var response = handler.handleClientAbort(new AsyncRequestNotUsableException(
+                "ServletOutputStream failed to write",
+                new IOException("Broken pipe")));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(499);
+        assertThat(response.getBody()).isNull();
     }
 }

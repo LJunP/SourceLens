@@ -7,6 +7,7 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 
 import java.util.stream.Collectors;
 
@@ -29,6 +30,12 @@ public class GlobalExceptionHandler {
         log.warn("参数校验失败: {}", msg);
         return ResponseEntity.status(400)
                 .body(Result.fail("VALIDATION_ERROR", msg));
+    }
+
+    @ExceptionHandler(AsyncRequestNotUsableException.class)
+    public ResponseEntity<Void> handleClientAbort(AsyncRequestNotUsableException e) {
+        log.warn("客户端连接已中断: {}", e.getMessage());
+        return ResponseEntity.status(499).build();
     }
 
     @ExceptionHandler(Exception.class)

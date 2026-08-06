@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @Component
 @ConditionalOnProperty(name = "sourcelens.sandbox.executor", havingValue = "docker")
@@ -84,8 +85,7 @@ public class DockerSandboxExecutor implements SandboxExecutor {
         dockerCommand.add("ALL");
         dockerCommand.add("--security-opt");
         dockerCommand.add("no-new-privileges");
-        dockerCommand.add("--entrypoint");
-        dockerCommand.add("");
+        dockerCommand.add("--entrypoint=");
         if (readOnlyRoot) {
             dockerCommand.add("--read-only");
         }
@@ -93,6 +93,13 @@ public class DockerSandboxExecutor implements SandboxExecutor {
             dockerCommand.add("--tmpfs");
             dockerCommand.add(tmpfs);
         }
+        Map<String, String> containerEnvironment = SandboxCommandValidator.validateAndNormalizeEnvironment(command.getEnvironment());
+        containerEnvironment.forEach((key, value) -> addContainerEnvironment(dockerCommand, key, value));
+        addContainerEnvironment(dockerCommand, "HOME", "/workspace/.sourcelens-home");
+        addContainerEnvironment(dockerCommand, "XDG_CACHE_HOME", "/workspace/.sourcelens-cache/xdg");
+        addContainerEnvironment(dockerCommand, "MAVEN_CONFIG", "/workspace/.sourcelens-cache/maven");
+        addContainerEnvironment(dockerCommand, "npm_config_cache", "/workspace/.sourcelens-cache/npm");
+        addContainerEnvironment(dockerCommand, "GRADLE_USER_HOME", "/workspace/.sourcelens-cache/gradle");
         dockerCommand.add("-v");
         dockerCommand.add(workingDirectory + ":/workspace:rw");
         dockerCommand.add("-w");
@@ -105,9 +112,14 @@ public class DockerSandboxExecutor implements SandboxExecutor {
                 .command(dockerCommand)
                 .workingDirectory(workingDirectory)
                 .timeout(command.getTimeout() == null ? Duration.ofSeconds(60) : command.getTimeout())
-                .environment(command.getEnvironment())
+                .environment(Map.of())
                 .build());
         metrics.recordSandboxCommand("docker", result.getExitCode(), result.isTimedOut(), System.currentTimeMillis() - start);
         return result;
+    }
+
+    private void addContainerEnvironment(List<String> dockerCommand, String key, String value) {
+        dockerCommand.add("-e");
+        dockerCommand.add(key + "=" + value);
     }
 }

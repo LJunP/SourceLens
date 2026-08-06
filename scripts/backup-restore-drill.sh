@@ -213,6 +213,33 @@ sha256_file() {
   return 1
 }
 
+sha256_text() {
+  local value="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$value" | sha256sum | awk '{print tolower($1)}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$value" | openssl dgst -sha256 | awk '{print tolower($2)}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$value" | LC_ALL=C LANG=C shasum -a 256 | awk '{print tolower($1)}'
+    return
+  fi
+  return 1
+}
+
+scratch_database_name_for_backup_id() {
+  local backup_id="$1"
+  local random_suffix="$2"
+  local backup_hash
+  backup_hash="$(sha256_text "$backup_id" | cut -c1-16)" \
+    || fail "a SHA-256 command is required to derive a bounded scratch database name"
+  [[ "$backup_hash" =~ ^[a-f0-9]{16}$ ]] || fail "backup id hash could not be derived for scratch database name"
+  printf 'sourcelens_drill_%s_%s\n' "$backup_hash" "$random_suffix"
+}
+
 checksum_manifest_covers_artifact() {
   local manifest_path="$1"
   local artifact_path="$2"
@@ -350,8 +377,9 @@ restore_database_into_scratch() {
   docker exec "$MYSQL_CONTAINER" sh -lc 'test -n "$MYSQL_ROOT_PASSWORD"' >/dev/null 2>&1 \
     || fail "MySQL container must expose MYSQL_ROOT_PASSWORD for scratch restore"
   random_suffix="$(date +%s)_$RANDOM"
-  SCRATCH_DB="sourcelens_drill_${backup_id//[^A-Za-z0-9_]/_}_${random_suffix}"
+  SCRATCH_DB="$(scratch_database_name_for_backup_id "$backup_id" "$random_suffix")"
   [[ "$SCRATCH_DB" =~ ^[A-Za-z0-9_]+$ ]] || fail "generated scratch database name is unsafe"
+  (( ${#SCRATCH_DB} <= 64 )) || fail "generated scratch database name exceeds MySQL 64 character identifier limit"
   docker_mysql_query "DROP DATABASE IF EXISTS \`$SCRATCH_DB\`; CREATE DATABASE \`$SCRATCH_DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
   SCRATCH_DB_CREATED=true
   docker exec -i "$MYSQL_CONTAINER" sh -lc 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot "$1"' sh "$SCRATCH_DB" < "$sql_path" \

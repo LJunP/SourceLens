@@ -30,6 +30,8 @@ import java.util.concurrent.atomic.AtomicReference;
 @Primary
 public class LlmClient {
 
+    public static final String DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small";
+
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
             .build();
@@ -120,7 +122,7 @@ public class LlmClient {
         String url = baseUrl + "/embeddings";
 
         Map<String, Object> body = new LinkedHashMap<>();
-        String model = "text-embedding-3-small";
+        String model = DEFAULT_EMBEDDING_MODEL;
         body.put("model", model);
         body.put("input", text);
 
@@ -193,7 +195,7 @@ public class LlmClient {
         String url = baseUrl + "/embeddings";
 
         Map<String, Object> body = new LinkedHashMap<>();
-        String model = "text-embedding-3-small";
+        String model = DEFAULT_EMBEDDING_MODEL;
         body.put("model", model);
         body.put("input", texts);
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Alert, Button, Card, Empty, Input, Popconfirm, Progress, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd'
+import { Alert, Card, Input, Popconfirm, Progress, Select, Space, Table, Tag, Typography, message } from 'antd'
 import {
   BranchesOutlined,
   CheckCircleOutlined,
@@ -16,7 +16,11 @@ import {
   WarningOutlined,
 } from '@ant-design/icons'
 import { executionTaskApi, ExecutionAttempt, ExecutionLog, ExecutionTask, ExecutionTaskDetail, ExecutionStep } from '../api/executionTask'
-import { showApiError } from '../api/client'
+import { formatApiError, showApiError } from '../api/client'
+import ActionButton from '../components/ui/ActionButton'
+import IconActionButton from '../components/ui/IconActionButton'
+import StateBlock from '../components/ui/StateBlock'
+import { createSelectableTableRowProps } from '../components/ui/selectableTableRow'
 import ArtifactLinkButton from '../components/ArtifactLinkButton'
 import LogViewer from '../components/LogViewer'
 import TaskTimeline from '../components/TaskTimeline'
@@ -87,6 +91,28 @@ interface PipelineSignal {
   }>
 }
 
+interface ExecutionLifecycleStage {
+  key: string
+  stage: string
+  title: string
+  status: string
+  description: string
+  tone: ExecutionTone
+  icon: React.ReactNode
+}
+
+interface ExecutionActionGate {
+  status: 'READY' | 'REVIEW' | 'BLOCKED'
+  tone: ExecutionTone
+  summary: string
+  reason: string
+  checks: Array<{
+    label: string
+    value: string
+    tone: ExecutionTone
+  }>
+}
+
 export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
   const navigate = useNavigate()
   const [tasks, setTasks] = useState<ExecutionTask[]>([])
@@ -94,6 +120,8 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
   const [detail, setDetail] = useState<ExecutionTaskDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [listError, setListError] = useState<string | null>(null)
+  const [detailError, setDetailError] = useState<string | null>(null)
   const [cancellingId, setCancellingId] = useState<number | null>(null)
   const [keyword, setKeyword] = useState('')
   const [statusFilter, setStatusFilter] = useState('ALL')
@@ -103,6 +131,7 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
   const [total, setTotal] = useState(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const initialTaskLoadedRef = useRef<string | null>(null)
+  const detailRequestSeqRef = useRef(0)
 
   const hasActiveTask = useMemo(
     () => tasks.some(task => isActive(task.status)),
@@ -111,11 +140,13 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
 
   const loadTasks = useCallback((nextPage = page, nextPageSize = pageSize, silent = false) => {
     if (!silent) setLoading(true)
+    if (!silent) setListError(null)
     executionTaskApi.list(projectId, nextPage, nextPageSize)
       .then(res => {
         const data = res.data.data
         const list = data?.items || []
         setTasks(list)
+        setListError(null)
         setPage(data?.page || nextPage)
         setPageSize(data?.pageSize || nextPageSize)
         setTotal(data?.total || 0)
@@ -124,44 +155,75 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
           if (updated) setSelected(updated)
         }
       })
-      .catch(error => showApiError(error, '加载执行任务失败'))
+      .catch(error => {
+        setListError(formatApiError(error, '加载执行任务失败'))
+        showApiError(error, '加载执行任务失败')
+      })
       .finally(() => {
         if (!silent) setLoading(false)
       })
   }, [page, pageSize, projectId, selected])
 
   const loadDetail = useCallback((task: ExecutionTask) => {
+    const requestSeq = detailRequestSeqRef.current + 1
+    detailRequestSeqRef.current = requestSeq
     setSelected(task)
+    setDetail(null)
+    setDetailError(null)
     setDetailLoading(true)
     executionTaskApi.detail(projectId, task.id)
-      .then(res => setDetail(res.data.data))
+      .then(res => {
+        if (detailRequestSeqRef.current !== requestSeq) return
+        setDetail(res.data.data)
+        setDetailError(null)
+      })
       .catch(error => {
+        if (detailRequestSeqRef.current !== requestSeq) return
         setDetail(null)
+        setDetailError(formatApiError(error, '加载任务详情失败'))
         showApiError(error, '加载任务详情失败')
       })
-      .finally(() => setDetailLoading(false))
+      .finally(() => {
+        if (detailRequestSeqRef.current === requestSeq) {
+          setDetailLoading(false)
+        }
+      })
   }, [projectId])
 
   const refreshSelectedDetail = useCallback((taskId: number) => {
+    const requestSeq = detailRequestSeqRef.current + 1
+    detailRequestSeqRef.current = requestSeq
     executionTaskApi.detail(projectId, taskId)
       .then(res => {
-        setDetail(res.data.data)
-        setSelected(res.data.data.task)
+        if (detailRequestSeqRef.current !== requestSeq) return
+        const nextDetail = res.data.data
+        if (nextDetail?.task?.id !== taskId) return
+        setDetail(nextDetail)
+        setSelected(nextDetail.task)
       })
       .catch(() => undefined)
   }, [projectId])
 
   const handleCancel = async (task: ExecutionTask) => {
+    const requestSeq = detailRequestSeqRef.current + 1
+    detailRequestSeqRef.current = requestSeq
     setCancellingId(task.id)
     try {
       const res = await executionTaskApi.cancel(projectId, task.id)
-      setDetail(res.data.data)
-      setSelected(res.data.data.task)
+      const nextDetail = res.data.data
+      if (detailRequestSeqRef.current === requestSeq && nextDetail?.task?.id === task.id) {
+        setDetail(nextDetail)
+        setSelected(nextDetail.task)
+        setDetailError(null)
+      }
       message.success('执行任务已取消')
       loadTasks(page, pageSize, true)
     } catch (error) {
       showApiError(error, '取消执行任务失败')
     } finally {
+      if (detailRequestSeqRef.current === requestSeq) {
+        setDetailLoading(false)
+      }
       setCancellingId(null)
     }
   }
@@ -201,14 +263,29 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
     const loadKey = `${projectId}:${initialTaskId}`
     if (initialTaskLoadedRef.current === loadKey) return
     initialTaskLoadedRef.current = loadKey
+    const requestSeq = detailRequestSeqRef.current + 1
+    detailRequestSeqRef.current = requestSeq
+    setDetailError(null)
+    setDetail(null)
     setDetailLoading(true)
     executionTaskApi.detail(projectId, initialTaskId)
       .then(res => {
+        if (detailRequestSeqRef.current !== requestSeq) return
+        if (res.data.data.task.id !== initialTaskId) return
         setDetail(res.data.data)
         setSelected(res.data.data.task)
+        setDetailError(null)
       })
-      .catch(error => showApiError(error, '加载指定执行任务失败'))
-      .finally(() => setDetailLoading(false))
+      .catch(error => {
+        if (detailRequestSeqRef.current !== requestSeq) return
+        setDetailError(formatApiError(error, '加载指定执行任务失败'))
+        showApiError(error, '加载指定执行任务失败')
+      })
+      .finally(() => {
+        if (detailRequestSeqRef.current === requestSeq) {
+          setDetailLoading(false)
+        }
+      })
   }, [initialTaskId, projectId])
 
   useEffect(() => {
@@ -221,10 +298,10 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
   }, [hasActiveTask, loadTasks, page, pageSize])
 
   useEffect(() => {
-    if (selected && hasActiveTask) {
+    if (selected && hasActiveTask && !detailLoading) {
       refreshSelectedDetail(selected.id)
     }
-  }, [refreshSelectedDetail, selected?.id, hasActiveTask, tasks])
+  }, [refreshSelectedDetail, selected?.id, hasActiveTask, detailLoading, tasks])
 
   const filteredTasks = useMemo(() => tasks.filter(task => {
     const q = keyword.trim().toLowerCase()
@@ -261,6 +338,8 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
     })),
   ], [tasks])
 
+  const selectedDetail = selected && detail?.task?.id === selected.id ? detail : null
+
   const summary = useMemo(() => {
     const activeCount = tasks.filter(task => isActive(task.status)).length
     const failedCount = tasks.filter(task => task.status === 'FAILED').length
@@ -296,6 +375,12 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
   }, [tasks])
 
   const pipelineSignal = useMemo(() => buildPipelineSignal(tasks.length, summary), [summary, tasks.length])
+  const executionLifecycleStages = useMemo(() => buildExecutionLifecycleStages(
+    tasks.length,
+    summary,
+    selected,
+    selectedDetail,
+  ), [selected, selectedDetail, summary, tasks.length])
 
   const columns = [
     {
@@ -305,17 +390,17 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
       width: 210,
       render: (type: string, record: ExecutionTask) => (
         <Space direction="vertical" size={4}>
-          <Button
+          <ActionButton
             aria-label={`查看任务 #${record.id} 详情`}
             type="link"
             className="sl-inline-link"
-            onClick={() => loadDetail(record)}
-          >
-            <Space size="small">
-              <ScheduleOutlined />
-              <span>{TASK_TYPE_LABEL[type] || type}</span>
-            </Space>
-          </Button>
+            onClick={(event) => {
+              event.stopPropagation()
+              loadDetail(record)
+            }}
+            icon={<ScheduleOutlined />}
+            label={TASK_TYPE_LABEL[type] || type}
+          />
           <Text type="secondary" className="sl-table-subtext">
             #{record.id} · {record.currentStep || '等待调度'}
           </Text>
@@ -364,20 +449,24 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
       width: 125,
       render: (_: unknown, record: ExecutionTask) => (
         <Space size="small" onClick={(event) => event.stopPropagation()}>
-          <Tooltip title="打开来源">
-            <Button
-              aria-label={`打开任务 #${record.id} 来源`}
-              size="small"
-              icon={<LinkOutlined />}
-              disabled={!canOpenSource(record)}
-              onClick={() => openSource(record)}
-            />
-          </Tooltip>
-          <ArtifactLinkButton
-            projectId={projectId}
-            ownerType={artifactOwnerType(record)}
-            ownerId={record.sourceId}
+          <IconActionButton
+            label={`打开任务 #${record.id} 来源`}
+            tooltip="打开来源"
+            size="small"
+            icon={<LinkOutlined />}
+            disabled={!canOpenSource(record)}
+            onClick={(event) => {
+              event.stopPropagation()
+              openSource(record)
+            }}
           />
+          <span onClick={(event) => event.stopPropagation()}>
+            <ArtifactLinkButton
+              projectId={projectId}
+              ownerType={artifactOwnerType(record)}
+              ownerId={record.sourceId}
+            />
+          </span>
           {isActive(record.status) && (
             <Popconfirm
               title="取消执行任务"
@@ -386,17 +475,27 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
               cancelText="返回"
               onConfirm={() => handleCancel(record)}
             >
-              <Tooltip title="取消任务">
-                <Button
-                  aria-label={`取消任务 #${record.id}`}
-                  size="small"
-                  danger
-                  icon={<StopOutlined />}
-                  loading={cancellingId === record.id}
-                />
-              </Tooltip>
+              <IconActionButton
+                label={`取消任务 #${record.id}`}
+                tooltip="取消任务"
+                size="small"
+                danger
+                icon={<StopOutlined />}
+                loading={cancellingId === record.id}
+                onClick={(event) => event.stopPropagation()}
+              />
             </Popconfirm>
           )}
+          <ActionButton
+            size="small"
+            className="sl-execution-detail-action"
+            onClick={(event) => {
+              event.stopPropagation()
+              loadDetail(record)
+            }}
+            aria-label={`查看执行任务 #${record.id} 详情`}
+            label="详情"
+          />
         </Space>
       )
     }
@@ -404,15 +503,18 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
 
   const attemptsById = useMemo(() => {
     const map = new Map<number, ExecutionAttempt>()
-    ;(detail?.attempts || []).forEach(attempt => map.set(attempt.id, attempt))
+    ;(selectedDetail?.attempts || []).forEach(attempt => map.set(attempt.id, attempt))
     return map
-  }, [detail?.attempts])
+  }, [selectedDetail?.attempts])
 
   const executionLogText = useMemo(
-    () => formatExecutionLogs(detail?.logs || [], attemptsById),
-    [attemptsById, detail?.logs]
+    () => formatExecutionLogs(selectedDetail?.logs || [], attemptsById),
+    [attemptsById, selectedDetail?.logs]
   )
-  const selectedHealth = selected ? buildExecutionHealthSignal(selected, detail) : null
+  const selectedHealth = selected ? buildExecutionHealthSignal(selected, selectedDetail) : null
+  const selectedActionGate = selected ? buildExecutionActionGate(selected, selectedDetail) : null
+  const selectedDetailId = selected ? `execution-task-detail-${selected.id}` : undefined
+  const selectedTitleId = selected ? `execution-task-detail-title-${selected.id}` : undefined
 
   return (
     <div>
@@ -438,9 +540,7 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
             />
             <Select value={statusFilter} options={statusOptions} onChange={setStatusFilter} />
             <Select value={typeFilter} options={typeOptions} onChange={setTypeFilter} />
-            <Button aria-label="刷新执行任务" icon={<ReloadOutlined />} onClick={() => loadTasks()}>
-              刷新
-            </Button>
+            <ActionButton aria-label="刷新执行任务" icon={<ReloadOutlined />} onClick={() => loadTasks()} label="刷新" />
           </div>
         </div>
 
@@ -470,6 +570,8 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
 
       <ExecutionPipelineSignal signal={pipelineSignal} />
 
+      <ExecutionLifecycleLoop stages={executionLifecycleStages} />
+
       {summary.typeStats.length > 0 && (
         <div className="sl-execution-type-strip">
           {summary.typeStats.slice(0, 8).map(stat => (
@@ -488,14 +590,36 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
         </div>
       )}
 
+      {listError && tasks.length > 0 && (
+        <StateBlock
+          compact
+          tone="error"
+          title="执行任务刷新失败"
+          description={listError}
+          action={<ActionButton size="small" icon={<ReloadOutlined />} loading={loading} onClick={() => loadTasks()} label="重新加载任务" />}
+        />
+      )}
+
       <div className={`sl-execution-layout ${selected ? 'sl-execution-layout-with-detail' : ''}`}>
-        <Card className="sl-section-card sl-execution-table-card">
+        <Card className="sl-section-card sl-execution-table-card sl-selectable-table-card">
           <Table
             dataSource={filteredTasks}
             columns={columns}
             rowKey="id"
             loading={loading}
-            locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无执行任务" /> }}
+            locale={{
+              emptyText: listError ? (
+                <StateBlock
+                  compact
+                  tone="error"
+                  title="执行任务加载失败"
+                  description={listError}
+                  action={<ActionButton size="small" icon={<ReloadOutlined />} loading={loading} onClick={() => loadTasks()} label="重新加载任务" />}
+                />
+              ) : (
+                <StateBlock compact title="暂无执行任务" description="触发扫描、Agent、自动修复或审查流程后会在这里形成任务记录。" />
+              ),
+            }}
             pagination={{
               current: page,
               pageSize,
@@ -505,8 +629,12 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
             }}
             scroll={{ x: 850 }}
             onChange={(next) => loadTasks(next.current || 1, next.pageSize || 20)}
-            onRow={(record) => ({
-              onClick: () => loadDetail(record),
+            onRow={(record) => createSelectableTableRowProps({
+              record,
+              selected: selected?.id === record.id,
+              onSelect: loadDetail,
+              controlsId: selectedDetailId,
+              label: `ExecutionTask #${record.id} ${selected?.id === record.id ? '已选中' : '查看详情'}`,
               className: selected?.id === record.id ? 'sl-execution-row-active' : '',
             })}
           />
@@ -514,21 +642,27 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
 
         {selected && (
           <Card
+            id={selectedDetailId}
+            role="region"
+            aria-labelledby={selectedTitleId}
             className="sl-section-card sl-execution-detail-card"
             title={(
-              <Space size="small">
+              <Space size="small" id={selectedTitleId}>
                 <ScheduleOutlined />
                 <span>任务 #{selected.id}</span>
               </Space>
             )}
             extra={(
-              <Button
-                aria-label="关闭任务详情"
+              <IconActionButton
+                label="关闭任务详情"
+                tooltip="关闭"
                 type="text"
                 icon={<CloseOutlined />}
                 onClick={() => {
+                  detailRequestSeqRef.current += 1
                   setSelected(null)
                   setDetail(null)
+                  setDetailLoading(false)
                 }}
               />
             )}
@@ -543,18 +677,27 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
               </div>
 
               <Progress percent={selected.progress || 0} status={progressStatus(selected.status)} />
+              {detailError && (
+                <StateBlock
+                  compact
+                  tone="error"
+                  title="任务详情加载失败"
+                  description={detailError}
+                  action={<ActionButton size="small" icon={<ReloadOutlined />} loading={detailLoading} onClick={() => loadDetail(selected)} label="重新加载任务" />}
+                />
+              )}
               {selectedHealth && <ExecutionHealthCard signal={selectedHealth} />}
-              <ExecutionEvidenceGrid task={selected} detail={detail} />
+              {selectedActionGate && <ExecutionActionGatePanel gate={selectedActionGate} />}
+              <ExecutionEvidenceGrid task={selected} detail={selectedDetail} />
 
               <Space wrap>
-                <Button
+                <ActionButton
                   aria-label={`打开任务 #${selected.id} 来源`}
                   icon={<LinkOutlined />}
                   disabled={!canOpenSource(selected)}
                   onClick={() => openSource(selected)}
-                >
-                  打开来源
-                </Button>
+                  label="打开来源"
+                />
                 <ArtifactLinkButton
                   projectId={projectId}
                   ownerType={artifactOwnerType(selected)}
@@ -570,14 +713,13 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
                     cancelText="返回"
                     onConfirm={() => handleCancel(selected)}
                   >
-                    <Button
+                    <ActionButton
                       aria-label={`取消任务 #${selected.id}`}
                       danger
                       icon={<StopOutlined />}
                       loading={cancellingId === selected.id}
-                    >
-                      取消任务
-                    </Button>
+                      label="取消任务"
+                    />
                   </Popconfirm>
                 )}
               </Space>
@@ -605,10 +747,10 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
                 </div>
               </div>
 
-              {!!detail?.attempts?.length && (
+              {!!selectedDetail?.attempts?.length && (
                 <Space size={[6, 6]} wrap>
                   <Text type="secondary">执行次数：</Text>
-                  {detail.attempts.map(attempt => (
+                  {selectedDetail.attempts.map(attempt => (
                     <Tag key={attempt.id} color={STATUS_COLOR[attempt.status] || 'default'}>
                       第 {attempt.attemptNo} 次 · {STATUS_LABEL[attempt.status] || attempt.status}
                     </Tag>
@@ -618,7 +760,7 @@ export default function ExecutionTasks({ projectId, initialTaskId }: Props) {
 
               <TaskTimeline
                 loading={detailLoading}
-                items={(detail?.steps || []).map(step => ({
+                items={(selectedDetail?.steps || []).map(step => ({
                   key: step.id,
                   title: stepTitle(step, attemptsById),
                   status: step.status,
@@ -693,6 +835,40 @@ function ExecutionPipelineSignal({ signal }: { signal: PipelineSignal }) {
   )
 }
 
+function ExecutionLifecycleLoop({ stages }: { stages: ExecutionLifecycleStage[] }) {
+  return (
+    <section className="sl-execution-lifecycle-loop" aria-label="执行生命周期治理闭环">
+      <div className="sl-execution-lifecycle-head">
+        <SafetyCertificateOutlined />
+        <div>
+          <span>DEVELOPER CONTROL PLANE</span>
+          <h2>执行生命周期治理闭环</h2>
+          <p>执行任务闭环只能证明任务状态、来源、步骤、日志和产物入口可追踪，不能证明真实执行质量、产物正确、CI/PR/AutoRepair 或 LLM 结果已经正确。</p>
+        </div>
+      </div>
+      <div className="sl-execution-lifecycle-grid">
+        {stages.map(stage => (
+          <article
+            key={stage.key}
+            className={`sl-execution-lifecycle-stage sl-execution-lifecycle-stage-${stage.tone}`}
+            data-sl-execution-lifecycle-stage={stage.key}
+          >
+            <div className="sl-execution-lifecycle-stage-head">
+              <div className="sl-execution-lifecycle-icon">{stage.icon}</div>
+              <div>
+                <span>{stage.stage}</span>
+                <strong>{stage.title}</strong>
+              </div>
+            </div>
+            <div className="sl-execution-lifecycle-status">{stage.status}</div>
+            <p>{stage.description}</p>
+          </article>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function ExecutionHealthCard({ signal }: { signal: ExecutionHealthSignal }) {
   return (
     <div className={`sl-execution-health sl-execution-health-${signal.tone}`}>
@@ -716,6 +892,33 @@ function ExecutionHealthCard({ signal }: { signal: ExecutionHealthSignal }) {
         <span>{signal.nextAction}</span>
       </div>
     </div>
+  )
+}
+
+function ExecutionActionGatePanel({ gate }: { gate: ExecutionActionGate }) {
+  return (
+    <section
+      className={`sl-execution-action-gate sl-execution-action-gate-${gate.tone}`}
+      aria-label="执行任务动作门禁说明"
+    >
+      <div className="sl-execution-action-gate-head">
+        <SafetyCertificateOutlined />
+        <div>
+          <span>Execution Action Gate</span>
+          <strong>{gate.summary}</strong>
+        </div>
+        <Tag color={executionToneColor(gate.tone)}>{gate.status}</Tag>
+      </div>
+      <p>{gate.reason}</p>
+      <div className="sl-execution-action-gate-grid">
+        {gate.checks.map(check => (
+          <div className={`sl-execution-action-gate-check sl-execution-action-gate-check-${check.tone}`} key={check.label}>
+            <span>{check.label}</span>
+            <strong>{check.value}</strong>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -753,6 +956,163 @@ function ExecutionEvidenceGrid({ task, detail }: { task: ExecutionTask; detail: 
       </div>
     </div>
   )
+}
+
+function buildExecutionLifecycleStages(
+  taskCount: number,
+  summary: {
+    activeCount: number
+    failedCount: number
+    terminalCount: number
+    sourceCoverage: number
+    sourceLinkedCount: number
+    stalledCount: number
+  },
+  selected: ExecutionTask | null,
+  selectedDetail: ExecutionTaskDetail | null,
+): ExecutionLifecycleStage[] {
+  const selectedEvidenceCount = (selectedDetail?.attempts?.length || 0) + (selectedDetail?.steps?.length || 0) + (selectedDetail?.logs?.length || 0)
+  const sourceTone: ExecutionTone = !taskCount ? 'idle' : summary.sourceCoverage >= 80 ? 'ready' : 'warning'
+  const dispatchTone: ExecutionTone = summary.stalledCount > 0 ? 'danger' : summary.activeCount > 0 ? 'warning' : taskCount ? 'ready' : 'idle'
+  const evidenceTone: ExecutionTone = !selected ? 'idle' : selectedEvidenceCount > 0 ? 'ready' : 'warning'
+  const reviewTone: ExecutionTone = summary.failedCount > 0 ? 'danger' : summary.terminalCount > 0 ? 'ready' : taskCount ? 'warning' : 'idle'
+
+  return [
+    {
+      key: 'source-intake',
+      stage: 'R1',
+      title: '来源接入',
+      status: taskCount ? `${summary.sourceLinkedCount}/${taskCount} 可回跳` : '等待任务',
+      description: taskCount
+        ? '扫描、Agent、AutoRepair、CI、PR 和 Issue 拆解来源必须可回跳，不能只留下孤立执行记录。'
+        : '先触发扫描、Agent 或修复流程，执行中心才会形成可治理任务。',
+      tone: sourceTone,
+      icon: <BranchesOutlined />,
+    },
+    {
+      key: 'dispatch-control',
+      stage: 'R2',
+      title: '调度控制',
+      status: `${summary.activeCount} 活跃 · ${summary.stalledCount} 疑似卡住`,
+      description: summary.stalledCount > 0
+        ? '存在长时间未更新任务，必须优先打开详情核对步骤、日志和取消门禁。'
+        : summary.activeCount > 0
+          ? '运行中任务保持自动刷新，取消只能在受控检查点执行。'
+          : '当前没有活跃调度，后续只能复盘终态任务或回来源重新发起。',
+      tone: dispatchTone,
+      icon: <SyncOutlined spin={summary.activeCount > 0} />,
+    },
+    {
+      key: 'evidence-capture',
+      stage: 'R3',
+      title: '证据采集',
+      status: selected ? `${selectedEvidenceCount} 条选中任务证据` : '未选择任务',
+      description: selected
+        ? selectedEvidenceCount > 0
+          ? '选中任务已有 attempt、步骤或日志证据，可进入脱敏日志和时间线复盘。'
+          : '选中任务缺少 attempt、步骤和日志证据，不能直接作为执行结论。'
+        : '选择一条任务后，才能判断该任务的 attempt、步骤、日志和产物证据是否足够。',
+      tone: evidenceTone,
+      icon: <FileDoneOutlined />,
+    },
+    {
+      key: 'review-handoff',
+      stage: 'R4',
+      title: '复盘交接',
+      status: `${summary.terminalCount} 终态 · ${summary.failedCount} 失败`,
+      description: summary.failedCount > 0
+        ? '失败任务必须先复盘来源、失败步骤和脱敏日志，再决定是否从来源页重跑。'
+        : summary.terminalCount > 0
+          ? '终态任务只开放来源、产物、步骤和日志复盘，不允许把状态直接解释为业务正确。'
+          : '任务尚未形成终态，不能宣称执行结果、产物质量或后续交接已经完成。',
+      tone: reviewTone,
+      icon: summary.failedCount > 0 ? <WarningOutlined /> : <CheckCircleOutlined />,
+    },
+  ]
+}
+
+function buildExecutionActionGate(task: ExecutionTask, detail: ExecutionTaskDetail | null): ExecutionActionGate {
+  const hasSource = canOpenSource(task)
+  const hasSteps = Boolean(detail?.steps?.length)
+  const hasLogs = Boolean(detail?.logs?.length)
+  const hasAttempts = Boolean(detail?.attempts?.length)
+  const sourceLabel = hasSource ? `${task.sourceType} #${task.sourceId}` : '来源不可跳转'
+
+  if (isActive(task.status)) {
+    return {
+      status: 'READY',
+      tone: 'warning',
+      summary: '取消门禁开放，来源和证据复核同步开放',
+      reason: '任务仍在排队、运行或等待人工确认；允许受控取消，来源跳转和日志/步骤复核保持开放，但不能把当前结果当作终态结论。',
+      checks: [
+        { label: '取消', value: '可在检查点停止', tone: 'ready' },
+        { label: '来源', value: hasSource ? `可打开 ${sourceLabel}` : '来源缺失', tone: hasSource ? 'ready' : 'warning' },
+        { label: '步骤/日志', value: hasSteps || hasLogs ? '已有运行证据' : '等待写入', tone: hasSteps || hasLogs ? 'warning' : 'idle' },
+        { label: '终态结论', value: '未形成', tone: 'warning' },
+      ],
+    }
+  }
+
+  if (task.status === 'SUCCESS') {
+    return {
+      status: 'REVIEW',
+      tone: 'ready',
+      summary: '状态变更门禁关闭，来源和产物复盘开放',
+      reason: '任务已成功进入终态，不允许取消；后续只能查看来源、步骤、日志和产物证据，不能重复执行当前任务记录。',
+      checks: [
+        { label: '取消', value: '终态关闭', tone: 'idle' },
+        { label: '来源', value: hasSource ? `可打开 ${sourceLabel}` : '来源缺失', tone: hasSource ? 'ready' : 'warning' },
+        { label: '执行证据', value: hasAttempts || hasSteps || hasLogs ? '可复盘' : '缺失', tone: hasAttempts || hasSteps || hasLogs ? 'ready' : 'warning' },
+        { label: '产物', value: artifactOwnerType(task) ? '可查询' : '无 owner', tone: artifactOwnerType(task) ? 'ready' : 'warning' },
+      ],
+    }
+  }
+
+  if (task.status === 'FAILED') {
+    const hasFailureEvidence = hasSteps || hasLogs || Boolean(task.errorMessage)
+    return {
+      status: hasFailureEvidence ? 'REVIEW' : 'BLOCKED',
+      tone: hasFailureEvidence ? 'danger' : 'danger',
+      summary: hasFailureEvidence ? '失败复盘开放，状态变更门禁关闭' : '失败任务缺少复盘证据',
+      reason: hasFailureEvidence
+        ? '任务失败后不允许取消或重复执行当前记录；必须先查看来源、失败步骤、脱敏日志和错误摘要，再决定是否重跑来源任务。'
+        : '任务失败但缺少错误、步骤和日志证据，不能直接作为复盘结论，需要排查执行器或后端写入链路。',
+      checks: [
+        { label: '取消', value: '失败终态关闭', tone: 'idle' },
+        { label: '来源', value: hasSource ? `可打开 ${sourceLabel}` : '来源缺失', tone: hasSource ? 'ready' : 'warning' },
+        { label: '失败证据', value: hasFailureEvidence ? '可复盘' : '缺失', tone: hasFailureEvidence ? 'warning' : 'danger' },
+        { label: '下一步', value: hasFailureEvidence ? '先复盘再重跑' : '先补证据', tone: hasFailureEvidence ? 'warning' : 'danger' },
+      ],
+    }
+  }
+
+  if (task.status === 'CANCELLED') {
+    return {
+      status: 'REVIEW',
+      tone: 'idle',
+      summary: '取消终态冻结，复盘入口开放',
+      reason: '任务已被取消，状态不会继续推进；只能查看取消前的步骤、日志、来源和产物记录，必要时从来源页面重新发起。',
+      checks: [
+        { label: '取消', value: '已完成', tone: 'idle' },
+        { label: '来源', value: hasSource ? `可打开 ${sourceLabel}` : '来源缺失', tone: hasSource ? 'ready' : 'warning' },
+        { label: '步骤/日志', value: hasSteps || hasLogs ? '可复盘' : '无', tone: hasSteps || hasLogs ? 'warning' : 'idle' },
+        { label: '重跑', value: '回来源发起', tone: hasSource ? 'warning' : 'danger' },
+      ],
+    }
+  }
+
+  return {
+    status: 'BLOCKED',
+    tone: 'danger',
+    summary: '未知状态，动作门禁关闭',
+    reason: `执行任务状态 ${task.status} 不在已知状态机内，来源跳转和证据查看可用于排查，但取消或终态结论必须关闭。`,
+    checks: [
+      { label: '取消', value: '关闭', tone: 'danger' },
+      { label: '来源', value: hasSource ? `可打开 ${sourceLabel}` : '来源缺失', tone: hasSource ? 'warning' : 'danger' },
+      { label: '状态', value: task.status, tone: 'danger' },
+      { label: '复核', value: '需要后端状态排查', tone: 'warning' },
+    ],
+  }
 }
 
 function buildPipelineSignal(taskCount: number, summary: {

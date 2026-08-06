@@ -1,0 +1,322 @@
+schema_version: 2
+record_type: sourcelens_aios_project_truth
+last_verified_at: "2026-07-11T00:09:05+08:00"
+verification_scope: P0_TRUTH_CONTAINMENT_ACCEPTED_WITH_EXTERNAL_EXACT_STATE_RESOLUTION
+
+authority:
+  strategy:
+    file: docs/aios/STRATEGIC_CONSTITUTION.md
+    version: "2.3"
+    status: FROZEN
+  execution_protocol:
+    file: docs/aios/MASTER_EXECUTION_PROTOCOL.md
+    version: "1.0"
+    status: FROZEN
+  evaluation_protocol:
+    file: docs/aios/EVALUATION_PROTOCOL.md
+    version: "1.1"
+    status: FROZEN_FOR_P0
+  migration_ledger:
+    file: docs/aios/MIGRATION_LEDGER.yaml
+    status: P0_REVIEW_REQUIRED
+  domain_owners:
+    strategy: docs/aios/STRATEGIC_CONSTITUTION.md
+    current_mutable_facts: docs/aios/truth/project_state.yaml
+    execution: docs/aios/MASTER_EXECUTION_PROTOCOL.md
+    evaluation: docs/aios/EVALUATION_PROTOCOL.md
+    migration: docs/aios/MIGRATION_LEDGER.yaml
+    decision_rationale: docs/AGENT_DECISION_REGISTER.md
+  rule: Each authority controls only its domain; this fact registry cannot modify strategy.
+
+project:
+  name: SourceLens AIOS
+  current_phase: P0
+  phase_name: Strategic Foundation
+  phase_status: IN_PROGRESS
+  strategy_ref: docs/aios/STRATEGIC_CONSTITUTION.md
+  strategic_mirror_is_authoritative: false
+  strategic_mirror:
+    positioning: Trustworthy autonomous-agent infrastructure research platform using software engineering as the first validation environment.
+    year_one_outcome: One trustworthy software-engineering Agent evaluated scientifically on real bounded repository tasks.
+    primary_icp: Repository maintainer or responsible engineer handling bounded reproducible maintenance issues in a buildable Java or Java-TypeScript repository.
+    primary_jtbd: Produce the smallest defensible independently verified and reversible patch when the maintainer does not fully understand the repository.
+    north_star_metric: Verified Task Success Rate
+
+p0_audit:
+  report: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-a-20260710-220800/p0_takeover_report.md
+  evidence_manifest: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-a-20260710-220800/evidence_manifest.json
+  audit_location_policy: outside_git_worktree
+  worktree_mutated_by_audit: false
+
+p0_control_plane:
+  status: IMPLEMENTED_REVIEWED_WITH_BLOCKERS
+  evidence_level: TESTED
+  validation:
+    - Ruby YAML parse and structural assertions passed for project_state.yaml, MIGRATION_LEDGER.yaml and the P0-05 Task Contract.
+    - All four P0 JSON contract drafts parse successfully.
+    - Canonical path and nonempty-file checks passed.
+    - Active entry documents and Dashboard contain no legacy current-phase, legacy north-star or 11-plus-5 authority claim.
+    - Legacy strategy, status, handoff, scorecard, backlog and activity files are excluded from default Agent context by governance policy, operator-entry validation and checked headers; no technical retrieval filter is claimed.
+    - Git diff whitespace validation passed.
+    - AIOS governance, shell syntax and code-map gates passed; code map covers 616 files, 90 routes and 80 frontend API calls.
+    - Current make verify passed, including 934 backend tests, frontend build and UI regression, Rust checks and tests, artifact quality, LLM safety, security static and dependency regression gates.
+  gate_artifact: docs/aios/P0_GATE.md
+  contract_drafts:
+    status: INDEPENDENT_REVIEW_PASS_PENDING_ACCOUNTABLE_ACCEPTANCE
+    task_spec_schema: docs/aios/schemas/task-spec.schema.json
+    environment_snapshot_schema: docs/aios/schemas/environment-snapshot.schema.json
+    system_configuration_schema: docs/aios/schemas/system-configuration.schema.json
+    run_record_schema: docs/aios/schemas/run-record.schema.json
+    baseline_adapter_contract: docs/aios/BASELINE_ADAPTER_CONTRACT.md
+  independent_review:
+    artifact: docs/aios/P0_INDEPENDENT_REVIEW.md
+    initial_gate_review:
+      quality_and_evaluation: FAIL_NOT_READY
+      security: FAIL_NO_GO
+      cto: FAIL_NO_GO
+    final_control_plane_review:
+      quality_and_evaluation: PASS
+      security: PASS
+      cto: PASS
+    p0_gate_recommendation: NO_GO
+    accepted_findings:
+      - P0 freezes TaskSpec, environment and adapter contracts; P1 implements the executable research harness.
+      - VTSR requires a normative denominator, retry, timeout, invalid-run and exclusion policy.
+      - Current baseline, hidden-set, trace and Patch Evidence assets remain definitions rather than implemented capabilities.
+      - Raw artifact custody, LLM egress, local executor isolation and remote-side-effect rollback were missing from the initial blocker list.
+      - Authority must be domain-scoped; current facts cannot override the Strategic Constitution.
+      - Migration path ownership must be non-overlapping and repository-accurate.
+
+inherited_full_verification:
+  command: make verify
+  observed_at: "2026-07-10T22:54:58+08:00"
+  status: FAILED
+  exit_code: 2
+  passed_stages:
+    - shell syntax validation
+    - Git diff whitespace validation
+    - project code-map validation
+    - API design validation
+    - database schema validation
+    - backend test suite with 934 tests, 0 failures, 0 errors and 1 skipped
+    - frontend TypeScript and production Vite build
+  failed_stage: Frontend UI regression validation
+  failure: AgentChat responsive CSS does not satisfy the first-viewport thread and full-composer contract at 1200px and 720px breakpoints.
+  evidence_boundary: Historical observation retained to show the inherited failure before the bounded P0 truth-containment and Slice F gate repair.
+  disposition: SUPERSEDED_BY_CURRENT_FULL_VERIFICATION_FOR_CURRENT_WORKTREE_ONLY
+
+current_full_verification:
+  command: make verify
+  observed_at: "2026-07-10T23:46:39+08:00"
+  status: PASSED
+  exit_code: 0
+  passed_stages:
+    - shell syntax and Git diff whitespace validation
+    - project code map with 614 files, 90 routes and 80 frontend API calls at the recorded observation
+    - API and database schema contract gates
+    - backend test suite with 934 tests, 0 failures, 0 errors and 1 skipped
+    - frontend TypeScript, production Vite build and UI regression validation
+    - artifact quality regression checks
+    - Rust analyzer check and 4 Rust tests
+    - LLM safety regression checks
+    - security static regression checks
+    - dependency regression checks
+  evidence_boundary: This proves only the dirty worktree observed at the recorded timestamp passed declared local regression gates. Later governance-only remediation is not covered by this in-tree record; exact final-state gate evidence must be read from the external truth-binding attestation. It does not create a reviewable source baseline, pass P0, prove production readiness or establish a Patch Evidence Package.
+  exact_final_state_evidence: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-truth-contained-final/truth-binding.json
+
+git_baseline:
+  snapshot_kind: P0_AUDIT_OBSERVATION_NOT_CURRENT_ACCEPTED_BASELINE
+  observed_at: "2026-07-10T22:08:00+08:00"
+  repository_root: /Users/lijunpeng/Desktop/cc/project/SourceLens
+  branch: main
+  head: 09cf8dd6a1bcee138b949d117804d652000eb7cc
+  ahead_of_origin_main: 1
+  tracked_files: 436
+  modified_tracked_entries: 140
+  untracked_entries: 150
+  staged_entries: 0
+  worktree_state: DIRTY_AND_NOT_REVIEWABLE_AS_ONE_CHANGESET
+  evidence_level: TESTED
+  caveat: P0 control-plane edits began after this observation and before a reconstructable full worktree snapshot was retained.
+
+current_worktree_preservation:
+  snapshot_kind: EXACT_POST_REMEDIATION_DIRTY_WORKTREE_RESOLVED_BY_EXTERNAL_ATTESTATION
+  directory: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-truth-contained-final
+  manifest: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-truth-contained-final/manifest.json
+  verification: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-truth-contained-final/verification.json
+  truth_binding: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-truth-contained-final/truth-binding.json
+  resolution_rule: Read truth-binding.json for capture time, hashes, exact counts and verification result; those resulting values are intentionally not copied back into this snapshotted registry.
+  expected_head: 09cf8dd6a1bcee138b949d117804d652000eb7cc
+  expected_tracked_changed_count: 146
+  expected_untracked_file_count: 170
+  expected_staged_changed_count: 0
+  verification_contract: Artifact hashes, untracked copies and tracked binary patch must pass disposable-clone restoration.
+  verification_status_source: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-truth-contained-final/truth-binding.json
+  current_state_exact: RESOLVE_FROM_EXTERNAL_ATTESTATION
+  prior_preservation:
+    directory: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-b-preservation-20260710T154704Z
+    semantics: CAPTURED_PRE_INDEPENDENT_REVIEW_STATE_NOT_EXACT_CURRENT_WORKTREE
+    manifest_sha256: 22ce0f0d336191063b66b41bccf72a92f3446e8852bd68601f8b68498aae3d81
+  pre_aios_dirty_state_reconstructable: false
+
+local_release_evidence:
+  package: release-evidence/release-current-schema-20260710-114653
+  required_failures: 0
+  optional_warnings: 0
+  skipped: 5
+  evidence_level: GATE_PASSED
+  scope: LOCAL_PLATFORM_REGRESSION_ONLY
+  caveats:
+    - generated_from_dirty_worktree
+    - exact_source_tree_not_immutably_bound
+    - five_checks_skipped
+    - not_production_proof
+    - not_a_patch_evidence_package
+
+capabilities:
+  repository_intelligence:
+    status: PARTIAL
+    evidence_level: GATE_PASSED
+    verified_scope: Java-focused scan AST relations code chunks retrieval and citations under local gates.
+    limitations:
+      - no task-conditioned benchmark against simple baselines
+      - no hidden evaluation set
+      - non-Java quality not established
+      - source revision identity not consistently immutable
+  agent_runtime:
+    status: PARTIAL
+    evidence_level: IMPLEMENTED
+    verified_scope: Bounded conversation and tool loop with a maximum round count.
+    limitations:
+      - no durable task graph
+      - no reliable checkpoint and resume contract
+      - no independent completion verifier
+  evaluation_research_foundation:
+    status: PARTIAL
+    evidence_level: TESTED
+    verified_scope: Focused smoke tests and a 22-case deterministic retrieval regression corpus.
+    limitations:
+      - regression_corpus_explicitly_not_a_benchmark
+      - no Baseline Suite
+      - no hidden set
+      - no reproducible Agent research harness
+  trust_and_execution:
+    status: PARTIAL
+    evidence_level: GATE_PASSED
+    verified_scope: Local sandbox flags audits release gates and selected negative tests.
+    limitations:
+      - lexical path controls can be bypassed through symlink resolution gaps
+      - canonical repository revision is not immutably bound across the task
+      - patch verification is not independent
+      - checkpoint failure can be nonfatal in write paths
+      - nonzero shell exit can be represented as a successful tool result
+      - the default local executor provides a working directory but no filesystem or network isolation
+      - raw preview can return unredacted content without the required acknowledgement and audit chain
+      - artifact reads do not consistently verify stored checksums and audit persistence can fail open
+      - source and chunk content can leave through LLM or embedding calls without DNS-resolved provider allowlisting
+      - remote branch side effects do not have reliable rollback or reconciliation
+  software_engineer_agent:
+    status: NOT_PROVEN
+    evidence_level: DEFINED
+    limitations:
+      - current AutoRepair may declare PATCH_READY without build and test verification
+      - no full real issue to independent verification to evidence package loop
+      - failed PR creation can leave a pushed remote branch without reliable rollback
+  memory_and_learning:
+    status: NOT_IMPLEMENTED
+    evidence_level: DEFINED
+    limitations:
+      - transcript replay is not a measured memory system
+  multi_agent_organization_runtime:
+    status: NOT_IMPLEMENTED
+    evidence_level: DEFINED
+    limitations:
+      - role documents and Codex reviews do not prove a product runtime
+      - multi-Agent advantage has not been evaluated
+
+active_p0_work:
+  - id: P0-01
+    title: Freeze strategic and execution baseline
+    status: COMPLETE
+  - id: P0-02
+    title: Establish Truth Registry and migration ledger
+    status: CONTROL_PLANE_REVIEW_PASS
+  - id: P0-03
+    title: Define Baseline Suite and Evaluation Protocol
+    status: INDEPENDENT_CONTRACT_REVIEW_PASS_PENDING_ACCEPTANCE
+  - id: P0-04
+    title: Converge legacy authority documents
+    status: COMPLETE
+  - id: P0-04A
+    title: Contain active truth drift and legacy-context pollution
+    task_contract_ref: docs/aios/tasks/P0-04A_TRUTH_CONTAINMENT.yaml
+    status: COMPLETE_INDEPENDENT_REVIEW_PASS
+  - id: P0-04B
+    title: Repair inherited AgentChat responsive regression gate
+    task_contract_ref: docs/aios/tasks/P0-04B_SLICE_F_GATE_REPAIR.yaml
+    status: COMPLETE_INDEPENDENT_REVIEW_PASS
+  - id: P0-05
+    title: Partition dirty worktree into reviewable checkpoints
+    task_contract_ref: docs/aios/tasks/P0-05_BASELINE_SLICING.yaml
+    status: CONTRACT_READY_PARTITION_NOT_STARTED
+  - id: P0-06
+    title: Independent migration review and Founder gate
+    status: CONTROL_PLANE_REVIEW_PASS_P0_GATE_NO_GO
+
+runtime_restrictions:
+  enforcement_status: GOVERNANCE_ONLY_NOT_YET_TECHNICALLY_ENFORCED
+  legacy_context_retrieval_filter: NOT_IMPLEMENTED_GOVERNANCE_ALLOWLIST_ONLY
+  model_initiated_file_write: BLOCKED
+  agent_shell_execution: BLOCKED
+  autorepair_remote_pr: BLOCKED
+  real_provider_source_egress: BLOCKED
+  production_or_autonomous_merge: BLOCKED
+
+blocking_risks:
+  - id: RISK-P0-001
+    severity: CRITICAL
+    title: Existing dirty worktree cannot identify an exact accepted product baseline.
+  - id: RISK-P0-002
+    severity: HIGH
+    title: Patch source identity and independent verification are incomplete.
+  - id: RISK-P0-003
+    severity: HIGH
+    title: Filesystem symlink and tool-result semantics can undermine execution trust.
+  - id: RISK-P0-004
+    severity: HIGH
+    title: Legacy roadmaps and status ledgers conflict with the frozen AIOS route.
+    status: MITIGATED_INDEPENDENT_REVIEW_PASS_PENDING_BASELINE_SLICING
+  - id: RISK-P0-005
+    severity: CRITICAL
+    title: Raw artifact access and real-provider LLM or embedding egress are not fail-closed evidence boundaries.
+  - id: RISK-P0-006
+    severity: CRITICAL
+    title: The default local executor is not an isolation sandbox and shell failures can be represented as successful tool results.
+  - id: RISK-P0-007
+    severity: HIGH
+    title: AutoRepair remote side effects lack independent verification and reliable rollback or reconciliation.
+  - id: RISK-P0-008
+    severity: HIGH
+    title: Exact pre-AIOS dirty worktree state was observed but not fully preserved before control-plane edits began.
+  - id: RISK-P0-009
+    severity: HIGH
+    title: The inherited AgentChat responsive layout failed the frontend UI regression gate; the bounded repair now passes the current full local gate.
+    status: MITIGATED_INDEPENDENT_REVIEW_PASS
+  - id: RISK-P0-010
+    severity: MEDIUM
+    title: Legacy context exclusion is governance-enforced at Codex entry and document headers but is not a fail-closed technical retrieval filter.
+
+decisions:
+  - id: AIOS-ADR-001
+    status: ACCEPTED
+    summary: Freeze Strategic Constitution v2.3 and make prior phase routes historical.
+  - id: AIOS-ADR-002
+    status: ACCEPTED
+    summary: Use this YAML as the current fact authority and keep ADRs as decision rationale.
+
+update_rules:
+  - The Master proposes updates after independently verified evidence changes.
+  - Current facts may change without changing strategy; mission, primary ICP, year-one outcome or direction changes require Founder approval and a new constitution version.
+  - Capability evidence levels never advance from documentation labels alone.
+  - Historical logs and handoffs never override this file.
+  - Unknown or stale facts are marked explicitly rather than inferred.

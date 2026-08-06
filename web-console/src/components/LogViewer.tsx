@@ -1,4 +1,5 @@
-import { Empty } from 'antd'
+import StateBlock from './ui/StateBlock'
+import { redactSensitiveText } from '../utils/displayRedaction'
 
 interface Props {
   value?: string | null
@@ -6,13 +7,18 @@ interface Props {
   tone?: 'terminal' | 'plain'
 }
 
+function redactSensitiveLog(value: string) {
+  return redactSensitiveText(value)
+}
+
 export default function LogViewer({ value, maxHeight = 300, tone = 'terminal' }: Props) {
   if (!value || value.trim() === '') {
-    return <Empty description="暂无日志" />
+    return <StateBlock compact title="暂无日志" description="当前执行还没有写入可展示日志。" />
   }
   const isTerminal = tone === 'terminal'
+  const redactedValue = redactSensitiveLog(value)
   return (
-    <pre style={{
+    <pre className="sl-log-viewer" aria-label="脱敏执行日志" style={{
       background: isTerminal ? '#1e1e1e' : '#f5f5f5',
       color: isTerminal ? '#00ff00' : '#262626',
       padding: 12,
@@ -25,7 +31,7 @@ export default function LogViewer({ value, maxHeight = 300, tone = 'terminal' }:
       lineHeight: 1.6,
       margin: 0,
     }}>
-      {value}
+      {redactedValue}
     </pre>
   )
 }

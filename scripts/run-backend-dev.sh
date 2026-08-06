@@ -126,6 +126,7 @@ export DB_PASSWORD="${DB_PASSWORD:-${MYSQL_PASSWORD:-sourcelens123}}"
 export DB_URL="${DB_URL:-jdbc:mysql://localhost:3307/${MYSQL_DATABASE:-sourcelens}?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}"
 export REDIS_HOST="${REDIS_HOST:-localhost}"
 export REDIS_PORT="${REDIS_PORT:-6379}"
+export SOURCELENS_BACKEND_MAIN_CLASS="${SOURCELENS_BACKEND_MAIN_CLASS:-com.sourcelens.SourceLensApplication}"
 
 if [[ -z "${JAVA_HOME:-}" && -x /usr/libexec/java_home ]]; then
   JAVA_HOME="$(/usr/libexec/java_home 2>/dev/null || true)"
@@ -136,6 +137,8 @@ fi
 
 assert_backend_port_available "$SERVER_PORT"
 
-echo "Starting SourceLens backend with profile=${SPRING_PROFILES_ACTIVE}, port=${SERVER_PORT}, env_file=${ENV_FILE}, db_url=${DB_URL%%\?*}"
+echo "Starting SourceLens backend with profile=${SPRING_PROFILES_ACTIVE}, port=${SERVER_PORT}, env_file=${ENV_FILE}, db_url=${DB_URL%%\?*}, main_class=${SOURCELENS_BACKEND_MAIN_CLASS}"
 cd "$ROOT_DIR/backend-spring"
-exec mvn spring-boot:run
+exec mvn spring-boot:run \
+  -Dspring-boot.run.main-class="${SOURCELENS_BACKEND_MAIN_CLASS}" \
+  -Dspring-boot.run.arguments="--server.port=${SERVER_PORT}"

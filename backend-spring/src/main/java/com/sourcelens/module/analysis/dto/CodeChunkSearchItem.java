@@ -9,8 +9,12 @@ import java.util.List;
 @Builder
 public class CodeChunkSearchItem {
     private Long id;
+    private String citationId;
+    private String sourceLabel;
     private Long scanTaskId;
     private String filePath;
+    private String workspaceRoot;
+    private String moduleRoot;
     private Integer startLine;
     private Integer endLine;
     private String content;

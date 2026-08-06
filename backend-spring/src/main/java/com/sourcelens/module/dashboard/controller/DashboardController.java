@@ -45,6 +45,15 @@ public class DashboardController {
         data.put("latestCodeChunks", stat.getLatestCodeChunks());
         data.put("latestEmbeddedChunks", stat.getLatestEmbeddedChunks());
         data.put("languagesJson", stat.getLanguagesJson());
+        data.put("trustedLoopCompletionRate", stat.getTrustedLoopCompletionRate());
+        data.put("trustedLoopStatus", stat.getTrustedLoopStatus());
+        data.put("trustedLoopStatusLabel", stat.getTrustedLoopStatusLabel());
+        data.put("trustedLoopReadyStages", stat.getTrustedLoopReadyStages());
+        data.put("trustedLoopTotalStages", stat.getTrustedLoopTotalStages());
+        data.put("reportEvidenceReady", stat.getReportEvidenceReady());
+        data.put("codeQaReadiness", stat.getCodeQaReadiness());
+        data.put("recoverySignal", stat.getRecoverySignal());
+        data.put("trustedLoopMetricsSource", stat.getTrustedLoopMetricsSource());
         return Result.ok(data);
     }
 

@@ -2,10 +2,264 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RELEASE_EVIDENCE_STANDARD_STEP_COUNT=24
+RELEASE_EVIDENCE_STRICT_AUDIT_FIXTURE_OK_COUNT=3
+SECURITY_REGRESSION_VERBOSE="${SOURCELENS_SECURITY_REGRESSION_VERBOSE:-true}"
+SECURITY_REGRESSION_ASSERT_PROGRESS_INTERVAL="${SOURCELENS_SECURITY_REGRESSION_ASSERT_PROGRESS_INTERVAL:-250}"
+SECURITY_REGRESSION_VERIFY_TIMEOUT_SECONDS="${SOURCELENS_SECURITY_REGRESSION_VERIFY_TIMEOUT_SECONDS:-120}"
+SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS="${SOURCELENS_SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS:-300}"
+SECURITY_REGRESSION_NODE_TIMEOUT_SECONDS="${SOURCELENS_SECURITY_REGRESSION_NODE_TIMEOUT_SECONDS:-60}"
+SECURITY_REGRESSION_FORCE_NODE_TIMEOUT="${SOURCELENS_SECURITY_REGRESSION_FORCE_NODE_TIMEOUT:-false}"
+SECURITY_REGRESSION_INTERNAL_TIMEOUT_PROBE="${SOURCELENS_SECURITY_REGRESSION_INTERNAL_TIMEOUT_PROBE:-false}"
+SECURITY_REGRESSION_SUITE="${SOURCELENS_SECURITY_REGRESSION_SUITE:-full}"
+SECURITY_REGRESSION_STARTED_AT="$(date -u +%s 2>/dev/null || printf '0')"
+SECURITY_REGRESSION_STEP=0
+SECURITY_REGRESSION_ASSERTIONS_CHECKED=0
+exec 9>&2
 
 fail() {
   echo "SECURITY CHECK FAIL: $*" >&2
   exit 1
+}
+
+security_bool_is_false() {
+  case "$1" in
+    false|FALSE|0|no|NO|n|N) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+security_validate_bool() {
+  local key="$1"
+  local value="$2"
+  case "$value" in
+    true|TRUE|1|yes|YES|y|Y|false|FALSE|0|no|NO|n|N) return 0 ;;
+    *) fail "$key must be true or false" ;;
+  esac
+}
+
+security_validate_positive_integer() {
+  local key="$1"
+  local value="$2"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "$key must be a positive integer"
+}
+
+security_suite_names() {
+  printf 'full, static, llm-provider, release-evidence-profile, release-verifier-forgery, release-verifier-public-repo-marker, release-verifier-public-repo-ui-marker, release-verifier-autorepair-ui-marker, release-verifier-dashboard-ui-marker, release-verifier-report-evidence-marker, release-verifier-scan-governance-marker, release-verifier-agent-chat-marker, release-verifier-artifacts-marker, release-verifier-integrity, integration-drill'
+}
+
+security_normalize_suite() {
+  local suite="${1:-}"
+  case "$suite" in
+    full|all) printf 'full' ;;
+    static|security-static) printf 'static' ;;
+    llm-provider|security-llm-provider) printf 'llm-provider' ;;
+    release-evidence-profile) printf 'release-evidence-profile' ;;
+    release-verifier-forgery|marker-forgery) printf 'release-verifier-forgery' ;;
+    release-verifier-public-repo-marker|public-repo-marker) printf 'release-verifier-public-repo-marker' ;;
+    release-verifier-public-repo-ui-marker|public-repo-ui-marker) printf 'release-verifier-public-repo-ui-marker' ;;
+    release-verifier-autorepair-ui-marker|autorepair-ui-marker) printf 'release-verifier-autorepair-ui-marker' ;;
+    release-verifier-dashboard-ui-marker|dashboard-ui-marker) printf 'release-verifier-dashboard-ui-marker' ;;
+    release-verifier-report-evidence-marker|report-evidence-marker) printf 'release-verifier-report-evidence-marker' ;;
+    release-verifier-scan-governance-marker|scan-governance-marker) printf 'release-verifier-scan-governance-marker' ;;
+    release-verifier-agent-chat-marker|agent-chat-marker) printf 'release-verifier-agent-chat-marker' ;;
+    release-verifier-artifacts-marker|artifacts-marker) printf 'release-verifier-artifacts-marker' ;;
+    release-verifier-integrity|release-forgery) printf 'release-verifier-integrity' ;;
+    integration-drill) printf 'integration-drill' ;;
+    *) return 1 ;;
+  esac
+}
+
+security_parse_args() {
+  local suite="$SECURITY_REGRESSION_SUITE"
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --suite|--gate)
+        local option="$1"
+        shift
+        [[ "$#" -gt 0 ]] || fail "$option requires a value"
+        suite="$1"
+        ;;
+      --suite=*|--gate=*)
+        suite="${1#*=}"
+        ;;
+      -h|--help)
+        printf 'usage: %s [--suite %s]\n' "$0" "$(security_suite_names)"
+        exit 0
+        ;;
+      *)
+        fail "unknown security regression argument: $1"
+        ;;
+    esac
+    shift
+  done
+  SECURITY_REGRESSION_SUITE="$(security_normalize_suite "$suite")" \
+    || fail "SOURCELENS_SECURITY_REGRESSION_SUITE/--suite must be one of: $(security_suite_names)"
+}
+
+security_validate_config() {
+  security_validate_bool SOURCELENS_SECURITY_REGRESSION_VERBOSE "$SECURITY_REGRESSION_VERBOSE"
+  security_validate_positive_integer SOURCELENS_SECURITY_REGRESSION_ASSERT_PROGRESS_INTERVAL "$SECURITY_REGRESSION_ASSERT_PROGRESS_INTERVAL"
+  security_validate_positive_integer SOURCELENS_SECURITY_REGRESSION_VERIFY_TIMEOUT_SECONDS "$SECURITY_REGRESSION_VERIFY_TIMEOUT_SECONDS"
+  security_validate_positive_integer SOURCELENS_SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS"
+  security_validate_positive_integer SOURCELENS_SECURITY_REGRESSION_NODE_TIMEOUT_SECONDS "$SECURITY_REGRESSION_NODE_TIMEOUT_SECONDS"
+  security_validate_bool SOURCELENS_SECURITY_REGRESSION_FORCE_NODE_TIMEOUT "$SECURITY_REGRESSION_FORCE_NODE_TIMEOUT"
+  security_validate_bool SOURCELENS_SECURITY_REGRESSION_INTERNAL_TIMEOUT_PROBE "$SECURITY_REGRESSION_INTERNAL_TIMEOUT_PROBE"
+}
+
+security_elapsed_seconds() {
+  local now
+  now="$(date -u +%s 2>/dev/null || printf '0')"
+  if [[ "$SECURITY_REGRESSION_STARTED_AT" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ && "$SECURITY_REGRESSION_STARTED_AT" -gt 0 ]]; then
+    printf '%s' "$((now - SECURITY_REGRESSION_STARTED_AT))"
+  else
+    printf '?'
+  fi
+}
+
+security_log() {
+  security_bool_is_false "$SECURITY_REGRESSION_VERBOSE" && return 0
+  SECURITY_REGRESSION_STEP=$((SECURITY_REGRESSION_STEP + 1))
+  printf '[security-regression] step=%s elapsed=%ss %s\n' \
+    "$SECURITY_REGRESSION_STEP" \
+    "$(security_elapsed_seconds)" \
+    "$*" >&9
+}
+
+security_assert_progress() {
+  local description="$1"
+  SECURITY_REGRESSION_ASSERTIONS_CHECKED=$((SECURITY_REGRESSION_ASSERTIONS_CHECKED + 1))
+  if (( SECURITY_REGRESSION_ASSERTIONS_CHECKED == 1 || SECURITY_REGRESSION_ASSERTIONS_CHECKED % SECURITY_REGRESSION_ASSERT_PROGRESS_INTERVAL == 0 )); then
+    security_log "STATIC checked=${SECURITY_REGRESSION_ASSERTIONS_CHECKED} latest=${description}"
+  fi
+}
+
+run_with_timeout() {
+  local label="$1"
+  local seconds="$2"
+  local status
+  local restore_errexit=false
+  shift 2
+  [[ "${1:-}" == "--" ]] || fail "run_with_timeout requires -- before command for $label"
+  shift
+  [[ "$#" -gt 0 ]] || fail "run_with_timeout requires a command for $label"
+  security_validate_positive_integer "timeout for $label" "$seconds"
+  security_log "START ${label} timeout=${seconds}s"
+  case "$-" in
+    *e*) restore_errexit=true ;;
+  esac
+  set +e
+  if ! security_bool_is_false "$SECURITY_REGRESSION_FORCE_NODE_TIMEOUT"; then
+    node -e '
+const { spawn } = require("node:child_process");
+const seconds = Number(process.argv[1]);
+const command = process.argv[2];
+const args = process.argv.slice(3);
+if (!Number.isInteger(seconds) || seconds <= 0 || !command) process.exit(127);
+let timedOut = false;
+const child = spawn(command, args, { stdio: "inherit", detached: true });
+const timer = setTimeout(() => {
+  timedOut = true;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
+  setTimeout(() => {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+  }, 2000).unref();
+}, seconds * 1000);
+child.on("exit", (code, signal) => {
+  clearTimeout(timer);
+  if (timedOut) process.exit(124);
+  if (signal) process.exit(128);
+  process.exit(code ?? 1);
+});
+child.on("error", error => {
+  clearTimeout(timer);
+  console.error(error.message);
+  process.exit(127);
+});
+' "$seconds" "$@"
+    status=$?
+  elif command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+    status=$?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
+    status=$?
+  else
+    node -e '
+const { spawn } = require("node:child_process");
+const seconds = Number(process.argv[1]);
+const command = process.argv[2];
+const args = process.argv.slice(3);
+if (!Number.isInteger(seconds) || seconds <= 0 || !command) process.exit(127);
+let timedOut = false;
+const child = spawn(command, args, { stdio: "inherit", detached: true });
+const timer = setTimeout(() => {
+  timedOut = true;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
+  setTimeout(() => {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+  }, 2000).unref();
+}, seconds * 1000);
+child.on("exit", (code, signal) => {
+  clearTimeout(timer);
+  if (timedOut) process.exit(124);
+  if (signal) process.exit(128);
+  process.exit(code ?? 1);
+});
+child.on("error", error => {
+  clearTimeout(timer);
+  console.error(error.message);
+  process.exit(127);
+});
+' "$seconds" "$@"
+    status=$?
+  fi
+  if [[ "$restore_errexit" == "true" ]]; then
+    set -e
+  else
+    set +e
+  fi
+  if [[ "$status" -eq 124 ]]; then
+    security_log "TIMEOUT ${label} after ${seconds}s"
+    echo "SECURITY CHECK TIMEOUT: ${label} exceeded ${seconds}s" >&2
+    fail "${label} timed out after ${seconds}s"
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    security_log "OK ${label}"
+  else
+    security_log "FAIL ${label} exit=${status}"
+  fi
+  return "$status"
+}
+
+run_release_evidence() {
+  run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- ./scripts/release-evidence.sh "$@"
+}
+
+run_verify_release_evidence() {
+  local run_dir="${1:-unknown}"
+  run_with_timeout "verify-release-evidence:${run_dir##*/}" "$SECURITY_REGRESSION_VERIFY_TIMEOUT_SECONDS" -- ./scripts/verify-release-evidence.sh "$@"
+}
+
+run_security_node() {
+  local script="${1:-node}"
+  run_with_timeout "node:${script}" "$SECURITY_REGRESSION_NODE_TIMEOUT_SECONDS" -- node "$@"
 }
 
 require_cmd() {
@@ -39,6 +293,726 @@ rewrite_release_evidence_checksums_for_probe() {
     fail "sha256sum or shasum is required to rewrite release evidence probe checksums"
   fi
   chmod 600 "$manifest"
+}
+
+SECURITY_PUBLIC_REPO_MARKER_BASE_TMP_DIR=""
+SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_DIR=""
+SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_ID=""
+
+cleanup_security_regression_shared_fixtures() {
+  if [[ -n "${SECURITY_PUBLIC_REPO_MARKER_BASE_TMP_DIR:-}" ]]; then
+    rm -rf "$SECURITY_PUBLIC_REPO_MARKER_BASE_TMP_DIR"
+  fi
+}
+
+trap cleanup_security_regression_shared_fixtures EXIT
+
+prepare_public_repo_marker_base_fixture() {
+  local tmp_dir
+  local evidence_root
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local release_code
+
+  if [[ -n "$SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_DIR" && -d "$SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_DIR" ]]; then
+    return 0
+  fi
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-public-repo-marker-base.XXXXXX")" \
+    || fail "could not create shared public repo marker base temp dir"
+  chmod 0700 "$tmp_dir" || fail "could not harden shared public repo marker base temp dir"
+  evidence_root="$tmp_dir/evidence"
+  run_id="public-repo-marker-base-${tmp_dir##*.}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+
+  set +e
+  run_with_timeout "release-evidence:public-repo-marker-base" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+    PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+    HOME="${HOME:-$tmp_dir}" \
+    SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+    SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+    SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+    SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=true \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+    SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+    ./scripts/release-evidence.sh > "$output_file" 2>&1
+  release_code=$?
+  set -e
+  if (( release_code == 0 )); then
+    cat "$output_file" >&2
+    fail "shared public repo marker base should record a required public repo smoke failure before marker forgery"
+  fi
+  if [[ ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    fail "shared public repo marker base release evidence package was not created"
+  fi
+  if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+    cat "$verify_output_file" >&2
+    fail "shared untampered required public repo smoke package must pass verifier before marker probes"
+  fi
+
+  SECURITY_PUBLIC_REPO_MARKER_BASE_TMP_DIR="$tmp_dir"
+  SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_DIR="$run_dir"
+  SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_ID="$run_id"
+}
+
+copy_public_repo_marker_base_fixture() {
+  local evidence_root="$1"
+  prepare_public_repo_marker_base_fixture
+  mkdir -p "$evidence_root" || fail "could not create public repo marker probe evidence root"
+  cp -R "$SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_DIR" "$evidence_root/" \
+    || fail "could not copy shared public repo marker base fixture"
+}
+
+init_public_repo_marker_batch() {
+  local batch_dir="$1"
+  mkdir -p "$batch_dir/logs" || fail "could not create public repo marker batch dir"
+  : > "$batch_dir/cases.jsonl" || fail "could not create public repo marker batch cases file"
+  chmod 700 "$batch_dir" "$batch_dir/logs" || fail "could not harden public repo marker batch dir"
+  chmod 600 "$batch_dir/cases.jsonl" || fail "could not harden public repo marker batch cases file"
+}
+
+add_public_repo_marker_batch_log_case() {
+  local batch_dir="$1"
+  local label="$2"
+  local expected="$3"
+  local expected_pattern="${4:-}"
+  local require_ui_smoke="${5:-false}"
+  local require_source_location_probes="${6:-false}"
+  local require_report_evidence_qa_citation="${7:-false}"
+  local log_body="$8"
+  local case_index
+  local log_file
+
+  [[ -d "$batch_dir/logs" ]] || fail "public repo marker batch dir was not initialized"
+  case_index="$(wc -l < "$batch_dir/cases.jsonl" | tr -d '[:space:]')"
+  log_file="$batch_dir/logs/case-${case_index}.log"
+  printf '%s\n' "$log_body" > "$log_file" || fail "could not write public repo marker batch log for $label"
+  chmod 600 "$log_file" || fail "could not harden public repo marker batch log for $label"
+
+  node - "$batch_dir/cases.jsonl" "$label" "$log_file" "$expected" "$expected_pattern" "$require_ui_smoke" "$require_source_location_probes" "$require_report_evidence_qa_citation" <<'NODE'
+const fs = require("node:fs");
+const [
+  casesFile,
+  label,
+  logFile,
+  expected,
+  expectedPattern,
+  requireUiSmoke,
+  requireSourceLocationProbes,
+  requireReportEvidenceQaCitation,
+] = process.argv.slice(2);
+fs.appendFileSync(casesFile, `${JSON.stringify({
+  label,
+  logFile,
+  expected,
+  expectedPattern,
+  requireUiSmoke,
+  requireSourceLocationProbes,
+  requireReportEvidenceQaCitation,
+})}\n`);
+NODE
+}
+
+add_public_repo_marker_batch_payload_case() {
+  local batch_dir="$1"
+  local label="$2"
+  local payload="$3"
+  local expected="$4"
+  local expected_pattern="${5:-}"
+  local require_ui_smoke="${6:-false}"
+  local require_source_location_probes="${7:-false}"
+  local require_report_evidence_qa_citation="${8:-false}"
+  add_public_repo_marker_batch_log_case \
+    "$batch_dir" \
+    "$label" \
+    "$expected" \
+    "$expected_pattern" \
+    "$require_ui_smoke" \
+    "$require_source_location_probes" \
+    "$require_report_evidence_qa_citation" \
+    "PUBLIC_REPO_SMOKE_OK ${payload}"
+}
+
+run_public_repo_marker_batch() {
+  local batch_dir="$1"
+  local output_file="$2"
+  run_security_node - "$ROOT_DIR/scripts/verify-release-evidence.sh" "$batch_dir/cases.jsonl" <<'NODE' > "$output_file" 2>&1
+const fs = require("node:fs");
+const vm = require("node:vm");
+
+const verifierPath = process.argv[2];
+const casesFile = process.argv[3];
+const verifier = fs.readFileSync(verifierPath, "utf8");
+const functionStart = verifier.indexOf("validate_public_repo_smoke_success_marker()");
+if (functionStart < 0) {
+  throw new Error("could not find validate_public_repo_smoke_success_marker in verify-release-evidence.sh");
+}
+const heredocStart = verifier.indexOf("<<'NODE'", functionStart);
+if (heredocStart < 0) {
+  throw new Error("could not find public repo marker validator heredoc");
+}
+const sourceStart = verifier.indexOf("\n", heredocStart) + 1;
+const sourceEnd = verifier.indexOf("\nNODE\n", sourceStart);
+if (sourceStart <= 0 || sourceEnd < 0) {
+  throw new Error("could not extract public repo marker validator source");
+}
+const validatorSource = verifier.slice(sourceStart, sourceEnd);
+const cases = fs.readFileSync(casesFile, "utf8")
+  .split(/\r?\n/)
+  .filter(Boolean)
+  .map((line) => JSON.parse(line));
+
+function boolArg(value) {
+  return /^(true|1|yes|y)$/i.test(String(value || "")) ? "true" : "false";
+}
+
+function runCase(testCase) {
+  const stderr = [];
+  const sandboxProcess = {
+    argv: [
+      "node",
+      "public-repo-marker-validator",
+      testCase.logFile,
+      boolArg(testCase.requireUiSmoke),
+      boolArg(testCase.requireSourceLocationProbes),
+      boolArg(testCase.requireReportEvidenceQaCitation),
+    ],
+    exit(code = 0) {
+      const error = new Error(`process.exit(${code})`);
+      error.publicRepoMarkerExitCode = code;
+      throw error;
+    },
+  };
+  const sandbox = {
+    require,
+    console: {
+      error(...args) {
+        stderr.push(args.map(String).join(" "));
+      },
+      log() {},
+      warn(...args) {
+        stderr.push(args.map(String).join(" "));
+      },
+    },
+    process: sandboxProcess,
+  };
+
+  let passed = false;
+  let exitCode = 0;
+  try {
+    vm.runInNewContext(validatorSource, sandbox, {
+      filename: "verify-release-evidence.sh:validate_public_repo_smoke_success_marker",
+      timeout: 5000,
+    });
+    passed = true;
+  } catch (error) {
+    exitCode = Number.isInteger(error.publicRepoMarkerExitCode) ? error.publicRepoMarkerExitCode : 1;
+    if (!Number.isInteger(error.publicRepoMarkerExitCode)) {
+      stderr.push(error && error.stack ? error.stack : String(error));
+    }
+  }
+
+  const expected = testCase.expected || "reject";
+  const output = stderr.join("\n");
+  if (expected === "pass") {
+    if (!passed || exitCode !== 0) {
+      throw new Error(`${testCase.label}: expected pass, got reject\n${output}`);
+    }
+    return;
+  }
+  if (passed) {
+    throw new Error(`${testCase.label}: expected reject, got pass`);
+  }
+  if (testCase.expectedPattern) {
+    const pattern = new RegExp(testCase.expectedPattern);
+    if (!pattern.test(output)) {
+      throw new Error(`${testCase.label}: expected rejection matching ${testCase.expectedPattern}\n${output}`);
+    }
+  }
+}
+
+for (const testCase of cases) {
+  runCase(testCase);
+}
+console.log(`PUBLIC_REPO_MARKER_BATCH_OK cases=${cases.length}`);
+NODE
+}
+
+release_evidence_fixture_title_for_slug() {
+  local slug="$1"
+  case "$slug" in
+    git-metadata) printf 'Git metadata snapshot\n' ;;
+    worktree-inventory) printf 'Worktree inventory snapshot\n' ;;
+    make-verify) printf 'Full local verification\n' ;;
+    prod-preflight) printf 'Production preflight (warn-only)\n' ;;
+    backup-preflight) printf 'Backup/restore preflight (warn-only)\n' ;;
+    rollback-preflight) printf 'Rollback preflight (warn-only)\n' ;;
+    backup-restore-drill-evidence) printf 'Backup/restore drill evidence file\n' ;;
+    rollback-plan) printf 'Rollback plan file\n' ;;
+    smoke) printf 'Smoke test\n' ;;
+    public-repo-smoke) printf 'Public repo analysis smoke\n' ;;
+    file-bound-repair-smoke) printf 'File-bound repair smoke\n' ;;
+    autorepair-patch-smoke) printf 'AutoRepair patch readiness smoke\n' ;;
+    patch-ready-ui-smoke) printf 'PATCH_READY browser UI smoke (mocked)\n' ;;
+    dashboard-next-action-ui-smoke) printf 'Dashboard next action browser UI smoke (mocked)\n' ;;
+    report-evidence-drawer-ui-smoke) printf 'Report evidence drawer browser UI smoke (mocked)\n' ;;
+    scan-governance-timeline-ui-smoke) printf 'Scan governance timeline browser UI smoke (mocked)\n' ;;
+    agent-chat-audit-ui-smoke) printf 'AgentChat audit browser UI smoke (mocked)\n' ;;
+    agent-chat-closure-rail-ui-smoke) printf 'AgentChat closure rail browser UI smoke (mocked)\n' ;;
+    agent-chat-tool-audit-smoke) printf 'AgentChat tool audit backend smoke\n' ;;
+    audit-workbench-smoke) printf 'Audit workbench smoke\n' ;;
+    phase12-baseline) printf 'Phase 12 baseline\n' ;;
+    sandbox-drill) printf 'Docker sandbox drill\n' ;;
+    github-app-drill) printf 'GitHub App read-only drill\n' ;;
+    github-webhook-drill) printf 'GitHub webhook drill\n' ;;
+    llm-provider-run) printf 'LLM provider safety eval result\n' ;;
+    *) fail "unknown release evidence fixture slug: $slug" ;;
+  esac
+}
+
+append_release_evidence_fixture_status_row() {
+  local run_dir="$1"
+  local status="$2"
+  local slug="$3"
+  local exit_code="$4"
+  local log_file="$5"
+  local detail="$6"
+  local title
+  title="$(release_evidence_fixture_title_for_slug "$slug")"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$status" "$slug" "$exit_code" "$log_file" "$detail" >> "$run_dir/status.tsv"
+  printf -- '- %s `%s`: %s (%s)\n' "$status" "$slug" "$title" "$detail" >> "$run_dir/summary.md"
+  if [[ ! -e "$run_dir/$log_file" ]]; then
+    printf 'title: %s\nstatus: %s\ndetail: %s\n' "$title" "$status" "$detail" > "$run_dir/$log_file"
+  fi
+}
+
+write_strict_audit_workbench_release_evidence_fixture() {
+  local run_dir="$1"
+  local run_id="$2"
+  local sample_seeded="$3"
+  local audit_total="$4"
+  local tool_total="$5"
+  local webhook_total="$6"
+
+  mkdir -p "$run_dir"
+  chmod 0700 "$run_dir"
+  cat > "$run_dir/manifest.txt" <<EOF
+run_id: $run_id
+created_at: 2026-06-29T00:00:00Z
+release_evidence_profile_schema: 1
+release_evidence_profile: local
+release_evidence_profile_source: default
+root_dir: $ROOT_DIR
+env_file: deploy/.env.example
+include_verify: false
+include_preflight: false
+include_smoke: false
+include_public_repo_smoke: false
+public_repo_smoke_ui: false
+include_file_bound_repair_smoke: false
+include_autorepair_patch_smoke: false
+include_patch_ready_ui_smoke: false
+include_dashboard_next_action_ui_smoke: false
+include_report_evidence_drawer_ui_smoke: false
+include_scan_governance_timeline_ui_smoke: false
+include_agent_chat_audit_ui_smoke: false
+include_agent_chat_tool_audit_smoke: false
+include_audit_workbench_smoke: true
+include_phase12: false
+include_sandbox_drill: false
+include_github_app_drill: false
+include_github_webhook_drill: false
+include_llm_provider_run: false
+worktree_inventory_strict: true
+audit_workbench_smoke_require_samples: true
+EOF
+  {
+    printf 'llm_provider_run_file: %s\n' ""
+    printf 'llm_raw_output_dir: %s\n' ""
+    printf 'git_head: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+  } >> "$run_dir/manifest.txt"
+  printf 'working tree clean\n' > "$run_dir/git-status.txt"
+  printf 'no changes\n' > "$run_dir/git-diff-stat.txt"
+  printf '# SourceLens Worktree Inventory\n\nReview order suggestion:\n' > "$run_dir/worktree-inventory.md"
+  {
+    printf '# SourceLens Release Evidence\n\n'
+    printf -- '- run_id: `%s`\n' "$run_id"
+    printf -- '- created_at: `2026-06-29T00:00:00Z`\n'
+    printf -- '- env_file: `deploy/.env.example`\n'
+    printf -- '- evidence_dir: `%s`\n\n' "$run_dir"
+    printf '## Steps\n'
+  } > "$run_dir/summary.md"
+  printf 'status\tslug\texit_code\tlog_file\tdetail\n' > "$run_dir/status.tsv"
+
+  append_release_evidence_fixture_status_row "$run_dir" OK git-metadata 0 manifest.txt "manifest, status and diff stat captured"
+  append_release_evidence_fixture_status_row "$run_dir" OK worktree-inventory 0 worktree-inventory.md "worktree inventory captured; strict=true"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP make-verify - make-verify.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP prod-preflight - prod-preflight.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP backup-preflight - backup-preflight.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP rollback-preflight - rollback-preflight.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP backup-restore-drill-evidence - backup-restore-drill-evidence.log "SOURCELENS_BACKUP_RESTORE_DRILL_EVIDENCE_FILE is not configured"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP rollback-plan - rollback-plan.log "SOURCELENS_ROLLBACK_PLAN_FILE is not configured"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP smoke - smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP public-repo-smoke - public-repo-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP file-bound-repair-smoke - file-bound-repair-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP autorepair-patch-smoke - autorepair-patch-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP patch-ready-ui-smoke - patch-ready-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP dashboard-next-action-ui-smoke - dashboard-next-action-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP report-evidence-drawer-ui-smoke - report-evidence-drawer-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP scan-governance-timeline-ui-smoke - scan-governance-timeline-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP agent-chat-audit-ui-smoke - agent-chat-audit-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP agent-chat-tool-audit-smoke - agent-chat-tool-audit-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" OK audit-workbench-smoke 0 audit-workbench-smoke.log "completed"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP phase12-baseline - phase12-baseline.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP sandbox-drill - sandbox-drill.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP github-app-drill - github-app-drill.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP github-webhook-drill - github-webhook-drill.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP llm-provider-run - llm-provider-run.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false"
+  {
+    printf '\n## Summary\n\n'
+    printf -- '- required_failures: `0`\n'
+    printf -- '- optional_warnings: `0`\n'
+    printf -- '- skipped: `%s`\n' "$((RELEASE_EVIDENCE_STANDARD_STEP_COUNT - RELEASE_EVIDENCE_STRICT_AUDIT_FIXTURE_OK_COUNT))"
+  } >> "$run_dir/summary.md"
+  printf 'title: Audit workbench smoke\nAUDIT_WORKBENCH_SMOKE_OK {"sampleSeeded":%s,"sources":{"auditLogs":{"total":%s},"agentToolCalls":{"total":%s},"githubWebhookDeliveries":{"total":%s}}}\nfinished_at: 2026-06-29T00:00:01Z\nexit_code: 0\n' \
+    "$sample_seeded" "$audit_total" "$tool_total" "$webhook_total" > "$run_dir/audit-workbench-smoke.log"
+  find "$run_dir" -type f -exec chmod 0600 {} +
+  rewrite_release_evidence_checksums_for_probe "$run_dir"
+}
+
+write_agent_chat_closure_rail_marker_log() {
+  local run_dir="$1"
+  local mutation="${2:-valid}"
+  AGENT_CHAT_CLOSURE_MARKER_MUTATION="$mutation" node > "$run_dir/agent-chat-closure-rail-ui-smoke.log" <<'NODE'
+const mutation = process.env.AGENT_CHAT_CLOSURE_MARKER_MUTATION || "valid";
+const payload = {
+  projectId: 14,
+  scanTaskId: 24,
+  conversationId: 101,
+  agentTaskId: 202,
+  linkedAgentTaskId: 202,
+  handoffAgentTaskId: 303,
+  mockedApiOnly: true,
+  unhandledApiRequests: 0,
+  runtimeIssues: 0,
+  noHorizontalOverflow: true,
+  spec: "agent-chat-closure-rail-smoke.spec.ts",
+  baseURLHost: "127.0.0.1",
+  viewports: ["1440x900", "320x740"],
+  codeUnderstandingHandoff: {
+    status: "OK",
+    surface: "PROJECT_DETAIL_CODE_UNDERSTANDING_AGENT_HANDOFF",
+    source: "PROJECT_QA_CODE_UNDERSTANDING_LENS",
+    projectId: 14,
+    scanTaskId: 24,
+    conversationId: 101,
+    inputKind: "FILE_LINE",
+    queryShape: "file:line",
+    sourceLabel: "C1",
+    filePath: "src/main/java/com/example/PawnshopController.java",
+    lineRef: "src/main/java/com/example/PawnshopController.java:42",
+    contextRole: "PRIMARY",
+    evidenceType: "CONTROLLER",
+    relevanceScore: 92,
+    rawPromptInUrl: false,
+    rawPromptInUrlBlocked: true,
+    handoffVisible: true,
+    draftPrefilled: true,
+    conversationCreatedOrSelected: true,
+    autoSent: false,
+    rawStackStored: false,
+    providerQualityClaim: false,
+    llmFactClaim: false,
+    noHorizontalOverflow: true,
+    preConversationState: {
+      status: "OK",
+      usePromptHiddenOrDisabled: true,
+      createBoundTaskPrimaryCta: true,
+      createTaskDisabledWhenMissingScan: true,
+      missingScanTaskCreateBlocked: true,
+      missingScanReasonVisible: true,
+      noAutoSentWithoutScan: true,
+    },
+    agentTaskBinding: {
+      status: "OK",
+      projectId: 14,
+      scanTaskId: 24,
+      conversationId: 101,
+      agentTaskId: 303,
+      taskStatus: "PENDING",
+      taskType: "CUSTOM",
+      sameProjectBound: true,
+      sameScanBound: true,
+      conversationBound: true,
+      boundByBackend: true,
+      structuredInputOnly: true,
+      rawPromptStored: false,
+      rawStackStored: false,
+      autoStarted: false,
+      agentTaskCreated: true,
+    },
+    manualSend: {
+      status: "OK",
+      triggeredByUser: true,
+      messageRequestAfterClick: true,
+      autoSentBeforeClick: false,
+      agentTaskStillPending: true,
+      autoStarted: false,
+      writeToolTriggered: false,
+      closureRailStillBound: true,
+      auditReviewVisible: true,
+      rawPromptStored: false,
+      rawStackStored: false,
+    },
+  },
+};
+
+function applyMutation(name) {
+  const handoff = payload.codeUnderstandingHandoff;
+  const binding = handoff?.agentTaskBinding;
+  switch (name) {
+    case "valid":
+      return "marker";
+    case "missing-marker":
+      return "no-marker";
+    case "duplicate-marker":
+      return "duplicate-marker";
+    case "missing-handoff":
+      delete payload.codeUnderstandingHandoff;
+      return "marker";
+    case "missing-binding":
+      delete handoff.agentTaskBinding;
+      return "marker";
+    case "binding-array":
+      handoff.agentTaskBinding = [binding];
+      return "marker";
+    case "wrong-task-status":
+      binding.taskStatus = "COMPLETED";
+      return "marker";
+    case "wrong-task-type":
+      binding.taskType = "ARCHITECTURE_REVIEW";
+      return "marker";
+    case "scan-mismatch":
+      binding.scanTaskId = 25;
+      return "marker";
+    case "top-agent-task-mismatch":
+      payload.agentTaskId = 203;
+      return "marker";
+    case "handoff-agent-task-mismatch":
+      payload.handoffAgentTaskId = 304;
+      return "marker";
+    case "same-scan-false":
+      binding.sameScanBound = false;
+      return "marker";
+    case "bound-by-backend-false":
+      binding.boundByBackend = false;
+      return "marker";
+    case "structured-input-false":
+      binding.structuredInputOnly = false;
+      return "marker";
+    case "raw-prompt-stored":
+      binding.rawPromptStored = true;
+      return "marker";
+    case "auto-started":
+      binding.autoStarted = true;
+      return "marker";
+    case "auto-sent":
+      handoff.autoSent = true;
+      return "marker";
+    case "missing-manual-send":
+      delete handoff.manualSend;
+      return "marker";
+    case "manual-send-array":
+      handoff.manualSend = [handoff.manualSend];
+      return "marker";
+    case "manual-send-auto-sent-before-click":
+      handoff.manualSend.autoSentBeforeClick = true;
+      return "marker";
+    case "manual-send-message-request-missing":
+      handoff.manualSend.messageRequestAfterClick = false;
+      return "marker";
+    case "manual-send-auto-started":
+      handoff.manualSend.autoStarted = true;
+      return "marker";
+    case "manual-send-agent-task-not-pending":
+      handoff.manualSend.agentTaskStillPending = false;
+      return "marker";
+    case "manual-send-write-tool-triggered":
+      handoff.manualSend.writeToolTriggered = true;
+      return "marker";
+    case "manual-send-audit-review-hidden":
+      handoff.manualSend.auditReviewVisible = false;
+      return "marker";
+    case "manual-send-raw-prompt-stored":
+      handoff.manualSend.rawPromptStored = true;
+      return "marker";
+    case "manual-send-raw-stack-stored":
+      handoff.manualSend.rawStackStored = true;
+      return "marker";
+    case "missing-pre-conversation-state":
+      delete handoff.preConversationState;
+      return "marker";
+    case "pre-conversation-state-array":
+      handoff.preConversationState = [handoff.preConversationState];
+      return "marker";
+    case "pre-conversation-use-prompt-visible":
+      handoff.preConversationState.usePromptHiddenOrDisabled = false;
+      return "marker";
+    case "pre-conversation-primary-cta-missing":
+      handoff.preConversationState.createBoundTaskPrimaryCta = false;
+      return "marker";
+    case "pre-conversation-missing-scan-enabled":
+      handoff.preConversationState.createTaskDisabledWhenMissingScan = false;
+      return "marker";
+    case "pre-conversation-missing-scan-created-task":
+      handoff.preConversationState.missingScanTaskCreateBlocked = false;
+      return "marker";
+    case "pre-conversation-missing-scan-reason-hidden":
+      handoff.preConversationState.missingScanReasonVisible = false;
+      return "marker";
+    case "pre-conversation-auto-sent-without-scan":
+      handoff.preConversationState.noAutoSentWithoutScan = false;
+      return "marker";
+    case "provider-claim":
+      handoff.providerQualityClaim = true;
+      return "marker";
+    case "llm-claim":
+      handoff.llmFactClaim = true;
+      return "marker";
+    case "raw-key-leak":
+      binding.rawPrompt = "operator input";
+      return "marker";
+    case "sensitive-label-leak":
+      binding.credentialNote = "token present";
+      return "marker";
+    default:
+      console.error(`unknown agent chat closure marker mutation: ${name}`);
+      process.exit(2);
+  }
+}
+
+console.log("running agent-chat-closure-rail-smoke.spec.ts");
+const mode = applyMutation(mutation);
+if (mode === "no-marker") {
+  console.log("finished without marker");
+} else if (mode === "duplicate-marker") {
+  console.log(`AGENT_CHAT_CLOSURE_RAIL_SMOKE_OK ${JSON.stringify(payload)}`);
+  console.log(`AGENT_CHAT_CLOSURE_RAIL_SMOKE_OK ${JSON.stringify(payload)}`);
+} else {
+  console.log(`AGENT_CHAT_CLOSURE_RAIL_SMOKE_OK ${JSON.stringify(payload)}`);
+}
+console.log("finished_at: 2026-07-03T00:00:01Z");
+console.log("exit_code: 0");
+NODE
+  chmod 600 "$run_dir/agent-chat-closure-rail-ui-smoke.log"
+}
+
+write_agent_chat_closure_rail_release_evidence_fixture() {
+  local run_dir="$1"
+  local run_id="$2"
+
+  mkdir -p "$run_dir"
+  chmod 0700 "$run_dir"
+  cat > "$run_dir/manifest.txt" <<EOF
+run_id: $run_id
+created_at: 2026-07-03T00:00:00Z
+release_evidence_profile_schema: 3
+release_evidence_profile: local
+release_evidence_profile_source: default
+root_dir: $ROOT_DIR
+env_file: deploy/.env.example
+include_verify: false
+include_preflight: false
+include_smoke: false
+include_public_repo_smoke: false
+public_repo_smoke_ui: false
+public_repo_source_location_probes_required: false
+include_file_bound_repair_smoke: false
+include_autorepair_patch_smoke: false
+include_patch_ready_ui_smoke: false
+include_dashboard_next_action_ui_smoke: false
+include_report_evidence_drawer_ui_smoke: false
+include_scan_governance_timeline_ui_smoke: false
+include_agent_chat_audit_ui_smoke: false
+include_agent_chat_closure_rail_ui_smoke: true
+include_agent_chat_tool_audit_smoke: false
+include_audit_workbench_smoke: false
+include_phase12: false
+include_sandbox_drill: false
+include_github_app_drill: false
+include_github_webhook_drill: false
+include_llm_provider_run: false
+worktree_inventory_strict: true
+audit_workbench_smoke_require_samples: false
+EOF
+  {
+    printf 'llm_provider_run_file: %s\n' ""
+    printf 'llm_raw_output_dir: %s\n' ""
+    printf 'git_head: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+  } >> "$run_dir/manifest.txt"
+  printf 'working tree clean\n' > "$run_dir/git-status.txt"
+  printf 'no changes\n' > "$run_dir/git-diff-stat.txt"
+  printf '# SourceLens Worktree Inventory\n\nReview order suggestion:\n' > "$run_dir/worktree-inventory.md"
+  {
+    printf '# SourceLens Release Evidence\n\n'
+    printf -- '- run_id: `%s`\n' "$run_id"
+    printf -- '- created_at: `2026-07-03T00:00:00Z`\n'
+    printf -- '- env_file: `deploy/.env.example`\n'
+    printf -- '- evidence_dir: `%s`\n\n' "$run_dir"
+    printf '## Steps\n'
+  } > "$run_dir/summary.md"
+  printf 'status\tslug\texit_code\tlog_file\tdetail\n' > "$run_dir/status.tsv"
+
+  append_release_evidence_fixture_status_row "$run_dir" OK git-metadata 0 manifest.txt "manifest, status and diff stat captured"
+  append_release_evidence_fixture_status_row "$run_dir" OK worktree-inventory 0 worktree-inventory.md "worktree inventory captured; strict=true"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP make-verify - make-verify.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP prod-preflight - prod-preflight.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP backup-preflight - backup-preflight.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP rollback-preflight - rollback-preflight.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP backup-restore-drill-evidence - backup-restore-drill-evidence.log "SOURCELENS_BACKUP_RESTORE_DRILL_EVIDENCE_FILE is not configured"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP rollback-plan - rollback-plan.log "SOURCELENS_ROLLBACK_PLAN_FILE is not configured"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP smoke - smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP public-repo-smoke - public-repo-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP file-bound-repair-smoke - file-bound-repair-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP autorepair-patch-smoke - autorepair-patch-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP patch-ready-ui-smoke - patch-ready-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP dashboard-next-action-ui-smoke - dashboard-next-action-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP report-evidence-drawer-ui-smoke - report-evidence-drawer-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP scan-governance-timeline-ui-smoke - scan-governance-timeline-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP agent-chat-audit-ui-smoke - agent-chat-audit-ui-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" OK agent-chat-closure-rail-ui-smoke 0 agent-chat-closure-rail-ui-smoke.log "completed"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP agent-chat-tool-audit-smoke - agent-chat-tool-audit-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP audit-workbench-smoke - audit-workbench-smoke.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP phase12-baseline - phase12-baseline.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP sandbox-drill - sandbox-drill.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP github-app-drill - github-app-drill.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP github-webhook-drill - github-webhook-drill.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false"
+  append_release_evidence_fixture_status_row "$run_dir" SKIP llm-provider-run - llm-provider-run.log "SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false"
+  {
+    printf '\n## Summary\n\n'
+    printf -- '- required_failures: `0`\n'
+    printf -- '- optional_warnings: `0`\n'
+    printf -- '- skipped: `22`\n'
+  } >> "$run_dir/summary.md"
+  write_agent_chat_closure_rail_marker_log "$run_dir" valid
+  find "$run_dir" -type f -exec chmod 0600 {} +
+  rewrite_release_evidence_checksums_for_probe "$run_dir"
 }
 
 write_llm_provider_probe_fixture() {
@@ -103,7 +1077,7 @@ assert_llm_provider_validator_cli_arguments_fail_closed() {
   }
 
   if [[ -z "$failure" ]]; then
-    if node scripts/validate-llm-provider-run.mjs \
+    if run_security_node scripts/validate-llm-provider-run.mjs \
       docs/llm-safety-evals/provider-run-template.json \
       docs/llm-safety-evals/prompt-injection-cases.json \
       docs/llm-safety-evals/output-quality-cases.json \
@@ -116,7 +1090,7 @@ assert_llm_provider_validator_cli_arguments_fail_closed() {
     fi
   fi
   if [[ -z "$failure" ]]; then
-    if node scripts/validate-llm-provider-run.mjs \
+    if run_security_node scripts/validate-llm-provider-run.mjs \
       docs/llm-safety-evals/provider-run-template.json \
       docs/llm-safety-evals/prompt-injection-cases.json \
       docs/llm-safety-evals/output-quality-cases.json \
@@ -129,7 +1103,7 @@ assert_llm_provider_validator_cli_arguments_fail_closed() {
     fi
   fi
   if [[ -z "$failure" ]]; then
-    if node scripts/validate-llm-provider-run.mjs \
+    if run_security_node scripts/validate-llm-provider-run.mjs \
       docs/llm-safety-evals/provider-run-template.json \
       docs/llm-safety-evals/prompt-injection-cases.json \
       docs/llm-safety-evals/output-quality-cases.json \
@@ -146,11 +1120,101 @@ assert_llm_provider_validator_cli_arguments_fail_closed() {
   [[ -z "$failure" ]] || fail "$failure"
 }
 
+assert_llm_provider_eval_generator_writes_private_schema_without_secrets() {
+  local tmp_dir
+  local output_file
+  local raw_output_dir
+  local stdout_file
+  local artifacts_file
+  local run_id
+  local secret_value
+  local exit_code
+  local artifact_path
+  local relative_path
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-llm-provider-eval-probe.XXXXXX")" \
+    || fail "could not create LLM provider eval generator probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden LLM provider eval generator probe temp dir"
+  output_file="$tmp_dir/provider-run.json"
+  raw_output_dir="$tmp_dir/raw"
+  stdout_file="$tmp_dir/stdout.txt"
+  artifacts_file="$tmp_dir/artifacts.txt"
+  run_id="provider-generator-${tmp_dir##*.}"
+  secret_value="sk-sourcelensProviderProbeSecret000000"
+
+  cleanup_llm_provider_eval_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    set +e
+    run_with_timeout "node:scripts/run-llm-provider-eval.mjs" "$SECURITY_REGRESSION_NODE_TIMEOUT_SECONDS" -- \
+      env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_LLM_PROVIDER_EVAL_PROVIDER="security-regression-provider" \
+      SOURCELENS_LLM_PROVIDER_EVAL_MODEL="security-regression-model" \
+      SOURCELENS_LLM_PROVIDER_EVAL_API_KEY="$secret_value" \
+      SOURCELENS_LLM_PROVIDER_EVAL_BASE_URL="http://127.0.0.1:9/v1" \
+      SOURCELENS_LLM_PROVIDER_EVAL_RELEASE_RUN_ID="$run_id" \
+      SOURCELENS_LLM_PROVIDER_EVAL_OUTPUT_FILE="$output_file" \
+      SOURCELENS_LLM_PROVIDER_EVAL_RAW_OUTPUT_DIR="$raw_output_dir" \
+      node scripts/run-llm-provider-eval.mjs > "$stdout_file" 2>&1
+    exit_code=$?
+    set -e
+    if [[ "$exit_code" != "2" ]]; then
+      cat "$stdout_file" >&2
+      failure="LLM provider eval generator probe must write failed evidence and exit 2 when provider calls fail"
+    fi
+  fi
+  if [[ -z "$failure" && ! -s "$output_file" ]]; then
+    cat "$stdout_file" >&2
+    failure="LLM provider eval generator must write a provider run JSON file even when provider calls fail"
+  fi
+  if [[ -z "$failure" ]]; then
+    if rg -F -q "$secret_value" "$tmp_dir"; then
+      rg -F -n "$secret_value" "$tmp_dir" >&2 || true
+      failure="LLM provider eval generator must not write API keys into provider run output, raw artifacts, or logs"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_security_node scripts/validate-llm-provider-run.mjs \
+      "$output_file" \
+      docs/llm-safety-evals/prompt-injection-cases.json \
+      docs/llm-safety-evals/output-quality-cases.json \
+      --run-id "$run_id" \
+      --print-artifacts > "$artifacts_file" 2>> "$stdout_file"; then
+      cat "$stdout_file" >&2
+      failure="LLM provider eval generator output must pass provider run schema validation"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    while IFS= read -r artifact_path; do
+      [[ -n "$artifact_path" ]] || continue
+      relative_path="${artifact_path#release-evidence/${run_id}/}"
+      if [[ "$relative_path" == "$artifact_path" || "$relative_path" != llm-evals/* ]]; then
+        cat "$artifacts_file" >&2
+        failure="LLM provider eval generator rawOutputArtifact paths must mirror release-evidence/<run-id>/llm-evals"
+        break
+      fi
+      if [[ ! -s "$raw_output_dir/$relative_path" ]]; then
+        failure="LLM provider eval generator must write matching raw output artifact: $relative_path"
+        break
+      fi
+    done < "$artifacts_file"
+  fi
+
+  cleanup_llm_provider_eval_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
 assert_no_match() {
   local description="$1"
   local pattern="$2"
   shift 2
   local output
+  security_assert_progress "$description"
   if output="$(rg -n --hidden --glob '!backend-spring/target/**' --glob '!web-console/dist/**' -- "$pattern" "$@" 2>/dev/null)"; then
     echo "$output" >&2
     fail "$description"
@@ -161,8 +1225,18 @@ assert_match() {
   local description="$1"
   local pattern="$2"
   shift 2
+  security_assert_progress "$description"
   rg -n --hidden --glob '!backend-spring/target/**' --glob '!web-console/dist/**' -- "$pattern" "$@" >/dev/null \
     || fail "$description"
+}
+
+assert_release_evidence_loopback_runtime_guard_runs_before_init_output() {
+  awk '
+    /^validate_loopback_backend_runtime_boundary$/ { guard = NR }
+    /^init_output$/ { init = NR }
+    END { exit !(guard && init && guard < init) }
+  ' scripts/release-evidence.sh \
+    || fail "release evidence loopback runtime guard must run before evidence output initialization"
 }
 
 assert_match_count() {
@@ -171,6 +1245,7 @@ assert_match_count() {
   local pattern="$3"
   shift 3
   local count
+  security_assert_progress "$description"
   count="$(rg -n --hidden --glob '!backend-spring/target/**' --glob '!web-console/dist/**' -- "$pattern" "$@" 2>/dev/null \
     | wc -l | tr -d '[:space:]')"
   [[ "$count" == "$expected" ]] || fail "$description (expected $expected, got $count)"
@@ -181,6 +1256,7 @@ assert_line_order() {
   local first_pattern="$2"
   local second_pattern="$3"
   local file="$4"
+  security_assert_progress "$description"
   awk -v first="$first_pattern" -v second="$second_pattern" '
     $0 ~ first && first_line == 0 {
       first_line = NR
@@ -402,10 +1478,83 @@ SH
   [[ -z "$failure" ]] || fail "$failure"
 }
 
+assert_run_with_timeout_node_fallback_kills_process_group() {
+  local tmp_dir
+  local output_file
+  local pid_file
+  local exit_code
+  local child_pid=""
+  local attempt
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-timeout-node-fallback-probe.XXXXXX")" \
+    || fail "could not create timeout fallback probe temp dir"
+  output_file="$tmp_dir/timeout-output.txt"
+  pid_file="$tmp_dir/grandchild.pid"
+
+  cleanup_timeout_fallback_probe() {
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" >/dev/null 2>&1; then
+      kill -TERM "$child_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -KILL "$child_pid" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$tmp_dir"
+  }
+
+  set +e
+  SOURCELENS_SECURITY_REGRESSION_INTERNAL_TIMEOUT_PROBE=true \
+    SOURCELENS_SECURITY_REGRESSION_FORCE_NODE_TIMEOUT=true \
+    SOURCELENS_SECURITY_REGRESSION_TIMEOUT_PROBE_PID_FILE="$pid_file" \
+    SOURCELENS_SECURITY_REGRESSION_VERBOSE=true \
+    ./scripts/security-regression-check.sh --suite integration-drill > "$output_file" 2>&1
+  exit_code=$?
+  set -e
+
+  if (( exit_code == 0 )); then
+    cat "$output_file" >&2
+    failure="internal timeout probe must fail closed instead of exiting successfully"
+  elif ! rg -q 'SECURITY CHECK TIMEOUT: timeout-probe-child exceeded 1s' "$output_file"; then
+    cat "$output_file" >&2
+    failure="internal timeout probe must report timeout-probe-child timeout"
+  elif ! rg -q 'TIMEOUT timeout-probe-child after 1s' "$output_file"; then
+    cat "$output_file" >&2
+    failure="internal timeout probe must log timeout-probe-child timeout"
+  fi
+
+  if [[ -z "$failure" ]]; then
+    for attempt in 1 2 3 4 5; do
+      [[ -s "$pid_file" ]] && break
+      sleep 1
+    done
+    if [[ ! -s "$pid_file" ]]; then
+      cat "$output_file" >&2
+      failure="internal timeout probe must write nested child pid"
+    else
+      child_pid="$(tr -cd '0-9' < "$pid_file")"
+      [[ -n "$child_pid" ]] || failure="internal timeout probe child pid must be numeric"
+    fi
+  fi
+
+  if [[ -z "$failure" ]]; then
+    for attempt in 1 2 3 4 5; do
+      if ! kill -0 "$child_pid" >/dev/null 2>&1; then
+        child_pid=""
+        break
+      fi
+      sleep 1
+    done
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" >/dev/null 2>&1; then
+      failure="Node timeout fallback must kill nested child process group member: pid $child_pid"
+    fi
+  fi
+
+  cleanup_timeout_fallback_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
 assert_release_evidence_required_smoke_failure_is_verifiable() {
   local tmp_dir
   local evidence_root
-  local probe_suffix
   local run_id
   local run_dir
   local output_file
@@ -427,12 +1576,13 @@ assert_release_evidence_required_smoke_failure_is_verifiable() {
   }
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
       SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
       SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=true \
@@ -466,13 +1616,9288 @@ assert_release_evidence_required_smoke_failure_is_verifiable() {
     failure="release evidence smoke log must explain missing SOURCELENS_BASE_URL"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="required smoke failure release evidence package must pass verifier"
     fi
   fi
 
   cleanup_release_smoke_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_evidence_rejects_unsafe_loopback_runtime() {
+  local tmp_dir
+  local fake_bin
+  local output_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-release-runtime-probe.XXXXXX")" \
+    || fail "could not create release evidence runtime probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden release evidence runtime probe temp dir"
+  fake_bin="$tmp_dir/bin"
+  output_file="$tmp_dir/release-evidence-output.txt"
+
+  cleanup_release_runtime_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    mkdir -p "$fake_bin" || failure="could not create release evidence runtime probe fake bin"
+  fi
+  if [[ -z "$failure" ]]; then
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf 'printf '"'"'COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\\n'"'"'\n'
+      printf 'printf '"'"'java    4242 test   29u  IPv6 0x0      0t0  TCP *:8080 (LISTEN)\\n'"'"'\n'
+    } > "$fake_bin/lsof" || failure="could not write fake lsof"
+    chmod 700 "$fake_bin/lsof" || failure="could not harden fake lsof"
+  fi
+  if [[ -z "$failure" ]]; then
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf 'printf '"'"'/usr/bin/java -jar /workspace/backend-spring/target/source-lens-backend-0.1.0-SNAPSHOT.jar --server.port=8080\\n'"'"'\n'
+    } > "$fake_bin/ps" || failure="could not write fake ps"
+    chmod 700 "$fake_bin/ps" || failure="could not harden fake ps"
+  fi
+
+  if [[ -z "$failure" ]]; then
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="$fake_bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$tmp_dir/evidence" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="unsafe-runtime-probe" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=true \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      SOURCELENS_BASE_URL="http://localhost:8080" \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence must reject unsafe loopback target jar runtime before backend smoke"
+    fi
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q 'SOURCELENS_BASE_URL points to an unsafe local backend runtime' "$output_file"; then
+    cat "$output_file" >&2
+    failure="release evidence must explain unsafe loopback runtime rejection"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q 'SERVER_PORT=8080 make backend-jar' "$output_file"; then
+    cat "$output_file" >&2
+    failure="release evidence unsafe runtime rejection must recommend backend-jar on the same port"
+  fi
+  if [[ -z "$failure" && -d "$tmp_dir/evidence/unsafe-runtime-probe" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence unsafe runtime guard must fail before creating evidence output"
+  fi
+
+  cleanup_release_runtime_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_evidence_required_public_repo_smoke_failure_is_verifiable() {
+  local tmp_dir
+  local evidence_root
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-release-public-repo-smoke-probe.XXXXXX")" \
+    || fail "could not create release evidence public repo smoke probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden release evidence public repo smoke probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="public-repo-required-${probe_suffix}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+
+  cleanup_release_public_repo_smoke_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=true \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence must fail when public repo smoke is required without SOURCELENS_BASE_URL"
+    fi
+  fi
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a verifiable package for required public repo smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q $'^FAIL\tpublic-repo-smoke\t-\tpublic-repo-smoke\\.log\tSOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=true$' "$run_dir/status.tsv"; then
+    cat "$run_dir/status.tsv" >&2
+    failure="release evidence status table must record required public repo smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q 'required_failures: `1`' "$run_dir/summary.md"; then
+    cat "$run_dir/summary.md" >&2
+    failure="release evidence summary must count required public repo smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q 'SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=true' "$run_dir/public-repo-smoke.log"; then
+    cat "$run_dir/public-repo-smoke.log" >&2
+    failure="release evidence public repo smoke log must explain missing SOURCELENS_BASE_URL"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="required public repo smoke failure release evidence package must pass verifier"
+    fi
+  fi
+
+  cleanup_release_public_repo_smoke_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_evidence_public_repo_smoke_false_skip_is_verifiable() {
+  local tmp_dir
+  local evidence_root
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-release-public-repo-false-probe.XXXXXX")" \
+    || fail "could not create release evidence public repo false probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden release evidence public repo false probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="public-repo-false-${probe_suffix}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+
+  cleanup_release_public_repo_false_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence must create a public repo smoke false skip package"
+    fi
+  fi
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a package for public repo smoke false skip verification"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q '^include_public_repo_smoke: false$' "$run_dir/manifest.txt"; then
+    cat "$run_dir/manifest.txt" >&2
+    failure="release evidence manifest must record public repo smoke false mode"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q $'^SKIP\tpublic-repo-smoke\t-\tpublic-repo-smoke\\.log\tSOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false$' "$run_dir/status.tsv"; then
+    cat "$run_dir/status.tsv" >&2
+    failure="release evidence status table must record public repo smoke false skip"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="public repo smoke false skip release evidence package must pass verifier"
+    fi
+  fi
+
+  cleanup_release_public_repo_false_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_evidence_ci_profile_contract_is_verifiable() {
+  local tmp_dir
+  local evidence_root
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local tampered_output_file
+  local original_manifest_file
+  local tampered_manifest_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-release-ci-profile-probe.XXXXXX")" \
+    || fail "could not create release evidence ci profile probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden release evidence ci profile probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  mkdir -p "$evidence_root" || failure="could not create release evidence ci profile root"
+  chmod 0700 "$evidence_root" || failure="could not harden release evidence ci profile root"
+  run_id="ci-profile-${tmp_dir##*.}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+  tampered_output_file="$tmp_dir/verify-release-evidence-tampered-output.txt"
+  original_manifest_file="$tmp_dir/manifest.original"
+  tampered_manifest_file="$tmp_dir/manifest.tampered"
+
+  cleanup_release_ci_profile_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_PROFILE=ci \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence ci profile package must be generated"
+    fi
+  fi
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence ci profile package must keep a run directory"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence ci profile package must pass verifier"
+    fi
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q '^release_evidence_profile_schema: 3$' "$run_dir/manifest.txt"; then
+    cat "$run_dir/manifest.txt" >&2
+    failure="release evidence ci profile manifest must record profile schema"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q '^release_evidence_profile: ci$' "$run_dir/manifest.txt"; then
+    cat "$run_dir/manifest.txt" >&2
+    failure="release evidence ci profile manifest must record ci profile"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q '^release_evidence_profile_source: env$' "$run_dir/manifest.txt"; then
+    cat "$run_dir/manifest.txt" >&2
+    failure="release evidence ci profile manifest must record env profile source"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q '^public_repo_smoke_ui: false$' "$run_dir/manifest.txt"; then
+    cat "$run_dir/manifest.txt" >&2
+    failure="release evidence ci profile manifest must record public_repo_smoke_ui=false"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q '^public_repo_source_location_probes_required: false$' "$run_dir/manifest.txt"; then
+    cat "$run_dir/manifest.txt" >&2
+    failure="release evidence ci profile manifest must record public_repo_source_location_probes_required=false"
+  fi
+  if [[ -z "$failure" ]]; then
+    cp "$run_dir/manifest.txt" "$original_manifest_file" \
+      || failure="could not preserve original ci profile manifest"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^release_evidence_profile_schema: / {
+        print "release_evidence_profile_schema: 4"
+        changed = 1
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/manifest.txt" > "$tampered_manifest_file"; then
+      failure="could not tamper ci profile schema"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_manifest_file" "$run_dir/manifest.txt" \
+      && chmod 600 "$run_dir/manifest.txt" \
+      || failure="could not replace ci profile schema manifest"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$tampered_output_file" 2>&1; then
+      cat "$tampered_output_file" >&2
+      failure="release evidence verifier must reject invalid profile schema after checksums are regenerated"
+    elif ! rg -q 'release_evidence_profile_schema must be 1, 2, or 3' "$tampered_output_file"; then
+      cat "$tampered_output_file" >&2
+      failure="release evidence verifier must explain invalid profile schema"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    cp "$original_manifest_file" "$run_dir/manifest.txt" \
+      && chmod 600 "$run_dir/manifest.txt" \
+      || failure="could not restore ci profile manifest"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^release_evidence_profile: / {
+        print "release_evidence_profile: release"
+        changed = 1
+        next
+      }
+      /^public_repo_source_location_probes_required: / {
+        print "public_repo_source_location_probes_required: true"
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/manifest.txt" > "$tampered_manifest_file"; then
+      failure="could not tamper ci profile value"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_manifest_file" "$run_dir/manifest.txt" \
+      && chmod 600 "$run_dir/manifest.txt" \
+      || failure="could not replace ci profile value manifest"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$tampered_output_file" 2>&1; then
+      cat "$tampered_output_file" >&2
+      failure="release evidence verifier must reject profile/include mismatch after checksums are regenerated"
+    elif ! rg -q 'profile release requires include_verify=true' "$tampered_output_file"; then
+      cat "$tampered_output_file" >&2
+      failure="release evidence verifier must explain profile/include mismatch"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    cp "$original_manifest_file" "$run_dir/manifest.txt" \
+      && chmod 600 "$run_dir/manifest.txt" \
+      || failure="could not restore ci profile manifest before public repo UI tamper"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^public_repo_smoke_ui: / {
+        print "public_repo_smoke_ui: true"
+        changed = 1
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/manifest.txt" > "$tampered_manifest_file"; then
+      failure="could not tamper ci profile public_repo_smoke_ui"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_manifest_file" "$run_dir/manifest.txt" \
+      && chmod 600 "$run_dir/manifest.txt" \
+      || failure="could not replace ci profile public repo UI manifest"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$tampered_output_file" 2>&1; then
+      cat "$tampered_output_file" >&2
+      failure="release evidence verifier must reject ci public_repo_smoke_ui=true after checksums are regenerated"
+    elif ! rg -q 'profile ci requires public_repo_smoke_ui=false' "$tampered_output_file"; then
+      cat "$tampered_output_file" >&2
+      failure="release evidence verifier must explain ci public_repo_smoke_ui mismatch"
+    fi
+  fi
+
+  cleanup_release_ci_profile_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_evidence_profile_overrides_are_rejected() {
+  local tmp_dir
+  local output_file
+  local exit_code
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-release-profile-override-probe.XXXXXX")" \
+    || fail "could not create release evidence profile override probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden release evidence profile override probe temp dir"
+  output_file="$tmp_dir/release-evidence-output.txt"
+
+  cleanup_release_profile_override_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    set +e
+    run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$tmp_dir" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID=bad-profile-override \
+      SOURCELENS_RELEASE_EVIDENCE_PROFILE=ci \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=true \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1
+    exit_code=$?
+    set -e
+    if (( exit_code == 0 )); then
+      cat "$output_file" >&2
+      failure="release evidence profile include overrides must be rejected"
+    elif ! rg -q 'cannot be used with SOURCELENS_RELEASE_EVIDENCE_PROFILE=ci' "$output_file"; then
+      cat "$output_file" >&2
+      failure="release evidence profile override rejection must explain the conflicting include env"
+    fi
+  fi
+
+  cleanup_release_profile_override_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_public_repo_smoke_ok_without_marker() {
+  local tmp_dir
+  local evidence_root
+  local run_id
+  local run_dir
+  local output_file
+  local marker_output_file
+  local batch_dir
+  local batch_output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-public-repo-marker-probe.XXXXXX")" \
+    || fail "could not create public repo marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden public repo marker probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  copy_public_repo_marker_base_fixture "$evidence_root"
+  run_id="$SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_ID"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  marker_output_file="$tmp_dir/verify-release-evidence-marker-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+
+  cleanup_public_repo_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a package for public repo marker verification"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN {
+        OFS = "\t"
+      }
+      NR == 1 {
+        print
+        next
+      }
+      $2 == "public-repo-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge public repo smoke status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- FAIL `public-repo-smoke`: / && !changed {
+        print "- OK `public-repo-smoke`: Public repo analysis smoke (completed)"
+        changed = 1
+        next
+      }
+      /^- required_failures: `/ {
+        line = $0
+        sub(/^- required_failures: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- required_failures: `" line - 1 "`"
+        next
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge public repo smoke summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged public repo smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged public repo smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep public repo marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$marker_output_file" 2>&1; then
+      cat "$marker_output_file" >&2
+      failure="release evidence verifier must reject public repo smoke OK rows without PUBLIC_REPO_SMOKE_OK marker"
+    elif ! rg -q 'public-repo-smoke OK must include PUBLIC_REPO_SMOKE_OK marker' "$marker_output_file"; then
+      cat "$marker_output_file" >&2
+      failure="release evidence verifier must explain missing public repo smoke marker rejection"
+    fi
+  fi
+
+  cleanup_public_repo_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_agent_chat_closure_rail_marker_forgery() {
+  local tmp_dir
+  local run_id
+  local run_dir
+  local verify_output_file
+  local reject_output_file
+  local mutation
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-agent-chat-marker-probe.XXXXXX")" \
+    || fail "could not create AgentChat closure marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden AgentChat closure marker probe temp dir"
+  run_id="agent-chat-marker-${tmp_dir##*.}"
+  run_dir="$tmp_dir/$run_id"
+  verify_output_file="$tmp_dir/verify-release-evidence-valid-output.txt"
+
+  cleanup_agent_chat_closure_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    write_agent_chat_closure_rail_release_evidence_fixture "$run_dir" "$run_id" \
+      || failure="could not write AgentChat closure rail release evidence fixture"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="valid AgentChat closure rail release evidence fixture must pass verifier"
+    fi
+  fi
+
+  for mutation in \
+    missing-marker \
+    duplicate-marker \
+    missing-handoff \
+    missing-binding \
+    binding-array \
+    wrong-task-status \
+    wrong-task-type \
+    scan-mismatch \
+    top-agent-task-mismatch \
+    handoff-agent-task-mismatch \
+    same-scan-false \
+    bound-by-backend-false \
+    structured-input-false \
+    raw-prompt-stored \
+    auto-started \
+    auto-sent \
+    missing-manual-send \
+    manual-send-array \
+    manual-send-auto-sent-before-click \
+    manual-send-message-request-missing \
+    manual-send-auto-started \
+    manual-send-agent-task-not-pending \
+    manual-send-write-tool-triggered \
+    manual-send-audit-review-hidden \
+    manual-send-raw-prompt-stored \
+    manual-send-raw-stack-stored \
+    missing-pre-conversation-state \
+    pre-conversation-state-array \
+    pre-conversation-use-prompt-visible \
+    pre-conversation-primary-cta-missing \
+    pre-conversation-missing-scan-enabled \
+    pre-conversation-missing-scan-created-task \
+    pre-conversation-missing-scan-reason-hidden \
+    pre-conversation-auto-sent-without-scan \
+    provider-claim \
+    llm-claim \
+    raw-key-leak \
+    sensitive-label-leak
+  do
+    [[ -n "$failure" ]] && break
+    reject_output_file="$tmp_dir/verify-release-evidence-${mutation}.txt"
+    write_agent_chat_closure_rail_marker_log "$run_dir" "$mutation" \
+      || {
+        failure="could not write forged AgentChat closure marker for $mutation"
+        break
+      }
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject forged AgentChat closure rail marker: $mutation"
+    elif ! rg -q 'agent-chat-closure-rail-ui-smoke OK must prove controlled code-understanding AgentTask binding' "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain forged AgentChat closure rail marker rejection: $mutation"
+    fi
+  done
+
+  cleanup_agent_chat_closure_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_artifacts_detail_selection_marker_forgery() {
+  local tmp_dir
+  local probe_suffix
+  local run_id
+  local run_dir
+  local output_file
+  local reject_output_file
+  local valid_marker_payload
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-artifacts-marker-probe.XXXXXX")" \
+    || fail "could not create Artifacts marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden Artifacts marker probe temp dir"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="artifacts-marker-${probe_suffix}"
+  run_dir="$tmp_dir/$run_id"
+  output_file="$tmp_dir/verify-release-evidence-artifacts-marker-output.txt"
+
+  cleanup_artifacts_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  valid_marker_payload='{"projectId":14,"mockedApiOnly":true,"unhandledApiRequests":0,"runtimeIssues":0,"noHorizontalOverflow":true,"viewports":["1440x900","390x844","320x740"],"rawDownloadBoundary":{"scope":"ARTIFACTS_RAW_DOWNLOAD_ACKNOWLEDGEMENT_AUDIT_BOUNDARY_ONLY","requestBound":true,"acknowledgementPresent":true,"receiptBoundaryExpected":true,"artifactIdBound":true,"noDrawerHijack":true,"rawDownloadRedactionClaim":false,"markerContainsRawContent":false},"rawDownloadAuditDeepLink":{"scope":"ARTIFACTS_RAW_DOWNLOAD_AUDIT_DEEP_LINK_ONLY","visible":true,"projectBound":true,"auditLogId":901,"auditLogIdBound":true,"resourceType":"ARTIFACT","resourceId":802,"action":"ARTIFACT_RAW_DOWNLOAD","status":"SUCCESS","successOnly":true,"navigatesToAuditLogs":true,"lowSensitiveQueryOnly":true,"urlHasRawPayload":false,"urlHasStoragePath":false,"urlHasFileName":false},"rawDownloadAuditFallback":{"scope":"ARTIFACTS_RAW_DOWNLOAD_AUDIT_FALLBACK_WITHOUT_RECEIPT_ID_ONLY","visible":true,"artifactId":803,"receiptIdMissing":true,"fallbackUsesResourceActionStatus":true,"fallbackUrlHasAuditLogId":false,"fallbackDoesNotClaimReceiptId":true,"urlHasRawPayload":false,"urlHasFileName":false},"spec":"artifacts-detail-selection-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+
+  write_artifacts_marker_log() {
+    local marker_body="$1"
+    {
+      printf 'title: Audit workbench smoke\n'
+      printf 'AUDIT_WORKBENCH_SMOKE_OK {"sampleSeeded":true,"sources":{"auditLogs":{"total":1},"agentToolCalls":{"total":1},"githubWebhookDeliveries":{"total":1}}}\n'
+      if [[ -n "$marker_body" ]]; then
+        printf '%s\n' "$marker_body"
+      fi
+      printf 'finished_at: 2026-06-29T00:00:01Z\n'
+      printf 'exit_code: 0\n'
+    } > "$run_dir/audit-workbench-smoke.log" || return 1
+    chmod 600 "$run_dir/audit-workbench-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  mutate_artifacts_marker_payload() {
+    local mutation="$1"
+    node - "$valid_marker_payload" "$mutation" <<'NODE'
+const payload = JSON.parse(process.argv[2]);
+const mutation = process.argv[3];
+switch (mutation) {
+  case "boundary-request-unbound":
+    payload.rawDownloadBoundary.requestBound = false;
+    break;
+  case "deep-link-audit-log-id-zero":
+    payload.rawDownloadAuditDeepLink.auditLogId = 0;
+    break;
+  case "deep-link-raw-file-name":
+    payload.rawDownloadAuditDeepLink.urlHasFileName = true;
+    break;
+  case "fallback-receipt-present":
+    payload.rawDownloadAuditFallback.receiptIdMissing = false;
+    break;
+  case "fallback-claims-receipt-id":
+    payload.rawDownloadAuditFallback.fallbackDoesNotClaimReceiptId = false;
+    break;
+  case "marker-contains-raw-content":
+    payload.rawDownloadBoundary.markerContainsRawContent = true;
+    break;
+  case "missing-mobile-viewport":
+    payload.viewports = ["1440x900", "390x844"];
+    break;
+  case "remote-host":
+    payload.baseURLHost = "example.com";
+    break;
+  default:
+    throw new Error(`unknown Artifacts marker mutation: ${mutation}`);
+}
+process.stdout.write(`ARTIFACTS_DETAIL_SELECTION_SMOKE_OK ${JSON.stringify(payload)}`);
+NODE
+  }
+
+  verify_artifacts_marker_rejects() {
+    local label="$1"
+    local marker_body="$2"
+    reject_output_file="$tmp_dir/verify-release-evidence-artifacts-${label}.txt"
+    if ! write_artifacts_marker_log "$marker_body"; then
+      failure="could not write forged Artifacts marker payload for $label"
+      return
+    fi
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid Artifacts marker: $label"
+    elif ! rg -q 'artifacts-detail-selection marker must prove raw download audit receipt and fallback boundaries' "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain invalid Artifacts marker rejection: $label"
+    fi
+  }
+
+  if [[ -z "$failure" ]]; then
+    write_strict_audit_workbench_release_evidence_fixture "$run_dir" "$run_id" true 1 1 1 \
+      || failure="could not write Artifacts marker release evidence fixture"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must accept package without optional Artifacts marker"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_artifacts_marker_log "ARTIFACTS_DETAIL_SELECTION_SMOKE_OK $valid_marker_payload"; then
+      failure="could not write valid Artifacts marker"
+    elif ! run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must accept valid Artifacts marker"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "duplicate-marker" "ARTIFACTS_DETAIL_SELECTION_SMOKE_OK $valid_marker_payload
+ARTIFACTS_DETAIL_SELECTION_SMOKE_OK $valid_marker_payload"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "boundary-request-unbound" "$(mutate_artifacts_marker_payload boundary-request-unbound)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "deep-link-audit-log-id-zero" "$(mutate_artifacts_marker_payload deep-link-audit-log-id-zero)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "deep-link-raw-file-name" "$(mutate_artifacts_marker_payload deep-link-raw-file-name)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "fallback-receipt-present" "$(mutate_artifacts_marker_payload fallback-receipt-present)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "fallback-claims-receipt-id" "$(mutate_artifacts_marker_payload fallback-claims-receipt-id)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "marker-contains-raw-content" "$(mutate_artifacts_marker_payload marker-contains-raw-content)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "missing-mobile-viewport" "$(mutate_artifacts_marker_payload missing-mobile-viewport)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_artifacts_marker_rejects "remote-host" "$(mutate_artifacts_marker_payload remote-host)"
+  fi
+
+  cleanup_artifacts_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_audit_logs_artifact_raw_download_marker_forgery() {
+  local tmp_dir
+  local probe_suffix
+  local run_id
+  local run_dir
+  local output_file
+  local reject_output_file
+  local valid_marker_payload
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-auditlogs-artifact-marker-probe.XXXXXX")" \
+    || fail "could not create AuditLogs Artifacts marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden AuditLogs Artifacts marker probe temp dir"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="auditlogs-artifact-marker-${probe_suffix}"
+  run_dir="$tmp_dir/$run_id"
+  output_file="$tmp_dir/verify-release-evidence-auditlogs-artifact-marker-output.txt"
+
+  cleanup_audit_logs_artifact_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  valid_marker_payload='{"mockedApiOnly":true,"unhandledApiRequests":0,"viewport":"390x844","artifactRawDownloadAuditDeepLink":{"selectedAuditLogId":904,"conflictingSameResourceAuditLogId":905,"auditLogId":904,"auditLogIdBound":true,"resourceType":"ARTIFACT","resourceId":802,"action":"ARTIFACT_RAW_DOWNLOAD","status":"SUCCESS","resourceActionStatusMatched":true,"associatedResourceTarget":"/artifacts?projectId=1&artifactId=802","associatedResourceReturnBound":true,"lowSensitiveQueryOnly":true}}'
+
+  write_audit_logs_artifact_marker_log() {
+    local marker_body="$1"
+    {
+      printf 'title: Audit workbench smoke\n'
+      printf 'AUDIT_WORKBENCH_SMOKE_OK {"sampleSeeded":true,"sources":{"auditLogs":{"total":1},"agentToolCalls":{"total":1},"githubWebhookDeliveries":{"total":1}}}\n'
+      if [[ -n "$marker_body" ]]; then
+        printf '%s\n' "$marker_body"
+      fi
+      printf 'finished_at: 2026-06-29T00:00:01Z\n'
+      printf 'exit_code: 0\n'
+    } > "$run_dir/audit-workbench-smoke.log" || return 1
+    chmod 600 "$run_dir/audit-workbench-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  mutate_audit_logs_artifact_marker_payload() {
+    local mutation="$1"
+    node - "$valid_marker_payload" "$mutation" <<'NODE'
+const payload = JSON.parse(process.argv[2]);
+const marker = payload.artifactRawDownloadAuditDeepLink;
+const mutation = process.argv[3];
+switch (mutation) {
+  case "audit-log-id-mismatch":
+    marker.auditLogId = 905;
+    break;
+  case "missing-conflict-proof":
+    marker.conflictingSameResourceAuditLogId = 904;
+    break;
+  case "wrong-action":
+    marker.action = "ARTIFACT_PREVIEW";
+    break;
+  case "resource-status-unmatched":
+    marker.resourceActionStatusMatched = false;
+    break;
+  case "associated-resource-unbound":
+    marker.associatedResourceTarget = "/artifacts?projectId=1&artifactId=803";
+    break;
+  case "associated-resource-leaks-audit-id":
+    marker.associatedResourceTarget = "/artifacts?projectId=1&artifactId=802&auditLogId=904";
+    break;
+  case "low-sensitive-query-false":
+    marker.lowSensitiveQueryOnly = false;
+    break;
+  case "bad-viewport":
+    payload.viewport = "1440x900";
+    break;
+  default:
+    throw new Error(`unknown AuditLogs artifact marker mutation: ${mutation}`);
+}
+process.stdout.write(`AUDIT_LOGS_ARTIFACT_RAW_DOWNLOAD_DEEP_LINK_SMOKE_OK ${JSON.stringify(payload)}`);
+NODE
+  }
+
+  verify_audit_logs_artifact_marker_rejects() {
+    local label="$1"
+    local marker_body="$2"
+    reject_output_file="$tmp_dir/verify-release-evidence-auditlogs-artifact-${label}.txt"
+    if ! write_audit_logs_artifact_marker_log "$marker_body"; then
+      failure="could not write forged AuditLogs artifact marker payload for $label"
+      return
+    fi
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid AuditLogs artifact marker: $label"
+    elif ! rg -q 'audit-logs artifact raw download marker must prove receipt-id-bound exact audit deep link' "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain invalid AuditLogs artifact marker rejection: $label"
+    fi
+  }
+
+  if [[ -z "$failure" ]]; then
+    write_strict_audit_workbench_release_evidence_fixture "$run_dir" "$run_id" true 1 1 1 \
+      || failure="could not write AuditLogs artifact marker release evidence fixture"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must accept package without optional AuditLogs artifact marker"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_audit_logs_artifact_marker_log "AUDIT_LOGS_ARTIFACT_RAW_DOWNLOAD_DEEP_LINK_SMOKE_OK $valid_marker_payload"; then
+      failure="could not write valid AuditLogs artifact marker"
+    elif ! run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must accept valid AuditLogs artifact marker"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "duplicate-marker" "AUDIT_LOGS_ARTIFACT_RAW_DOWNLOAD_DEEP_LINK_SMOKE_OK $valid_marker_payload
+AUDIT_LOGS_ARTIFACT_RAW_DOWNLOAD_DEEP_LINK_SMOKE_OK $valid_marker_payload"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "audit-log-id-mismatch" "$(mutate_audit_logs_artifact_marker_payload audit-log-id-mismatch)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "missing-conflict-proof" "$(mutate_audit_logs_artifact_marker_payload missing-conflict-proof)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "wrong-action" "$(mutate_audit_logs_artifact_marker_payload wrong-action)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "resource-status-unmatched" "$(mutate_audit_logs_artifact_marker_payload resource-status-unmatched)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "associated-resource-unbound" "$(mutate_audit_logs_artifact_marker_payload associated-resource-unbound)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "associated-resource-leaks-audit-id" "$(mutate_audit_logs_artifact_marker_payload associated-resource-leaks-audit-id)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "low-sensitive-query-false" "$(mutate_audit_logs_artifact_marker_payload low-sensitive-query-false)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_audit_logs_artifact_marker_rejects "bad-viewport" "$(mutate_audit_logs_artifact_marker_payload bad-viewport)"
+  fi
+
+  cleanup_audit_logs_artifact_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_public_repo_smoke_ok_without_natural_endpoint_probes() {
+  local tmp_dir
+  local evidence_root
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local marker_output_file
+  local batch_dir
+  local batch_output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local valid_code_qa_payload
+  local valid_cross_file_retrieval_payload
+  local valid_report_quality_payload
+  local valid_code_understanding_payload
+  local partial_primary_code_qa_payload
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-public-repo-natural-probe.XXXXXX")" \
+    || fail "could not create public repo natural endpoint probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden public repo natural endpoint probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  copy_public_repo_marker_base_fixture "$evidence_root"
+  run_id="$SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_ID"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+  marker_output_file="$tmp_dir/verify-release-evidence-marker-output.txt"
+  batch_dir="$tmp_dir/public-repo-marker-batch"
+  batch_output_file="$tmp_dir/public-repo-marker-batch-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+  init_public_repo_marker_batch "$batch_dir"
+
+  cleanup_public_repo_natural_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  write_public_repo_marker_payload() {
+    local payload="$1"
+    printf 'PUBLIC_REPO_SMOKE_OK %s\n' "$payload" > "$run_dir/public-repo-smoke.log" \
+      || return 1
+    chmod 600 "$run_dir/public-repo-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  write_public_repo_marker_log() {
+    local log_body="$1"
+    printf '%s\n' "$log_body" > "$run_dir/public-repo-smoke.log" \
+      || return 1
+    chmod 600 "$run_dir/public-repo-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  require_public_repo_source_location_gate_rejects_missing() {
+    add_public_repo_marker_batch_payload_case \
+      "$batch_dir" \
+      "source-location-required-missing" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$valid_code_qa_payload"'}' \
+      "reject" \
+      "sourceLocationProbes must be present when public_repo_source_location_probes_required=true" \
+      "false" \
+      "true" \
+      "false"
+  }
+
+  verify_public_repo_marker_rejects() {
+    local label="$1"
+    local payload="$2"
+    add_public_repo_marker_batch_payload_case "$batch_dir" "$label" "$payload" "reject"
+  }
+
+  valid_code_qa_payload='{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"rawRetrievedChunkContentAbsent":true,"contentPreviewMaxLength":120,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1,"citationCoverage":{"status":"FULL","coveragePercent":100,"totalEvidenceCount":1,"citedEvidenceCount":1,"uncitedCandidateCount":0,"repairCandidateCount":1,"uniqueEvidenceFileCount":1,"citedEvidenceFileCount":1,"primaryEvidenceFileCount":1,"citedPrimaryEvidenceFileCount":1,"contextEvidenceFileCount":0,"citedContextEvidenceFileCount":0,"evidenceRoleDistribution":{"status":"PRIMARY_SINGLE_FILE","totalFileCount":1,"citedFileCount":1,"primaryFileCount":1,"citedPrimaryFileCount":1,"contextFileCount":0,"citedContextFileCount":0,"roleCount":1,"fileEntryCount":1}},"claimCitationCoverage":{"status":"READY","readyForRepair":true,"readinessReason":"PRIMARY_BOUND_READY","claimCoveragePercent":100,"requiredClaimCount":1,"citedRequiredClaimCount":1,"uncitedRequiredClaimCount":0,"invalidCitationClaimCount":0,"validCitationFileCount":1,"requiredClaimCitationFileCount":1,"roleDistribution":{"status":"PRIMARY_BOUND","requiredClaimCount":1,"requiredPrimaryBoundClaimCount":1,"requiredContextOnlyClaimCount":0,"requiredUnknownOnlyClaimCount":0,"unbackedRequiredClaimCount":0,"invalidRequiredClaimCount":0,"validCitationFileCount":1,"requiredClaimCitationFileCount":1,"requiredPrimaryFileCount":1,"roleCount":1,"fileEntryCount":1}},"citationScanTaskIds":[1],"citedAnswerScanTaskIds":[1],"retrievedChunkScanTaskIds":[1]}'
+  valid_cross_file_retrieval_payload='{"status":"OK","endpoint":"/api/projects/1/code-chunks/search","query":"","limit":24,"responseScanTaskId":1,"resultCount":2,"totalChunks":100,"embeddedChunks":0,"uniqueFiles":2,"currentScanOnly":true,"fileStatsVisible":true,"fileStatsUniqueFiles":2,"fileDistribution":[{"filePath":"src/main/java/DemoController.java","resultCount":1,"evidenceTypes":["CONTROLLER"],"sourceLabelCount":1,"minStartLine":42,"maxEndLine":80},{"filePath":"src/main/java/DemoService.java","resultCount":1,"evidenceTypes":["SERVICE"],"sourceLabelCount":1,"minStartLine":12,"maxEndLine":34}],"fileDistributionSampleCount":2,"sourceLabelsVisible":true,"retrievalMode":"STABLE_FALLBACK","readiness":"GAP","minFileEvidenceSatisfied":true}'
+  valid_report_quality_payload='{"readiness":"REVIEW","confidence":74,"gaps":0,"nextActions":1,"evidenceChecks":6,"reportCitationQuality":{"status":"OK","artifactType":"ARCHITECTURE_REPORT","scanTaskId":1,"requiredCheckCount":6,"boundCheckCount":6,"evidenceCheckKeys":["api_data_surface","fingerprint","module_map","risk_signal","scan_scope","test_signal"],"sectionBindings":[{"key":"api_data_surface","sourceSection":"apiRoutes/dbEntities","status":"READY"},{"key":"fingerprint","sourceSection":"scanFingerprint","status":"READY"},{"key":"module_map","sourceSection":"modules","status":"READY"},{"key":"risk_signal","sourceSection":"codeQuality.risks","status":"READY"},{"key":"scan_scope","sourceSection":"overview","status":"READY"},{"key":"test_signal","sourceSection":"overview","status":"READY"}],"overviewBound":true,"moduleMapBound":true,"apiDataSurfaceBound":true,"fingerprintBound":true,"riskSignalBound":true,"nextActionsBound":true,"noRawPromptOrAnswer":true,"providerQualityClaim":false,"llmFactClaim":false}}'
+  valid_report_quality_payload="$(
+    VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+const proof = payload.reportCitationQuality;
+proof.narrativeBindingStatus = "ALL_BOUND";
+proof.requiredNarrativeBindingCount = 6;
+proof.narrativeBindingCount = 6;
+proof.narrativeBindings = [
+  { key: "summary_risk_posture", sourceSection: "reportQuality.summary/codeQuality.risks", sourceMetric: "highRiskCount", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "high_risk_count", sourceSection: "codeQuality.risks", sourceMetric: "severity=HIGH", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "medium_risk_count", sourceSection: "codeQuality.risks", sourceMetric: "severity=MEDIUM", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "technical_debt_count", sourceSection: "technicalDebt", sourceMetric: "array.length", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "suggestion_count", sourceSection: "suggestions", sourceMetric: "array.length", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "next_actions_risk_priority", sourceSection: "reportQuality.nextActions/codeQuality.risks", sourceMetric: "risk-priority-action", reportedCount: 1, actualCount: 1, status: "BOUND" },
+];
+process.stdout.write(JSON.stringify(payload));
+NODE
+  )"
+  valid_code_understanding_payload='{"contractVersion":1,"status":"OK","probeKind":"METHOD_ANCHOR_STACK_TRACE","projectId":1,"scanTaskId":1,"source":"DB_SYMBOL","anchor":{"language":"Java","filePath":"src/main/java/DemoController.java","className":"DemoController","methodName":"list","methodLine":42,"startLine":42,"endLine":42},"methodSearch":{"queryShape":"class#method","responseScanTaskId":1,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedStartLine":41,"matchedEndLine":80,"matchedEvidenceType":"CONTROLLER"},"stackTraceSearch":{"queryShape":"java-stack-frame","stackClass":"DemoController","stackMethod":"list","stackFile":"DemoController.java","stackLine":42,"responseScanTaskId":1,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedStartLine":41,"matchedEndLine":80,"matchedEvidenceType":"CONTROLLER"},"codeQa":{"requestScanTaskId":1,"responseScanTaskId":1,"retrievalMode":"KEYWORD","resultCount":1,"primaryMatched":true,"firstPrimaryIndex":0,"firstPrimaryFile":"src/main/java/DemoController.java","firstPrimaryStartLine":41,"firstPrimaryEndLine":80,"firstPrimaryContextRole":"PRIMARY","firstPrimaryExactAnchorPreserved":true,"primaryFile":"src/main/java/DemoController.java","primaryStartLine":41,"primaryEndLine":80},"currentScanOnly":true,"noRawPromptOrAnswer":true,"providerQualityClaim":false,"llmFactClaim":false}'
+  valid_code_qa_payload="$(
+    VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const requiredCitationCoverageSatisfied = ["FULL", "REQUIRED_FULL"].includes(codeQa.citationCoverage.status);
+const summaryReady = requiredCitationCoverageSatisfied
+  && codeQa.citationCoverage.primaryEvidenceFileCount > 0
+  && codeQa.citationCoverage.citedPrimaryEvidenceFileCount >= codeQa.citationCoverage.primaryEvidenceFileCount
+  && codeQa.claimCitationCoverage.status === "READY"
+  && codeQa.claimCitationCoverage.citedRequiredClaimCount >= codeQa.claimCitationCoverage.requiredClaimCount
+  && codeQa.claimCitationCoverage.roleDistribution.requiredPrimaryBoundClaimCount >= codeQa.claimCitationCoverage.requiredClaimCount;
+codeQa.crossFileCitationSummary = {
+  visible: true,
+  tones: [summaryReady ? "ready" : "warning"],
+  statuses: [codeQa.citationCoverage.evidenceRoleDistribution.status],
+  crossFileEvidenceSatisfied: codeQa.citationCoverage.uniqueEvidenceFileCount >= 2,
+  citationBindingSatisfied: codeQa.citationCoverage.citedEvidenceFileCount > 0 && codeQa.citationCoverage.citedPrimaryEvidenceFileCount > 0,
+  claimBindingSatisfied: (
+    codeQa.claimCitationCoverage.status === "READY"
+    && codeQa.claimCitationCoverage.citedRequiredClaimCount >= codeQa.claimCitationCoverage.requiredClaimCount
+    && codeQa.claimCitationCoverage.roleDistribution.requiredPrimaryBoundClaimCount >= codeQa.claimCitationCoverage.requiredClaimCount
+  ),
+  coverageStatus: codeQa.citationCoverage.status,
+  fullCitationCoverageSatisfied: codeQa.citationCoverage.status === "FULL",
+  requiredCitationCoverageSatisfied,
+  primaryCoverageSatisfied: codeQa.citationCoverage.primaryEvidenceFileCount > 0
+    && codeQa.citationCoverage.citedPrimaryEvidenceFileCount >= codeQa.citationCoverage.primaryEvidenceFileCount,
+  currentScanOnly: true,
+  sourceEvidenceScopes: ["CODE_QA_RESULT"],
+  evidenceFileCount: codeQa.citationCoverage.uniqueEvidenceFileCount,
+  citedEvidenceFileCount: codeQa.citationCoverage.citedEvidenceFileCount,
+  primaryEvidenceFileCount: codeQa.citationCoverage.primaryEvidenceFileCount,
+  citedPrimaryEvidenceFileCount: codeQa.citationCoverage.citedPrimaryEvidenceFileCount,
+  contextEvidenceFileCount: codeQa.citationCoverage.contextEvidenceFileCount,
+  citedContextEvidenceFileCount: codeQa.citationCoverage.citedContextEvidenceFileCount,
+  requiredClaimCount: codeQa.claimCitationCoverage.requiredClaimCount,
+  requiredClaimCitationFileCount: codeQa.claimCitationCoverage.requiredClaimCitationFileCount,
+  requiredPrimaryFileCount: codeQa.claimCitationCoverage.roleDistribution.requiredPrimaryFileCount,
+  requiredPrimaryBoundClaimCount: codeQa.claimCitationCoverage.roleDistribution.requiredPrimaryBoundClaimCount,
+};
+codeQa.claimCitationNoiseBoundary = {
+  status: "OK",
+  mode: "auto",
+  probeKind: "REAL_PUBLIC_REPO_CODE_QA_CLAIM_CITATION_NOISE",
+  scanTaskId: 1,
+  requestScanTaskId: 1,
+  responseScanTaskId: 1,
+  resultCount: 1,
+  citationCount: 1,
+  noiseKinds: ["exception-line", "fenced-code", "inline-code", "timestamp-log"],
+  groundingStatuses: ["UNVERIFIED"],
+  citationEnforcementStatuses: ["RETRY_FAILED"],
+  coverageStatus: "NONE",
+  maxCitedEvidenceCount: 0,
+  maxRepairCandidateCount: 0,
+  claimCitationStatus: "REVIEW",
+  maxCitedRequiredClaimCount: 0,
+  maxInvalidCitationClaimCount: 0,
+  roleDistributionStatus: "REVIEW_UNCITED",
+  maxRequiredPrimaryBoundClaimCount: 0,
+  answerCitationsCitedByAnswer: false,
+  repairEvidenceGateBlockedVisible: true,
+  rawAnswerStored: false,
+  rawPromptStored: false,
+  rawRetrievedChunkContentAbsent: true,
+  contentPreviewMaxLength: 120,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+  mutationFree: true,
+  dbMutationUsed: false,
+};
+process.stdout.write(JSON.stringify(codeQa));
+NODE
+  )"
+  valid_report_evidence_qa_payload='{"status":"OK","surface":"PUBLIC_REPO_REPORT_EVIDENCE_QA_MULTI_ANCHOR","mode":"auto","scanTaskId":1,"sampleCount":2,"currentScanOnly":true,"samplingStrategy":"DIVERSE_FILE_THEN_REPORT_ORDER","targetSampleCount":4,"candidateCount":2,"uniqueFileCount":2,"sourceSectionCount":1,"diversityStatus":"MULTI_FILE","diversityFallbackUsed":false,"sourceSections":["apiRoutes"],"sourceEvidenceMatchTypes":["REPORT_LINE_ANCHOR"],"groundingStatuses":["VERIFIED"],"citationEnforcementStatuses":["DIRECT_VERIFIED"],"minRequiredEvidenceCoveragePercent":100,"minRequiredEvidenceCount":1,"minCitedRequiredEvidenceCount":1,"minPrimaryEvidenceCount":1,"minCitedPrimaryEvidenceCount":1,"claimCitationStatuses":["READY"],"minClaimCoveragePercent":100,"minRequiredClaimCount":1,"minCitedRequiredClaimCount":1,"roleDistributionStatuses":["PRIMARY_BOUND"],"minRequiredPrimaryBoundClaimCount":1,"minRequiredPrimaryFileCount":1,"lineAnchorCitationStatus":"ALL_SAMPLES_BOUND","lineAnchorBoundSampleCount":2,"minLineAnchorCitedCount":1,"minLineAnchorPrimaryCitedCount":1,"samples":[{"index":1,"sourceSection":"apiRoutes","sourceEvidenceMatchType":"REPORT_LINE_ANCHOR","requestScanTaskId":1,"responseScanTaskId":1,"filePath":"src/main/java/DemoController.java","lineNumber":42,"resultCount":1,"citationCount":1,"citedChunkCount":1,"lineAnchorCitationBound":true,"lineAnchorCitedCount":1,"lineAnchorPrimaryCitedCount":1,"lineAnchorCitationFilePath":"src/main/java/DemoController.java","lineAnchorCitationStartLine":41,"lineAnchorCitationEndLine":80,"lineAnchorCitationContextRole":"PRIMARY","requiredEvidenceCoveragePercent":100,"requiredEvidenceCount":1,"citedRequiredEvidenceCount":1,"primaryEvidenceCount":1,"citedPrimaryEvidenceCount":1,"evidenceRoleDistributionStatus":"PRIMARY_SINGLE_FILE","claimCitationStatus":"READY","claimCoveragePercent":100,"requiredClaimCount":1,"citedRequiredClaimCount":1,"roleDistributionStatus":"PRIMARY_BOUND","requiredPrimaryBoundClaimCount":1,"requiredPrimaryFileCount":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"DIRECT_VERIFIED","providerQualityClaim":false,"llmFactClaim":false},{"index":2,"sourceSection":"apiRoutes","sourceEvidenceMatchType":"REPORT_LINE_ANCHOR","requestScanTaskId":1,"responseScanTaskId":1,"filePath":"src/main/java/DemoService.java","lineNumber":64,"resultCount":1,"citationCount":1,"citedChunkCount":1,"lineAnchorCitationBound":true,"lineAnchorCitedCount":1,"lineAnchorPrimaryCitedCount":1,"lineAnchorCitationFilePath":"src/main/java/DemoService.java","lineAnchorCitationStartLine":61,"lineAnchorCitationEndLine":90,"lineAnchorCitationContextRole":"PRIMARY","requiredEvidenceCoveragePercent":100,"requiredEvidenceCount":1,"citedRequiredEvidenceCount":1,"primaryEvidenceCount":1,"citedPrimaryEvidenceCount":1,"evidenceRoleDistributionStatus":"PRIMARY_SINGLE_FILE","claimCitationStatus":"READY","claimCoveragePercent":100,"requiredClaimCount":1,"citedRequiredClaimCount":1,"roleDistributionStatus":"PRIMARY_BOUND","requiredPrimaryBoundClaimCount":1,"requiredPrimaryFileCount":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"DIRECT_VERIFIED","providerQualityClaim":false,"llmFactClaim":false}],"noRawPromptOrAnswer":true,"providerQualityClaim":false,"llmFactClaim":false}'
+  valid_report_evidence_qa_payload="$(
+    VALID_REPORT_EVIDENCE_QA_PAYLOAD="$valid_report_evidence_qa_payload" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_REPORT_EVIDENCE_QA_PAYLOAD);
+payload.evidenceRefModeStatus = "MIXED_LINE_AND_START_END";
+payload.evidenceRefModes = ["LINE_NUMBER", "START_END_ONLY"];
+payload.lineNumberSampleCount = 1;
+payload.startEndOnlySampleCount = 1;
+payload.lineNumberLineAnchorBoundSampleCount = 1;
+payload.startEndOnlyLineAnchorBoundSampleCount = 1;
+payload.narrativeCitationStatus = "ALL_SAMPLES_NARRATIVE_BOUND";
+payload.narrativeBoundSampleCount = payload.sampleCount;
+payload.minNarrativeEvidenceRefFieldCount = 6;
+payload.narrativeCheckKeys = ["api_data_surface"];
+payload.narrativeSectionBindingStatuses = ["BOUND"];
+payload.citationEnforcementReasons = ["DIRECT_VERIFIED"];
+payload.lineAnchorEvidenceReasonVisibleSampleCount = payload.sampleCount;
+payload.rawRetrievedChunkContentAbsentSampleCount = payload.sampleCount;
+payload.maxContentPreviewLength = 120;
+for (const sample of payload.samples) {
+  if (sample.index === 1) {
+    sample.evidenceRefMode = "LINE_NUMBER";
+    sample.evidenceRefLineNumberPresent = true;
+    sample.evidenceRefStartEndPresent = false;
+    sample.evidenceRefStartLine = null;
+    sample.evidenceRefEndLine = null;
+    sample.sourceEvidenceRefLineNumberPresent = true;
+    sample.sourceEvidenceRefStartEndPresent = false;
+    sample.sourceEvidenceRefStartLine = null;
+    sample.sourceEvidenceRefEndLine = null;
+  } else {
+    sample.evidenceRefMode = "START_END_ONLY";
+    sample.evidenceRefLineNumberPresent = false;
+    sample.evidenceRefStartEndPresent = true;
+    sample.evidenceRefStartLine = sample.lineNumber;
+    sample.evidenceRefEndLine = sample.lineNumber;
+    sample.sourceEvidenceRefLineNumberPresent = false;
+    sample.sourceEvidenceRefStartEndPresent = true;
+    sample.sourceEvidenceRefStartLine = sample.lineNumber;
+    sample.sourceEvidenceRefEndLine = sample.lineNumber;
+  }
+  sample.narrativeBound = true;
+  sample.narrativeCheckKey = "api_data_surface";
+  sample.narrativeSourceSection = sample.sourceSection;
+  sample.narrativeSectionBindingStatus = "BOUND";
+  sample.narrativeEvidenceRefFieldCount = 6;
+  sample.narrativeQuestionBound = true;
+  sample.narrativeRawTextStored = false;
+  sample.citationEnforcementReason = "DIRECT_VERIFIED";
+  sample.lineAnchorEvidenceReasonVisible = true;
+  sample.rawRetrievedChunkContentAbsent = true;
+  sample.contentPreviewMaxLength = 120;
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+  )"
+
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a package for public repo natural endpoint marker verification"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN {
+        OFS = "\t"
+      }
+      NR == 1 {
+        print
+        next
+      }
+      $2 == "public-repo-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge public repo smoke natural endpoint status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- FAIL `public-repo-smoke`: / && !changed {
+        print "- OK `public-repo-smoke`: Public repo analysis smoke (completed)"
+        changed = 1
+        next
+      }
+      /^- required_failures: `/ {
+        line = $0
+        sub(/^- required_failures: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- required_failures: `" line - 1 "`"
+        next
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge public repo smoke natural endpoint summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged public repo smoke natural endpoint OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged public repo smoke natural endpoint OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep public repo natural endpoint marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_public_repo_marker_payload '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"SOURCE","matchedReason":"fallback:class-role-name"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$valid_code_qa_payload"'}'; then
+      failure="could not write valid forged public repo smoke natural endpoint payload"
+    elif ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must accept valid public repo smoke natural endpoint payload"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! missing_raw_content_boundary_code_qa_payload="$(
+      VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+delete payload.rawRetrievedChunkContentAbsent;
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not forge Code QA payload without raw content boundary marker"
+    elif ! write_public_repo_marker_payload '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"SOURCE","matchedReason":"fallback:class-role-name"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$missing_raw_content_boundary_code_qa_payload"'}'; then
+      failure="could not write forged public repo smoke payload without raw content boundary marker"
+    elif run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must reject Code QA payload without raw content boundary marker"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! false_raw_content_boundary_code_qa_payload="$(
+      VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+payload.rawRetrievedChunkContentAbsent = false;
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not forge Code QA payload with false raw content boundary marker"
+    elif ! write_public_repo_marker_payload '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"SOURCE","matchedReason":"fallback:class-role-name"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$false_raw_content_boundary_code_qa_payload"'}'; then
+      failure="could not write forged public repo smoke payload with false raw content boundary marker"
+    elif run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must reject Code QA payload with false raw content boundary marker"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_public_repo_marker_payload '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"SOURCE","matchedReason":"fallback:class-role-name"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$valid_code_qa_payload"',"reportEvidenceQaCitationQuality":'"$valid_report_evidence_qa_payload"'}'; then
+      failure="could not write valid public repo report evidence QA citation payload"
+    elif ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must accept valid public repo report evidence QA citation payload"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! missing_reason_report_evidence_qa_payload="$(
+      VALID_REPORT_EVIDENCE_QA_PAYLOAD="$valid_report_evidence_qa_payload" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_REPORT_EVIDENCE_QA_PAYLOAD);
+delete payload.citationEnforcementReasons;
+for (const sample of payload.samples || []) {
+  delete sample.citationEnforcementReason;
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not forge public repo report evidence QA citation payload without reason codes"
+    elif ! write_public_repo_marker_payload '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"SOURCE","matchedReason":"fallback:class-role-name"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$valid_code_qa_payload"',"reportEvidenceQaCitationQuality":'"$missing_reason_report_evidence_qa_payload"'}'; then
+      failure="could not write forged public repo report evidence QA citation payload without reason codes"
+    elif run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must reject public repo report evidence QA citation payload without reason codes"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! mismatched_reason_report_evidence_qa_payload="$(
+      VALID_REPORT_EVIDENCE_QA_PAYLOAD="$valid_report_evidence_qa_payload" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_REPORT_EVIDENCE_QA_PAYLOAD);
+payload.citationEnforcementReasons = ["RETRY_VERIFIED"];
+for (const sample of payload.samples || []) {
+  sample.citationEnforcementReason = "DIRECT_VERIFIED";
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not forge public repo report evidence QA citation payload with mismatched reason set"
+    elif ! write_public_repo_marker_payload '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"SOURCE","matchedReason":"fallback:class-role-name"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$valid_code_qa_payload"',"reportEvidenceQaCitationQuality":'"$mismatched_reason_report_evidence_qa_payload"'}'; then
+      failure="could not write forged public repo report evidence QA citation payload with mismatched reason set"
+    elif run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must reject public repo report evidence QA citation payload with mismatched reason set"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! required_full_code_qa_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+codeQa.resultCount = 2;
+codeQa.uniqueFiles = 2;
+codeQa.citationCount = 2;
+codeQa.citedChunkCount = 1;
+codeQa.citationCoverage = {
+  status: "REQUIRED_FULL",
+  coveragePercent: 50,
+  totalEvidenceCount: 2,
+  citedEvidenceCount: 1,
+  uncitedCandidateCount: 1,
+  repairCandidateCount: 1,
+  uniqueEvidenceFileCount: 2,
+  citedEvidenceFileCount: 1,
+  primaryEvidenceFileCount: 1,
+  citedPrimaryEvidenceFileCount: 1,
+  contextEvidenceFileCount: 1,
+  citedContextEvidenceFileCount: 0,
+  evidenceRoleDistribution: {
+    status: "MIXED_PRIMARY_CONTEXT",
+    totalFileCount: 2,
+    citedFileCount: 1,
+    primaryFileCount: 1,
+    citedPrimaryFileCount: 1,
+    contextFileCount: 1,
+    citedContextFileCount: 0,
+    roleCount: 2,
+    fileEntryCount: 2,
+  },
+};
+codeQa.crossFileCitationSummary = {
+  ...codeQa.crossFileCitationSummary,
+  tones: ["ready"],
+  statuses: ["MIXED_PRIMARY_CONTEXT"],
+  crossFileEvidenceSatisfied: true,
+  citationBindingSatisfied: true,
+  claimBindingSatisfied: true,
+  coverageStatus: "REQUIRED_FULL",
+  fullCitationCoverageSatisfied: false,
+  requiredCitationCoverageSatisfied: true,
+  primaryCoverageSatisfied: true,
+  evidenceFileCount: 2,
+  citedEvidenceFileCount: 1,
+  primaryEvidenceFileCount: 1,
+  citedPrimaryEvidenceFileCount: 1,
+  contextEvidenceFileCount: 1,
+  citedContextEvidenceFileCount: 0,
+};
+process.stdout.write(JSON.stringify(codeQa));
+NODE
+    )"; then
+      failure="could not build REQUIRED_FULL raw Code QA payload"
+    elif ! write_public_repo_marker_payload '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"SOURCE","matchedReason":"fallback:class-role-name"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$required_full_code_qa_payload"'}'; then
+      failure="could not write REQUIRED_FULL public repo smoke payload"
+    elif ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must accept REQUIRED_FULL when primary evidence is fully cited and context evidence remains uncited"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! partial_primary_code_qa_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+codeQa.resultCount = 8;
+codeQa.readiness = "REVIEW";
+codeQa.confidence = 62;
+codeQa.uniqueFiles = 4;
+codeQa.citationCount = 8;
+codeQa.citedChunkCount = 1;
+codeQa.citationCoverage = {
+  status: "PARTIAL",
+  coveragePercent: 13,
+  totalEvidenceCount: 8,
+  citedEvidenceCount: 1,
+  uncitedCandidateCount: 7,
+  repairCandidateCount: 1,
+  uniqueEvidenceFileCount: 4,
+  citedEvidenceFileCount: 1,
+  primaryEvidenceFileCount: 4,
+  citedPrimaryEvidenceFileCount: 1,
+  contextEvidenceFileCount: 4,
+  citedContextEvidenceFileCount: 0,
+  evidenceRoleDistribution: {
+    status: "PRIMARY_CROSS_FILE",
+    totalFileCount: 4,
+    citedFileCount: 1,
+    primaryFileCount: 4,
+    citedPrimaryFileCount: 1,
+    contextFileCount: 4,
+    citedContextFileCount: 0,
+    roleCount: 2,
+    fileEntryCount: 4,
+  },
+};
+codeQa.crossFileCitationSummary.statuses = [codeQa.citationCoverage.evidenceRoleDistribution.status];
+codeQa.crossFileCitationSummary.tones = ["warning"];
+codeQa.crossFileCitationSummary.crossFileEvidenceSatisfied = true;
+codeQa.crossFileCitationSummary.coverageStatus = codeQa.citationCoverage.status;
+codeQa.crossFileCitationSummary.fullCitationCoverageSatisfied = false;
+codeQa.crossFileCitationSummary.requiredCitationCoverageSatisfied = false;
+codeQa.crossFileCitationSummary.primaryCoverageSatisfied = false;
+codeQa.crossFileCitationSummary.evidenceFileCount = codeQa.citationCoverage.uniqueEvidenceFileCount;
+codeQa.crossFileCitationSummary.citedEvidenceFileCount = codeQa.citationCoverage.citedEvidenceFileCount;
+codeQa.crossFileCitationSummary.primaryEvidenceFileCount = codeQa.citationCoverage.primaryEvidenceFileCount;
+codeQa.crossFileCitationSummary.citedPrimaryEvidenceFileCount = codeQa.citationCoverage.citedPrimaryEvidenceFileCount;
+codeQa.crossFileCitationSummary.contextEvidenceFileCount = codeQa.citationCoverage.contextEvidenceFileCount;
+codeQa.crossFileCitationSummary.citedContextEvidenceFileCount = codeQa.citationCoverage.citedContextEvidenceFileCount;
+process.stdout.write(JSON.stringify(codeQa));
+NODE
+    )"; then
+      failure="could not build partial primary raw Code QA payload"
+    elif ! write_public_repo_marker_payload '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"SOURCE","matchedReason":"fallback:class-role-name"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$partial_primary_code_qa_payload"'}'; then
+      failure="could not write partial primary public repo smoke payload"
+    elif ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must accept raw Code QA PARTIAL coverage when at least one primary file is cited and claim roleDistribution is PRIMARY_BOUND"
+    fi
+  fi
+  verify_public_repo_report_quality_rejects() {
+    local label="$1"
+    local mutation="$2"
+    local mutated_payload
+    if ! mutated_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" VALID_CROSS_FILE_PAYLOAD="$valid_cross_file_retrieval_payload" VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" MUTATION="$mutation" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const crossFileRetrievalProof = JSON.parse(process.env.VALID_CROSS_FILE_PAYLOAD);
+const reportQuality = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof,
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+  },
+  codeUnderstandingFixture,
+  codeQa,
+};
+const proof = payload.reportQuality.reportCitationQuality;
+switch (process.env.MUTATION) {
+  case "missing-report-quality":
+    delete payload.reportQuality;
+    break;
+  case "report-quality-array":
+    payload.reportQuality = [];
+    break;
+  case "bad-readiness":
+    payload.reportQuality.readiness = "DONE";
+    break;
+  case "low-confidence":
+    payload.reportQuality.confidence = 20;
+    break;
+  case "missing-citation-quality":
+    delete payload.reportQuality.reportCitationQuality;
+    break;
+  case "citation-quality-array":
+    payload.reportQuality.reportCitationQuality = [];
+    break;
+  case "bad-status":
+    proof.status = "SKIPPED";
+    break;
+  case "wrong-artifact":
+    proof.artifactType = "CODE_METRICS";
+    break;
+  case "scan-mismatch":
+    proof.scanTaskId = 2;
+    break;
+  case "required-count-drift":
+    proof.requiredCheckCount = 5;
+    break;
+  case "bound-count-drift":
+    proof.boundCheckCount = 5;
+    break;
+  case "missing-key":
+    proof.evidenceCheckKeys = proof.evidenceCheckKeys.filter(key => key !== "risk_signal");
+    break;
+  case "section-bindings-missing":
+    delete proof.sectionBindings;
+    break;
+  case "section-bindings-duplicate":
+    proof.sectionBindings[1].key = "scan_scope";
+    break;
+  case "wrong-section":
+    proof.sectionBindings.find(item => item.key === "api_data_surface").sourceSection = "overview";
+    break;
+  case "bad-binding-status":
+    proof.sectionBindings[0].status = "DONE";
+    break;
+  case "overview-unbound":
+    proof.overviewBound = false;
+    break;
+  case "module-unbound":
+    proof.moduleMapBound = false;
+    break;
+  case "api-unbound":
+    proof.apiDataSurfaceBound = false;
+    break;
+  case "fingerprint-unbound":
+    proof.fingerprintBound = false;
+    break;
+  case "risk-unbound":
+    proof.riskSignalBound = false;
+    break;
+  case "next-actions-unbound":
+    proof.nextActionsBound = false;
+    break;
+  case "narrative-status-missing":
+    delete proof.narrativeBindingStatus;
+    break;
+  case "narrative-count-drift":
+    proof.narrativeBindingCount = 5;
+    break;
+  case "narrative-bindings-missing":
+    delete proof.narrativeBindings;
+    break;
+  case "narrative-wrong-section":
+    proof.narrativeBindings.find(item => item.key === "technical_debt_count").sourceSection = "suggestions";
+    break;
+  case "narrative-count-mismatch":
+    proof.narrativeBindings.find(item => item.key === "high_risk_count").actualCount = 2;
+    break;
+  case "narrative-bad-status":
+    proof.narrativeBindings.find(item => item.key === "summary_risk_posture").status = "READY";
+    break;
+  case "raw-prompt":
+    proof.rawPrompt = "summarize repo with token secret";
+    break;
+  case "raw-answer-flag":
+    proof.noRawPromptOrAnswer = false;
+    break;
+  case "provider-claim":
+    proof.providerQualityClaim = true;
+    break;
+  case "llm-fact-claim":
+    proof.llmFactClaim = true;
+    break;
+  default:
+    throw new Error(`unknown mutation ${process.env.MUTATION}`);
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not build public repo report citation quality mutation: $label"
+      return
+    fi
+    verify_public_repo_marker_rejects "$label" "$mutated_payload"
+  }
+  for mutation in \
+    missing-report-quality \
+    report-quality-array \
+    bad-readiness \
+    low-confidence \
+    missing-citation-quality \
+    citation-quality-array \
+    bad-status \
+    wrong-artifact \
+    scan-mismatch \
+    required-count-drift \
+    bound-count-drift \
+    missing-key \
+    section-bindings-missing \
+    section-bindings-duplicate \
+    wrong-section \
+    bad-binding-status \
+    overview-unbound \
+    module-unbound \
+    api-unbound \
+    fingerprint-unbound \
+    risk-unbound \
+    next-actions-unbound \
+    narrative-status-missing \
+    narrative-count-drift \
+    narrative-bindings-missing \
+    narrative-wrong-section \
+    narrative-count-mismatch \
+    narrative-bad-status \
+    raw-prompt \
+    raw-answer-flag \
+    provider-claim \
+    llm-fact-claim; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_report_quality_rejects "report-citation-quality-${mutation}" "$mutation"
+    fi
+  done
+  verify_public_repo_report_evidence_qa_rejects() {
+    local label="$1"
+    local mutation="$2"
+    local mutated_payload
+    if ! mutated_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" VALID_CROSS_FILE_PAYLOAD="$valid_cross_file_retrieval_payload" VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" VALID_REPORT_EVIDENCE_QA_PAYLOAD="$valid_report_evidence_qa_payload" MUTATION="$mutation" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const crossFileRetrievalProof = JSON.parse(process.env.VALID_CROSS_FILE_PAYLOAD);
+const reportQuality = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+const reportEvidenceQaCitationQuality = JSON.parse(process.env.VALID_REPORT_EVIDENCE_QA_PAYLOAD);
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof,
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+  },
+  codeUnderstandingFixture,
+  codeQa,
+  reportEvidenceQaCitationQuality,
+};
+const proof = payload.reportEvidenceQaCitationQuality;
+switch (process.env.MUTATION) {
+  case "sample-count-one":
+    proof.sampleCount = 1;
+    break;
+  case "scan-mismatch":
+    proof.scanTaskId = 2;
+    break;
+  case "file-anchor":
+    proof.sourceEvidenceMatchTypes = ["REPORT_FILE_ANCHOR"];
+    proof.samples[0].sourceEvidenceMatchType = "REPORT_FILE_ANCHOR";
+    break;
+  case "coverage-under-100":
+    proof.minRequiredEvidenceCoveragePercent = 99;
+    proof.samples[0].requiredEvidenceCoveragePercent = 99;
+    break;
+  case "claim-review":
+    proof.claimCitationStatuses = ["REVIEW"];
+    proof.samples[0].claimCitationStatus = "REVIEW";
+    break;
+  case "role-context-only":
+    proof.roleDistributionStatuses = ["CONTEXT_ONLY"];
+    proof.samples[0].roleDistributionStatus = "CONTEXT_ONLY";
+    break;
+  case "missing-evidence-ref-mode-status":
+    delete proof.evidenceRefModeStatus;
+    break;
+  case "evidence-ref-mode-status-line-only":
+    proof.evidenceRefModeStatus = "LINE_NUMBER_ONLY";
+    break;
+  case "missing-start-end-only-sample":
+    proof.evidenceRefModes = ["LINE_NUMBER"];
+    proof.startEndOnlySampleCount = 0;
+    proof.startEndOnlyLineAnchorBoundSampleCount = 0;
+    proof.samples[1].evidenceRefMode = "LINE_NUMBER";
+    proof.samples[1].evidenceRefLineNumberPresent = true;
+    proof.samples[1].evidenceRefStartEndPresent = false;
+    proof.samples[1].sourceEvidenceRefLineNumberPresent = true;
+    proof.samples[1].sourceEvidenceRefStartEndPresent = false;
+    break;
+  case "start-end-only-line-number-present":
+    proof.samples[1].evidenceRefLineNumberPresent = true;
+    proof.samples[1].sourceEvidenceRefLineNumberPresent = true;
+    break;
+  case "start-end-only-range-miss":
+    proof.samples[1].evidenceRefStartLine = 1;
+    proof.samples[1].evidenceRefEndLine = 10;
+    break;
+  case "evidence-ref-mode-count-forged":
+    proof.lineNumberSampleCount = 2;
+    proof.startEndOnlySampleCount = 0;
+    break;
+  case "missing-line-anchor-citation-status":
+    delete proof.lineAnchorCitationStatus;
+    break;
+  case "sample-line-anchor-unbound":
+    proof.samples[0].lineAnchorCitationBound = false;
+    break;
+  case "line-anchor-file-mismatch":
+    proof.samples[0].lineAnchorCitationFilePath = "src/main/java/OtherController.java";
+    break;
+  case "line-anchor-range-miss":
+    proof.samples[0].lineAnchorCitationStartLine = 1;
+    proof.samples[0].lineAnchorCitationEndLine = 10;
+    break;
+  case "line-anchor-context-not-primary":
+    proof.samples[0].lineAnchorCitationContextRole = "ADJACENT_CONTEXT";
+    break;
+  case "line-anchor-count-zero":
+    proof.samples[0].lineAnchorCitedCount = 0;
+    break;
+  case "line-anchor-bound-count-forged":
+    proof.lineAnchorBoundSampleCount = 1;
+    break;
+  case "line-anchor-min-count-forged":
+    proof.minLineAnchorCitedCount = 2;
+    break;
+  case "missing-narrative-citation-status":
+    delete proof.narrativeCitationStatus;
+    break;
+  case "sample-narrative-unbound":
+    proof.samples[0].narrativeBound = false;
+    break;
+  case "narrative-check-key-forged":
+    proof.samples[0].narrativeCheckKey = "risk_signal";
+    break;
+  case "narrative-source-section-mismatch":
+    proof.samples[0].narrativeSourceSection = "codeQuality.risks";
+    break;
+  case "narrative-section-status-bad":
+    proof.samples[0].narrativeSectionBindingStatus = "READY";
+    break;
+  case "narrative-bound-count-forged":
+    proof.narrativeBoundSampleCount = 1;
+    break;
+  case "narrative-min-field-count-low":
+    proof.samples[0].narrativeEvidenceRefFieldCount = 5;
+    proof.minNarrativeEvidenceRefFieldCount = 5;
+    break;
+  case "narrative-question-unbound":
+    proof.samples[0].narrativeQuestionBound = false;
+    break;
+  case "narrative-raw-text-stored":
+    proof.samples[0].narrativeRawTextStored = true;
+    break;
+  case "sampling-strategy-drift":
+    proof.samplingStrategy = "REPORT_ORDER_ONLY";
+    break;
+  case "candidate-count-under-samples":
+    proof.candidateCount = 1;
+    break;
+  case "unique-file-count-forged":
+    proof.uniqueFileCount = 3;
+    break;
+  case "source-section-count-forged":
+    proof.sourceSectionCount = 2;
+    break;
+  case "single-file-status-for-multi-file":
+    proof.diversityStatus = "SINGLE_FILE";
+    break;
+  case "multi-file-status-for-single-file":
+    proof.uniqueFileCount = 1;
+    proof.diversityStatus = "MULTI_FILE";
+    proof.samples[1].filePath = proof.samples[0].filePath;
+    break;
+  case "diversity-fallback-forged":
+    proof.diversityFallbackUsed = true;
+    break;
+  case "raw-prompt":
+    proof.rawPrompt = "summarize with apiKey=leak";
+    break;
+  default:
+    throw new Error(`unknown mutation ${process.env.MUTATION}`);
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not build public repo report evidence QA citation mutation: $label"
+      return
+    fi
+    verify_public_repo_marker_rejects "$label" "$mutated_payload"
+  }
+  for mutation in \
+    sample-count-one \
+    scan-mismatch \
+    file-anchor \
+    coverage-under-100 \
+    claim-review \
+    role-context-only \
+    missing-evidence-ref-mode-status \
+    evidence-ref-mode-status-line-only \
+    missing-start-end-only-sample \
+    start-end-only-line-number-present \
+    start-end-only-range-miss \
+    evidence-ref-mode-count-forged \
+    missing-line-anchor-citation-status \
+    sample-line-anchor-unbound \
+    line-anchor-file-mismatch \
+    line-anchor-range-miss \
+    line-anchor-context-not-primary \
+    line-anchor-count-zero \
+    line-anchor-bound-count-forged \
+    line-anchor-min-count-forged \
+    missing-narrative-citation-status \
+    sample-narrative-unbound \
+    narrative-check-key-forged \
+    narrative-source-section-mismatch \
+    narrative-section-status-bad \
+    narrative-bound-count-forged \
+    narrative-min-field-count-low \
+    narrative-question-unbound \
+    narrative-raw-text-stored \
+    sampling-strategy-drift \
+    candidate-count-under-samples \
+    unique-file-count-forged \
+    source-section-count-forged \
+    single-file-status-for-multi-file \
+    multi-file-status-for-single-file \
+    diversity-fallback-forged \
+    raw-prompt; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_report_evidence_qa_rejects "report-evidence-qa-citation-${mutation}" "$mutation"
+    fi
+  done
+  verify_public_repo_cross_file_retrieval_rejects() {
+    local label="$1"
+    local mutation="$2"
+    local mutated_payload
+    if ! mutated_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" MUTATION="$mutation" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const reportQuality = {
+  readiness: "REVIEW",
+  confidence: 74,
+  gaps: 0,
+  nextActions: 1,
+  evidenceChecks: 6,
+  reportCitationQuality: {
+    status: "OK",
+    artifactType: "ARCHITECTURE_REPORT",
+    scanTaskId: 1,
+    requiredCheckCount: 6,
+    boundCheckCount: 6,
+    evidenceCheckKeys: ["api_data_surface", "fingerprint", "module_map", "risk_signal", "scan_scope", "test_signal"],
+    sectionBindings: [
+      { key: "api_data_surface", sourceSection: "apiRoutes/dbEntities", status: "READY" },
+      { key: "fingerprint", sourceSection: "scanFingerprint", status: "READY" },
+      { key: "module_map", sourceSection: "modules", status: "READY" },
+      { key: "risk_signal", sourceSection: "codeQuality.risks", status: "READY" },
+      { key: "scan_scope", sourceSection: "overview", status: "READY" },
+      { key: "test_signal", sourceSection: "overview", status: "READY" },
+    ],
+    overviewBound: true,
+    moduleMapBound: true,
+    apiDataSurfaceBound: true,
+    fingerprintBound: true,
+    riskSignalBound: true,
+    nextActionsBound: true,
+    narrativeBindingStatus: "ALL_BOUND",
+    requiredNarrativeBindingCount: 6,
+    narrativeBindingCount: 6,
+    narrativeBindings: [
+      { key: "summary_risk_posture", sourceSection: "reportQuality.summary/codeQuality.risks", sourceMetric: "highRiskCount", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "high_risk_count", sourceSection: "codeQuality.risks", sourceMetric: "severity=HIGH", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "medium_risk_count", sourceSection: "codeQuality.risks", sourceMetric: "severity=MEDIUM", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "technical_debt_count", sourceSection: "technicalDebt", sourceMetric: "array.length", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "suggestion_count", sourceSection: "suggestions", sourceMetric: "array.length", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "next_actions_risk_priority", sourceSection: "reportQuality.nextActions/codeQuality.risks", sourceMetric: "risk-priority-action", reportedCount: 1, actualCount: 1, status: "BOUND" },
+    ],
+    noRawPromptOrAnswer: true,
+    providerQualityClaim: false,
+    llmFactClaim: false,
+  },
+};
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof: {
+      status: "OK",
+      endpoint: "/api/projects/1/code-chunks/search",
+      query: "",
+      limit: 24,
+      responseScanTaskId: 1,
+      resultCount: 2,
+      totalChunks: 100,
+      embeddedChunks: 0,
+      uniqueFiles: 2,
+      currentScanOnly: true,
+      fileStatsVisible: true,
+      fileStatsUniqueFiles: 2,
+      fileDistribution: [
+        {
+          filePath: "src/main/java/DemoController.java",
+          resultCount: 1,
+          evidenceTypes: ["CONTROLLER"],
+          sourceLabelCount: 1,
+          minStartLine: 42,
+          maxEndLine: 80,
+        },
+        {
+          filePath: "src/main/java/DemoService.java",
+          resultCount: 1,
+          evidenceTypes: ["SERVICE"],
+          sourceLabelCount: 1,
+          minStartLine: 12,
+          maxEndLine: 34,
+        },
+      ],
+      fileDistributionSampleCount: 2,
+      sourceLabelsVisible: true,
+      retrievalMode: "STABLE_FALLBACK",
+      readiness: "REVIEW",
+      minFileEvidenceSatisfied: true,
+    },
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+  },
+  codeUnderstandingFixture,
+  codeQa,
+};
+const proof = payload.chunkSearch.crossFileRetrievalProof;
+switch (process.env.MUTATION) {
+  case "missing":
+    delete payload.chunkSearch.crossFileRetrievalProof;
+    break;
+  case "array":
+    payload.chunkSearch.crossFileRetrievalProof = [];
+    break;
+  case "bad-status":
+    proof.status = "FAIL";
+    break;
+  case "endpoint-path-drift":
+    proof.endpoint = "/api/projects/1/code-chunks/other";
+    break;
+  case "endpoint-project-mismatch":
+    proof.endpoint = "/api/projects/2/code-chunks/search";
+    break;
+  case "non-empty-query":
+    proof.query = "controller";
+    break;
+  case "limit-drift":
+    proof.limit = 10;
+    break;
+  case "scan-mismatch":
+    proof.responseScanTaskId = 2;
+    break;
+  case "result-one":
+    proof.resultCount = 1;
+    break;
+  case "total-zero":
+    proof.totalChunks = 0;
+    proof.embeddedChunks = 0;
+    break;
+  case "embedded-negative":
+    proof.embeddedChunks = -1;
+    break;
+  case "embedded-over-total":
+    proof.embeddedChunks = 101;
+    break;
+  case "unique-one":
+    proof.uniqueFiles = 1;
+    break;
+  case "foreign-scan":
+    proof.currentScanOnly = false;
+    break;
+  case "file-stats-hidden":
+    proof.fileStatsVisible = false;
+    break;
+  case "file-stats-one":
+    proof.fileStatsUniqueFiles = 1;
+    break;
+  case "missing-file-distribution":
+    delete proof.fileDistribution;
+    break;
+  case "file-distribution-count-one":
+    proof.fileDistributionSampleCount = 1;
+    proof.fileDistribution = [proof.fileDistribution[0]];
+    break;
+  case "file-distribution-count-mismatch":
+    proof.fileDistributionSampleCount = 3;
+    break;
+  case "file-distribution-unsafe-path":
+    proof.fileDistribution[0].filePath = "../DemoController.java";
+    break;
+  case "file-distribution-empty-evidence-types":
+    proof.fileDistribution[0].evidenceTypes = [];
+    break;
+  case "file-distribution-source-label-undercount":
+    proof.fileDistribution[0].sourceLabelCount = 0;
+    break;
+  case "file-distribution-invalid-line-range":
+    proof.fileDistribution[0].maxEndLine = proof.fileDistribution[0].minStartLine - 1;
+    break;
+  case "source-labels-hidden":
+    proof.sourceLabelsVisible = false;
+    break;
+  case "no-context-mode":
+    proof.retrievalMode = "NO_CONTEXT";
+    break;
+  case "unknown-mode":
+    proof.retrievalMode = "VECTOR_MAGIC";
+    break;
+  case "unknown-readiness":
+    proof.readiness = "UNKNOWN";
+    break;
+  case "min-file-unsatisfied":
+    proof.minFileEvidenceSatisfied = false;
+    break;
+  default:
+    throw new Error(`unknown mutation ${process.env.MUTATION}`);
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not build public repo cross-file retrieval proof mutation: $label"
+      return
+    fi
+    verify_public_repo_marker_rejects "$label" "$mutated_payload"
+  }
+  for mutation in \
+    missing \
+    array \
+    bad-status \
+    endpoint-path-drift \
+    endpoint-project-mismatch \
+    non-empty-query \
+    limit-drift \
+    scan-mismatch \
+    result-one \
+    total-zero \
+    embedded-negative \
+    embedded-over-total \
+    unique-one \
+    foreign-scan \
+    file-stats-hidden \
+    file-stats-one \
+    missing-file-distribution \
+    file-distribution-count-one \
+    file-distribution-count-mismatch \
+    file-distribution-unsafe-path \
+    file-distribution-empty-evidence-types \
+    file-distribution-source-label-undercount \
+    file-distribution-invalid-line-range \
+    source-labels-hidden \
+    no-context-mode \
+    unknown-mode \
+    unknown-readiness \
+    min-file-unsatisfied; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_cross_file_retrieval_rejects "cross-file-retrieval-${mutation}" "$mutation"
+    fi
+  done
+  verify_public_repo_code_understanding_rejects() {
+    local label="$1"
+    local mutation="$2"
+    local mutated_payload
+    if ! mutated_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" VALID_CROSS_FILE_PAYLOAD="$valid_cross_file_retrieval_payload" VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" MUTATION="$mutation" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const crossFileRetrievalProof = JSON.parse(process.env.VALID_CROSS_FILE_PAYLOAD);
+const reportQuality = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof,
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+  },
+  codeUnderstandingFixture,
+  codeQa,
+};
+const fixture = payload.codeUnderstandingFixture;
+switch (process.env.MUTATION) {
+  case "missing":
+    delete payload.codeUnderstandingFixture;
+    break;
+  case "array":
+    payload.codeUnderstandingFixture = [];
+    break;
+  case "skipped-status":
+    fixture.status = "SKIPPED";
+    fixture.reason = "no_java_method_anchor_candidate";
+    break;
+  case "bad-kind":
+    fixture.probeKind = "GENERAL_CODE_UNDERSTANDING";
+    break;
+  case "project-mismatch":
+    fixture.projectId = 2;
+    break;
+  case "scan-mismatch":
+    fixture.scanTaskId = 2;
+    break;
+  case "bad-source":
+    fixture.source = "LLM_SUMMARY";
+    break;
+  case "unsafe-path":
+    fixture.anchor.filePath = "../DemoController.java";
+    break;
+  case "method-line-zero":
+    fixture.anchor.methodLine = 0;
+    break;
+  case "anchor-line-outside":
+    fixture.anchor.methodLine = 120;
+    break;
+  case "method-scan-mismatch":
+    fixture.methodSearch.responseScanTaskId = 2;
+    break;
+  case "method-zero-result":
+    fixture.methodSearch.resultCount = 0;
+    break;
+  case "method-file-mismatch":
+    fixture.methodSearch.matchedFile = "src/main/java/OtherController.java";
+    break;
+  case "method-range-miss":
+    fixture.methodSearch.matchedStartLine = 1;
+    fixture.methodSearch.matchedEndLine = 10;
+    break;
+  case "method-front-end":
+    fixture.methodSearch.matchedEvidenceType = "FRONTEND";
+    break;
+  case "stack-line-mismatch":
+    fixture.stackTraceSearch.stackLine = 43;
+    break;
+  case "stack-file-mismatch":
+    fixture.stackTraceSearch.stackFile = "OtherController.java";
+    break;
+  case "stack-range-miss":
+    fixture.stackTraceSearch.matchedStartLine = 1;
+    fixture.stackTraceSearch.matchedEndLine = 10;
+    break;
+  case "qa-response-scan-mismatch":
+    fixture.codeQa.responseScanTaskId = 2;
+    break;
+  case "qa-no-context":
+    fixture.codeQa.retrievalMode = "NO_CONTEXT";
+    break;
+  case "qa-zero-result":
+    fixture.codeQa.resultCount = 0;
+    break;
+  case "qa-primary-unmatched":
+    fixture.codeQa.primaryMatched = false;
+    break;
+  case "qa-first-primary-exact-anchor-false":
+    fixture.codeQa.firstPrimaryExactAnchorPreserved = false;
+    break;
+  case "qa-first-primary-index-not-zero":
+    fixture.codeQa.firstPrimaryIndex = 1;
+    break;
+  case "qa-first-primary-context-not-primary":
+    fixture.codeQa.firstPrimaryContextRole = "ADJACENT_CONTEXT";
+    break;
+  case "qa-first-primary-file-mismatch":
+    fixture.codeQa.firstPrimaryFile = "src/main/java/OtherController.java";
+    break;
+  case "qa-first-primary-range-miss":
+    fixture.codeQa.firstPrimaryStartLine = 1;
+    fixture.codeQa.firstPrimaryEndLine = 10;
+    break;
+  case "qa-primary-file-mismatch":
+    fixture.codeQa.primaryFile = "src/main/java/OtherController.java";
+    break;
+  case "qa-primary-range-miss":
+    fixture.codeQa.primaryStartLine = 1;
+    fixture.codeQa.primaryEndLine = 10;
+    break;
+  case "raw-prompt":
+    fixture.rawPrompt = "explain this source with password=secret";
+    break;
+  case "raw-stack-query":
+    fixture.stackQuery = "at DemoController.list(DemoController.java:42)";
+    break;
+  case "provider-claim":
+    fixture.providerQualityClaim = true;
+    break;
+  case "llm-fact-claim":
+    fixture.llmFactClaim = true;
+    break;
+  default:
+    throw new Error(`unknown mutation ${process.env.MUTATION}`);
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not build public repo code understanding fixture mutation: $label"
+      return
+    fi
+    verify_public_repo_marker_rejects "$label" "$mutated_payload"
+  }
+  for mutation in \
+    missing \
+    array \
+    skipped-status \
+    bad-kind \
+    project-mismatch \
+    scan-mismatch \
+    bad-source \
+    unsafe-path \
+    method-line-zero \
+    anchor-line-outside \
+    method-scan-mismatch \
+    method-zero-result \
+    method-file-mismatch \
+    method-range-miss \
+    method-front-end \
+    stack-line-mismatch \
+    stack-file-mismatch \
+    stack-range-miss \
+    qa-response-scan-mismatch \
+    qa-no-context \
+    qa-zero-result \
+    qa-primary-unmatched \
+    qa-first-primary-exact-anchor-false \
+    qa-first-primary-index-not-zero \
+    qa-first-primary-context-not-primary \
+    qa-first-primary-file-mismatch \
+    qa-first-primary-range-miss \
+    qa-primary-file-mismatch \
+    qa-primary-range-miss \
+    raw-prompt \
+    raw-stack-query \
+    provider-claim \
+    llm-fact-claim; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_code_understanding_rejects "code-understanding-fixture-${mutation}" "$mutation"
+    fi
+  done
+  verify_public_repo_raw_code_qa_cross_file_summary_rejects() {
+    local label="$1"
+    local mutation="$2"
+    local mutated_payload
+    if ! mutated_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" VALID_CROSS_FILE_PAYLOAD="$valid_cross_file_retrieval_payload" VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" MUTATION="$mutation" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const crossFileRetrievalProof = JSON.parse(process.env.VALID_CROSS_FILE_PAYLOAD);
+const reportQuality = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof,
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+  },
+  codeUnderstandingFixture,
+  codeQa,
+};
+const summary = payload.codeQa.crossFileCitationSummary;
+switch (process.env.MUTATION) {
+  case "array":
+    payload.codeQa.crossFileCitationSummary = [];
+    break;
+  case "unknown-field":
+    summary.notes = "unexpected";
+    break;
+  case "raw-answer":
+    summary.rawAnswer = "secret answer";
+    break;
+  case "source-url":
+    summary.sourceUrl = "http://example.com/source";
+    break;
+  case "cross-file-forged":
+    summary.crossFileEvidenceSatisfied = true;
+    payload.codeQa.citationCoverage.uniqueEvidenceFileCount = 1;
+    break;
+  case "citation-binding-forged":
+    summary.citationBindingSatisfied = true;
+    payload.codeQa.citationCoverage.citedPrimaryEvidenceFileCount = 0;
+    break;
+  case "claim-binding-forged":
+    summary.claimBindingSatisfied = true;
+    payload.codeQa.claimCitationCoverage.status = "REVIEW";
+    break;
+  case "coverage-status-forged-full":
+    payload.codeQa.citationCoverage.status = "PARTIAL";
+    summary.coverageStatus = "FULL";
+    break;
+  case "full-coverage-forged":
+    summary.fullCitationCoverageSatisfied = true;
+    payload.codeQa.citationCoverage.status = "PARTIAL";
+    break;
+  case "required-coverage-forged":
+    summary.requiredCitationCoverageSatisfied = false;
+    break;
+  case "primary-coverage-complete-forged":
+    summary.primaryCoverageSatisfied = true;
+    payload.codeQa.citationCoverage.primaryEvidenceFileCount = 4;
+    payload.codeQa.citationCoverage.citedPrimaryEvidenceFileCount = 1;
+    break;
+  case "partial-coverage-ready-overclaim":
+    payload.codeQa.citationCoverage.status = "PARTIAL";
+    payload.codeQa.citationCoverage.primaryEvidenceFileCount = 4;
+    payload.codeQa.citationCoverage.citedPrimaryEvidenceFileCount = 1;
+    summary.coverageStatus = "PARTIAL";
+    summary.fullCitationCoverageSatisfied = false;
+    summary.requiredCitationCoverageSatisfied = false;
+    summary.primaryCoverageSatisfied = false;
+    summary.primaryEvidenceFileCount = 4;
+    summary.citedPrimaryEvidenceFileCount = 1;
+    summary.tones = ["ready"];
+    break;
+  case "role-binding-forged":
+    summary.claimBindingSatisfied = true;
+    payload.codeQa.claimCitationCoverage.roleDistribution.requiredPrimaryBoundClaimCount = 0;
+    break;
+  case "count-mismatch":
+    summary.evidenceFileCount = summary.evidenceFileCount + 1;
+    break;
+  case "primary-count-mismatch":
+    summary.citedPrimaryEvidenceFileCount = summary.citedPrimaryEvidenceFileCount + 1;
+    break;
+  case "claim-count-mismatch":
+    summary.requiredClaimCount = summary.requiredClaimCount + 1;
+    break;
+  case "current-scan-false":
+    summary.currentScanOnly = false;
+    break;
+  case "scope-forged":
+    summary.sourceEvidenceScopes = ["REPORT_LINE_ANCHOR"];
+    break;
+  case "tone-blocked":
+    summary.tones = ["blocked"];
+    break;
+  case "status-mismatch":
+    summary.statuses = ["CONTEXT_ONLY"];
+    break;
+  default:
+    throw new Error(`unknown mutation ${process.env.MUTATION}`);
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not build raw Code QA cross-file citation summary mutation: $label"
+      return
+    fi
+    verify_public_repo_marker_rejects "$label" "$mutated_payload"
+  }
+  for mutation in \
+    array \
+    unknown-field \
+    raw-answer \
+    source-url \
+    cross-file-forged \
+    citation-binding-forged \
+    claim-binding-forged \
+    coverage-status-forged-full \
+    full-coverage-forged \
+    required-coverage-forged \
+    primary-coverage-complete-forged \
+    partial-coverage-ready-overclaim \
+    role-binding-forged \
+    count-mismatch \
+    primary-count-mismatch \
+    claim-count-mismatch \
+    current-scan-false \
+    scope-forged \
+    tone-blocked \
+    status-mismatch; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_raw_code_qa_cross_file_summary_rejects "code-qa-cross-file-summary-${mutation}" "$mutation"
+    fi
+  done
+  verify_public_repo_source_location_rejects() {
+    local label="$1"
+    local mutation="$2"
+    local mutated_payload
+    if ! mutated_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" MUTATION="$mutation" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const reportQuality = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof: {
+      status: "OK",
+      endpoint: "/api/projects/1/code-chunks/search",
+      query: "",
+      limit: 24,
+      responseScanTaskId: 1,
+      resultCount: 2,
+      totalChunks: 100,
+      embeddedChunks: 0,
+      uniqueFiles: 2,
+      currentScanOnly: true,
+      fileStatsVisible: true,
+      fileStatsUniqueFiles: 2,
+      sourceLabelsVisible: true,
+      retrievalMode: "STABLE_FALLBACK",
+      readiness: "REVIEW",
+      minFileEvidenceSatisfied: true,
+    },
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+    sourceLocationProbeContractVersion: 4,
+    sourceLocationProbes: [
+      {
+        kind: "standaloneBrowserSourceUrl",
+        status: "OK",
+        matched: true,
+        queryShape: "source-url",
+        queryHadScheme: true,
+        queryHadViteQueryParam: false,
+        queryHadColumn: true,
+        queryHadWebpackScheme: false,
+        scanTaskId: 1,
+        targetFile: "src/main/java/DemoController.java",
+        targetLine: 42,
+        expectedPort: 3000,
+        expectedColumn: 17,
+        resultCount: 1,
+        firstResultIndex: 0,
+        firstResultFile: "src/main/java/DemoController.java",
+        firstResultStartLine: 41,
+        firstResultEndLine: 80,
+        firstResultEvidenceType: "CONTROLLER",
+        firstResultMatchesExactAnchor: true,
+        exactAnchorPreservedAsFirstResult: true,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedStartLine: 41,
+        matchedEndLine: 80,
+        matchedEvidenceType: "CONTROLLER",
+        devServerPortIgnored: true,
+      },
+      {
+        kind: "viteQuerySourceUrl",
+        status: "OK",
+        matched: true,
+        queryShape: "vite-query-source-url",
+        queryHadScheme: true,
+        queryHadViteQueryParam: true,
+        queryHadColumn: true,
+        queryHadWebpackScheme: false,
+        scanTaskId: 1,
+        targetFile: "src/main/java/DemoController.java",
+        targetLine: 42,
+        expectedPort: 5173,
+        expectedColumn: 19,
+        resultCount: 1,
+        firstResultIndex: 0,
+        firstResultFile: "src/main/java/DemoController.java",
+        firstResultStartLine: 41,
+        firstResultEndLine: 80,
+        firstResultEvidenceType: "CONTROLLER",
+        firstResultMatchesExactAnchor: true,
+        exactAnchorPreservedAsFirstResult: true,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedStartLine: 41,
+        matchedEndLine: 80,
+        matchedEvidenceType: "CONTROLLER",
+        devServerPortIgnored: true,
+      },
+      {
+        kind: "anonymousWebpackStackFrame",
+        status: "OK",
+        matched: true,
+        queryShape: "anonymous-stack-frame",
+        queryHadScheme: true,
+        queryHadViteQueryParam: false,
+        queryHadColumn: true,
+        queryHadWebpackScheme: true,
+        scanTaskId: 1,
+        targetFile: "src/main/java/DemoController.java",
+        targetLine: 42,
+        expectedColumn: 13,
+        resultCount: 1,
+        firstResultIndex: 0,
+        firstResultFile: "src/main/java/DemoController.java",
+        firstResultStartLine: 41,
+        firstResultEndLine: 80,
+        firstResultEvidenceType: "CONTROLLER",
+        firstResultMatchesExactAnchor: true,
+        exactAnchorPreservedAsFirstResult: true,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedStartLine: 41,
+        matchedEndLine: 80,
+        matchedEvidenceType: "CONTROLLER",
+        devServerPortIgnored: true,
+      },
+    ],
+  },
+  codeUnderstandingFixture,
+  codeQa,
+};
+const probes = payload.chunkSearch.sourceLocationProbes;
+switch (process.env.MUTATION) {
+  case "missing":
+    delete payload.chunkSearch.sourceLocationProbes;
+    delete payload.chunkSearch.sourceLocationProbeContractVersion;
+    break;
+  case "duplicate-kind":
+    probes[1].kind = "standaloneBrowserSourceUrl";
+    break;
+  case "missing-vite-kind":
+    probes.splice(1, 1);
+    break;
+  case "scan-mismatch":
+    probes[0].scanTaskId = 2;
+    break;
+  case "unsafe-path":
+    probes[0].targetFile = "../DemoController.java";
+    break;
+  case "matched-file-mismatch":
+    probes[0].matchedFile = "src/main/java/OtherController.java";
+    break;
+  case "line-outside-range":
+    probes[0].targetLine = 120;
+    break;
+  case "result-zero":
+    probes[0].resultCount = 0;
+    break;
+  case "matched-false":
+    probes[0].matched = false;
+    break;
+  case "port-treated-as-line":
+    probes[0].matchedStartLine = 2981;
+    probes[0].matchedEndLine = 3020;
+    probes[0].targetLine = 3000;
+    break;
+  case "vite-port-treated-as-line":
+    probes[1].matchedStartLine = 5160;
+    probes[1].matchedEndLine = 5180;
+    probes[1].targetLine = 5173;
+    break;
+  case "bad-evidence-type":
+    probes[0].matchedEvidenceType = "DOCUMENTATION";
+    break;
+	  case "vite-query-shape":
+	    probes[1].queryShape = "source-url";
+	    break;
+	  case "source-url-no-scheme":
+	    probes[0].queryHadScheme = false;
+	    break;
+	  case "source-url-no-column":
+	    probes[0].queryHadColumn = false;
+	    break;
+	  case "v3-missing-shape-proof":
+	    delete probes[1].queryHadScheme;
+	    delete probes[1].queryHadViteQueryParam;
+	    delete probes[1].queryHadColumn;
+	    delete probes[1].queryHadWebpackScheme;
+	    break;
+	  case "vite-no-query-param":
+	    probes[1].queryHadViteQueryParam = false;
+	    break;
+	  case "vite-webpack-claim":
+	    probes[1].queryHadWebpackScheme = true;
+	    break;
+	  case "webpack-no-scheme":
+	    probes[2].queryHadWebpackScheme = false;
+	    break;
+	  case "raw-url-recorded":
+	    probes[1].rawUrl = "http://localhost:5173/src/main/java/DemoController.java?t=secret-token:42:19";
+	    break;
+  case "first-result-file-mismatch":
+    probes[0].firstResultFile = "src/main/java/OtherController.java";
+    break;
+  case "first-result-line-miss":
+    probes[0].firstResultStartLine = 120;
+    probes[0].firstResultEndLine = 180;
+    break;
+  case "first-result-index-not-zero":
+    probes[0].firstResultIndex = 1;
+    break;
+  case "first-result-match-false":
+    probes[0].firstResultMatchesExactAnchor = false;
+    break;
+  case "exact-anchor-not-preserved":
+    probes[0].exactAnchorPreservedAsFirstResult = false;
+    break;
+  case "target-file-query":
+    probes[1].targetFile = "src/main/java/DemoController.java?t=1782991000000";
+    break;
+  default:
+    throw new Error(`unknown mutation ${process.env.MUTATION}`);
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not build public repo source location mutation: $label"
+      return
+    fi
+    if [[ "$mutation" == "missing" ]]; then
+      add_public_repo_marker_batch_payload_case "$batch_dir" "$label" "$mutated_payload" "pass"
+      return
+    fi
+    verify_public_repo_marker_rejects "$label" "$mutated_payload"
+  }
+  for mutation in \
+    duplicate-kind \
+    missing-vite-kind \
+    scan-mismatch \
+    unsafe-path \
+    matched-file-mismatch \
+    line-outside-range \
+    result-zero \
+    matched-false \
+    port-treated-as-line \
+    vite-port-treated-as-line \
+	    bad-evidence-type \
+	    vite-query-shape \
+	    source-url-no-scheme \
+	    source-url-no-column \
+	    v3-missing-shape-proof \
+	    vite-no-query-param \
+	    vite-webpack-claim \
+	    webpack-no-scheme \
+	    raw-url-recorded \
+	    first-result-file-mismatch \
+	    first-result-line-miss \
+	    first-result-index-not-zero \
+	    first-result-match-false \
+	    exact-anchor-not-preserved \
+	    target-file-query; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_source_location_rejects "source-location-${mutation}" "$mutation"
+    fi
+  done
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_source_location_rejects "source-location-missing-optional" "missing"
+  fi
+  verify_public_repo_code_qa_claim_role_rejects() {
+    local label="$1"
+    local mutation="$2"
+    local mutated_payload
+    if ! mutated_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" MUTATION="$mutation" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const reportQuality = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+switch (process.env.MUTATION) {
+  case "missing-claim-coverage":
+    delete codeQa.claimCitationCoverage;
+    break;
+  case "claim-coverage-review":
+    codeQa.claimCitationCoverage.status = "REVIEW";
+    break;
+  case "missing-role-distribution":
+    delete codeQa.claimCitationCoverage.roleDistribution;
+    break;
+  case "context-only-role-distribution":
+    codeQa.claimCitationCoverage.roleDistribution.status = "CONTEXT_ONLY";
+    break;
+  case "zero-primary-bound-claims":
+    codeQa.claimCitationCoverage.roleDistribution.requiredPrimaryBoundClaimCount = 0;
+    break;
+  case "zero-primary-files":
+    codeQa.claimCitationCoverage.roleDistribution.requiredPrimaryFileCount = 0;
+    break;
+  default:
+    throw new Error(`unknown mutation ${process.env.MUTATION}`);
+}
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof: {
+      status: "OK",
+      endpoint: "/api/projects/1/code-chunks/search",
+      query: "",
+      limit: 24,
+      responseScanTaskId: 1,
+      resultCount: 2,
+      totalChunks: 100,
+      embeddedChunks: 0,
+      uniqueFiles: 2,
+      currentScanOnly: true,
+      fileStatsVisible: true,
+      fileStatsUniqueFiles: 2,
+      sourceLabelsVisible: true,
+      retrievalMode: "STABLE_FALLBACK",
+      readiness: "REVIEW",
+      minFileEvidenceSatisfied: true,
+    },
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+  },
+  codeUnderstandingFixture,
+  codeQa,
+};
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not build public repo Code QA claim role mutation: $label"
+      return
+    fi
+    verify_public_repo_marker_rejects "$label" "$mutated_payload"
+  }
+  for mutation in \
+    missing-claim-coverage \
+    claim-coverage-review \
+    missing-role-distribution \
+    context-only-role-distribution \
+    zero-primary-bound-claims \
+    zero-primary-files; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_code_qa_claim_role_rejects "code-qa-${mutation}" "$mutation"
+    fi
+  done
+  verify_public_repo_code_qa_claim_noise_rejects() {
+    local label="$1"
+    local mutation="$2"
+    local mutated_payload
+    if ! mutated_payload="$(VALID_CODE_QA_PAYLOAD="$valid_code_qa_payload" VALID_CODE_UNDERSTANDING_PAYLOAD="$valid_code_understanding_payload" VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" MUTATION="$mutation" node <<'NODE'
+const codeQa = JSON.parse(process.env.VALID_CODE_QA_PAYLOAD);
+const codeUnderstandingFixture = JSON.parse(process.env.VALID_CODE_UNDERSTANDING_PAYLOAD);
+const reportQuality = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+switch (process.env.MUTATION) {
+  case "missing-optional":
+    delete codeQa.claimCitationNoiseBoundary;
+    break;
+  case "ready-forged":
+    codeQa.claimCitationNoiseBoundary.claimCitationStatus = "READY";
+    codeQa.claimCitationNoiseBoundary.roleDistributionStatus = "PRIMARY_BOUND";
+    break;
+  case "verified-forged":
+    codeQa.claimCitationNoiseBoundary.groundingStatuses = ["VERIFIED"];
+    break;
+  case "cited-evidence-forged":
+    codeQa.claimCitationNoiseBoundary.maxCitedEvidenceCount = 1;
+    break;
+  case "repair-forged":
+    codeQa.claimCitationNoiseBoundary.maxRepairCandidateCount = 1;
+    break;
+  case "unknown-kind-forged":
+    codeQa.claimCitationNoiseBoundary.noiseKinds = ["fenced-code", "unknown-noise"];
+    break;
+  case "raw-answer-forged":
+    codeQa.claimCitationNoiseBoundary.rawAnswer = "AuthService validates token [C1]";
+    break;
+  case "scan-mismatch":
+    codeQa.claimCitationNoiseBoundary.responseScanTaskId = 2;
+    break;
+  default:
+    throw new Error(`unknown mutation ${process.env.MUTATION}`);
+}
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof: {
+      status: "OK",
+      endpoint: "/api/projects/1/code-chunks/search",
+      query: "",
+      limit: 24,
+      responseScanTaskId: 1,
+      resultCount: 2,
+      totalChunks: 100,
+      embeddedChunks: 0,
+      uniqueFiles: 2,
+      currentScanOnly: true,
+      fileStatsVisible: true,
+      fileStatsUniqueFiles: 2,
+      sourceLabelsVisible: true,
+      retrievalMode: "STABLE_FALLBACK",
+      readiness: "REVIEW",
+      minFileEvidenceSatisfied: true,
+    },
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+  },
+  codeUnderstandingFixture,
+  codeQa,
+};
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not build public repo Code QA claim noise mutation: $label"
+      return
+    fi
+    if [[ "$mutation" == "missing-optional" ]]; then
+      add_public_repo_marker_batch_payload_case "$batch_dir" "$label" "$mutated_payload" "pass"
+      return
+    fi
+    verify_public_repo_marker_rejects "$label" "$mutated_payload"
+  }
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_code_qa_claim_noise_rejects "code-qa-claim-noise-missing-optional" "missing-optional"
+  fi
+  for mutation in \
+    ready-forged \
+    verified-forged \
+    cited-evidence-forged \
+    repair-forged \
+    unknown-kind-forged \
+    raw-answer-forged \
+    scan-mismatch; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_code_qa_claim_noise_rejects "code-qa-claim-noise-${mutation}" "$mutation"
+    fi
+  done
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "missing-code-qa" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "code-qa-unverified-grounding" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"UNVERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "code-qa-retry-failed" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"RETRY_FAILED","citationCount":1,"citedChunkCount":1}}'
+  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_marker_rejects \
+	      "code-qa-zero-cited-chunks" \
+	      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":0}}'
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_marker_rejects \
+	      "code-qa-missing-scan-task-bindings" \
+	      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1}}'
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_marker_rejects \
+	      "code-qa-citation-scan-task-mismatch" \
+	      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1,"citationCoverage":{"status":"FULL","coveragePercent":100,"totalEvidenceCount":1,"citedEvidenceCount":1,"uncitedCandidateCount":0,"repairCandidateCount":1},"citationScanTaskIds":[2],"citedAnswerScanTaskIds":[1],"retrievedChunkScanTaskIds":[1]}}'
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_marker_rejects \
+	      "code-qa-cited-answer-scan-task-mismatch" \
+	      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1,"citationCoverage":{"status":"FULL","coveragePercent":100,"totalEvidenceCount":1,"citedEvidenceCount":1,"uncitedCandidateCount":0,"repairCandidateCount":1},"citationScanTaskIds":[1],"citedAnswerScanTaskIds":[2],"retrievedChunkScanTaskIds":[1]}}'
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_marker_rejects \
+	      "code-qa-retrieved-chunk-scan-task-mismatch" \
+	      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1,"citationCoverage":{"status":"FULL","coveragePercent":100,"totalEvidenceCount":1,"citedEvidenceCount":1,"uncitedCandidateCount":0,"repairCandidateCount":1},"citationScanTaskIds":[1],"citedAnswerScanTaskIds":[1],"retrievedChunkScanTaskIds":[2]}}'
+	  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "missing-raw-scan-contract" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "missing-role-probes" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "missing-natural-endpoint-en" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "wrong-query" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"login endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "matched-false" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":false,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "result-count-zero" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":0,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "frontend-evidence" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/frontend/api.ts","matchedEvidenceType":"FRONTEND","matchedReason":"evidenceType:FRONTEND"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "unknown-reason" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"fallback:java-service-class"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "controller-reason-evidence-mismatch" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoService.java","matchedEvidenceType":"SERVICE","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_marker_rejects \
+      "duplicate-role" \
+      '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/OtherController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    add_public_repo_marker_batch_log_case \
+      "$batch_dir" \
+      "duplicate-public-repo-smoke-markers" \
+      "reject" \
+      "" \
+      "false" \
+      "false" \
+      "false" \
+      'PUBLIC_REPO_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1,"citationCoverage":{"status":"FULL","coveragePercent":100,"totalEvidenceCount":1,"citedEvidenceCount":1,"uncitedCandidateCount":0,"repairCandidateCount":1},"citationScanTaskIds":[1],"citedAnswerScanTaskIds":[1],"retrievedChunkScanTaskIds":[1]}}
+PUBLIC_REPO_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[]},"codeQa":{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1,"citationCoverage":{"status":"FULL","coveragePercent":100,"totalEvidenceCount":1,"citedEvidenceCount":1,"uncitedCandidateCount":0,"repairCandidateCount":1},"citationScanTaskIds":[1],"citedAnswerScanTaskIds":[1],"retrievedChunkScanTaskIds":[1]}}'
+  fi
+  if [[ -z "$failure" ]]; then
+    require_public_repo_source_location_gate_rejects_missing
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_public_repo_marker_batch "$batch_dir" "$batch_output_file"; then
+      cat "$batch_output_file" >&2
+      failure="public repo marker batch validation failed"
+    elif ! rg -q 'PUBLIC_REPO_MARKER_BATCH_OK' "$batch_output_file"; then
+      cat "$batch_output_file" >&2
+      failure="public repo marker batch validation must report a success marker"
+    fi
+  fi
+
+  cleanup_public_repo_natural_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_public_repo_weak_keyword_eval_forgery() {
+  local tmp_dir
+  local evidence_root
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local marker_output_file
+  local batch_dir
+  local batch_output_file
+  local valid_payload
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-public-repo-weak-keyword.XXXXXX")" \
+    || fail "could not create public repo weak keyword eval temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden public repo weak keyword eval temp dir"
+  evidence_root="$tmp_dir/evidence"
+  copy_public_repo_marker_base_fixture "$evidence_root"
+  run_id="$SECURITY_PUBLIC_REPO_MARKER_BASE_RUN_ID"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+  marker_output_file="$tmp_dir/verify-release-evidence-marker-output.txt"
+  batch_dir="$tmp_dir/public-repo-weak-keyword-batch"
+  batch_output_file="$tmp_dir/public-repo-weak-keyword-batch-output.txt"
+  init_public_repo_marker_batch "$batch_dir"
+
+  cleanup_public_repo_weak_keyword_eval_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  public_repo_weak_keyword_eval_payload() {
+    local mutation="${1:-valid}"
+    node - "$mutation" <<'NODE'
+const mutation = process.argv[2];
+const reportQuality = {
+  readiness: "REVIEW",
+  confidence: 74,
+  gaps: 0,
+  nextActions: 1,
+  evidenceChecks: 6,
+  reportCitationQuality: {
+    status: "OK",
+    artifactType: "ARCHITECTURE_REPORT",
+    scanTaskId: 1,
+    requiredCheckCount: 6,
+    boundCheckCount: 6,
+    evidenceCheckKeys: ["api_data_surface", "fingerprint", "module_map", "risk_signal", "scan_scope", "test_signal"],
+    sectionBindings: [
+      { key: "api_data_surface", sourceSection: "apiRoutes/dbEntities", status: "READY" },
+      { key: "fingerprint", sourceSection: "scanFingerprint", status: "READY" },
+      { key: "module_map", sourceSection: "modules", status: "READY" },
+      { key: "risk_signal", sourceSection: "codeQuality.risks", status: "READY" },
+      { key: "scan_scope", sourceSection: "overview", status: "READY" },
+      { key: "test_signal", sourceSection: "overview", status: "READY" },
+    ],
+    overviewBound: true,
+    moduleMapBound: true,
+    apiDataSurfaceBound: true,
+    fingerprintBound: true,
+    riskSignalBound: true,
+    nextActionsBound: true,
+    narrativeBindingStatus: "ALL_BOUND",
+    requiredNarrativeBindingCount: 6,
+    narrativeBindingCount: 6,
+    narrativeBindings: [
+      { key: "summary_risk_posture", sourceSection: "reportQuality.summary/codeQuality.risks", sourceMetric: "highRiskCount", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "high_risk_count", sourceSection: "codeQuality.risks", sourceMetric: "severity=HIGH", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "medium_risk_count", sourceSection: "codeQuality.risks", sourceMetric: "severity=MEDIUM", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "technical_debt_count", sourceSection: "technicalDebt", sourceMetric: "array.length", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "suggestion_count", sourceSection: "suggestions", sourceMetric: "array.length", reportedCount: 1, actualCount: 1, status: "BOUND" },
+      { key: "next_actions_risk_priority", sourceSection: "reportQuality.nextActions/codeQuality.risks", sourceMetric: "risk-priority-action", reportedCount: 1, actualCount: 1, status: "BOUND" },
+    ],
+    noRawPromptOrAnswer: true,
+    providerQualityClaim: false,
+    llmFactClaim: false,
+  },
+};
+const payload = {
+  projectId: 1,
+  repositoryId: 1,
+  scanTaskId: 1,
+  rawScanContract: {
+    schemaVersion: 2,
+    language: "Java",
+    symbols: 1,
+    graphNodes: 1,
+    totalFiles: 1,
+    apiRoutes: 0,
+    entities: 0,
+  },
+  reportQuality,
+  chunkSearch: {
+    crossFileRetrievalProof: {
+      status: "OK",
+      endpoint: "/api/projects/1/code-chunks/search",
+      query: "",
+      limit: 24,
+      responseScanTaskId: 1,
+      resultCount: 2,
+      totalChunks: 100,
+      embeddedChunks: 0,
+      uniqueFiles: 2,
+      currentScanOnly: true,
+      fileStatsVisible: true,
+      fileStatsUniqueFiles: 2,
+      sourceLabelsVisible: true,
+      retrievalMode: "STABLE_FALLBACK",
+      readiness: "REVIEW",
+      minFileEvidenceSatisfied: true,
+    },
+    roleProbes: [
+      {
+        role: "naturalEndpointCn",
+        query: "业务接口",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+      {
+        role: "naturalEndpointEn",
+        query: "business endpoint",
+        status: "OK",
+        matched: true,
+        resultCount: 1,
+        matchedFile: "src/main/java/DemoController.java",
+        matchedEvidenceType: "CONTROLLER",
+        matchedReason: "evidenceType:CONTROLLER",
+      },
+    ],
+  },
+  codeUnderstandingFixture: {
+    contractVersion: 1,
+    status: "OK",
+    probeKind: "METHOD_ANCHOR_STACK_TRACE",
+    projectId: 1,
+    scanTaskId: 1,
+    source: "DB_SYMBOL",
+    anchor: {
+      language: "Java",
+      filePath: "src/main/java/DemoController.java",
+      className: "DemoController",
+      methodName: "list",
+      methodLine: 42,
+      startLine: 42,
+      endLine: 42,
+    },
+    methodSearch: {
+      queryShape: "class#method",
+      responseScanTaskId: 1,
+      resultCount: 1,
+      matchedFile: "src/main/java/DemoController.java",
+      matchedStartLine: 41,
+      matchedEndLine: 80,
+      matchedEvidenceType: "CONTROLLER",
+    },
+    stackTraceSearch: {
+      queryShape: "java-stack-frame",
+      stackClass: "DemoController",
+      stackMethod: "list",
+      stackFile: "DemoController.java",
+      stackLine: 42,
+      responseScanTaskId: 1,
+      resultCount: 1,
+      matchedFile: "src/main/java/DemoController.java",
+      matchedStartLine: 41,
+      matchedEndLine: 80,
+      matchedEvidenceType: "CONTROLLER",
+    },
+    codeQa: {
+      requestScanTaskId: 1,
+      responseScanTaskId: 1,
+      retrievalMode: "KEYWORD",
+      resultCount: 1,
+      primaryMatched: true,
+      firstPrimaryIndex: 0,
+      firstPrimaryFile: "src/main/java/DemoController.java",
+      firstPrimaryStartLine: 41,
+      firstPrimaryEndLine: 80,
+      firstPrimaryContextRole: "PRIMARY",
+      firstPrimaryExactAnchorPreserved: true,
+      primaryFile: "src/main/java/DemoController.java",
+      primaryStartLine: 41,
+      primaryEndLine: 80,
+    },
+    currentScanOnly: true,
+    noRawPromptOrAnswer: true,
+    providerQualityClaim: false,
+    llmFactClaim: false,
+  },
+  codeQa: {
+    retrievalMode: "KEYWORD",
+    resultCount: 1,
+    readiness: "READY",
+    confidence: 90,
+    uniqueFiles: 1,
+    rawRetrievedChunkContentAbsent: true,
+    contentPreviewMaxLength: 120,
+    groundingStatus: "VERIFIED",
+	    citationEnforcementStatus: "FALLBACK_CITED",
+	    citationCount: 1,
+	    citedChunkCount: 1,
+	    citationCoverage: {
+	      status: "FULL",
+	      coveragePercent: 100,
+	      totalEvidenceCount: 1,
+	      citedEvidenceCount: 1,
+	      uncitedCandidateCount: 0,
+	      repairCandidateCount: 1,
+	      uniqueEvidenceFileCount: 1,
+	      citedEvidenceFileCount: 1,
+	      primaryEvidenceFileCount: 1,
+	      citedPrimaryEvidenceFileCount: 1,
+	      contextEvidenceFileCount: 0,
+	      citedContextEvidenceFileCount: 0,
+	      evidenceRoleDistribution: {
+	        status: "PRIMARY_SINGLE_FILE",
+	        totalFileCount: 1,
+	        citedFileCount: 1,
+	        primaryFileCount: 1,
+	        citedPrimaryFileCount: 1,
+	        contextFileCount: 0,
+	        citedContextFileCount: 0,
+	        roleCount: 1,
+	        fileEntryCount: 1,
+	      },
+	    },
+	    claimCitationCoverage: {
+	      status: "READY",
+	      readyForRepair: true,
+	      readinessReason: "PRIMARY_BOUND_READY",
+	      claimCoveragePercent: 100,
+	      requiredClaimCount: 1,
+	      citedRequiredClaimCount: 1,
+	      uncitedRequiredClaimCount: 0,
+	      invalidCitationClaimCount: 0,
+	      validCitationFileCount: 1,
+	      requiredClaimCitationFileCount: 1,
+	      roleDistribution: {
+	        status: "PRIMARY_BOUND",
+	        requiredClaimCount: 1,
+	        requiredPrimaryBoundClaimCount: 1,
+	        requiredContextOnlyClaimCount: 0,
+	        requiredUnknownOnlyClaimCount: 0,
+	        unbackedRequiredClaimCount: 0,
+	        invalidRequiredClaimCount: 0,
+	        validCitationFileCount: 1,
+	        requiredClaimCitationFileCount: 1,
+	        requiredPrimaryFileCount: 1,
+	        roleCount: 1,
+	        fileEntryCount: 1,
+	      },
+	    },
+	    citationScanTaskIds: [1],
+    citedAnswerScanTaskIds: [1],
+    retrievedChunkScanTaskIds: [1],
+  },
+  projectQaWeakKeywordEvaluation: {
+    status: "OK",
+    mode: "true",
+    probeKind: "REAL_WEAK_KEYWORD_SAMPLE_EVAL",
+    sampleSet: "default-public-repo-low-keyword",
+    sampleCount: 2,
+    weakKeywordThreshold: 45,
+    semanticPoolLimit: 500,
+    mutationFree: true,
+    nonDbMutation: true,
+    dbMutationUsed: false,
+    providerQualityClaim: false,
+    rawRetrievedChunkContentAbsentCaseCount: 2,
+    maxContentPreviewLength: 120,
+    minSemanticFallbackHits: 1,
+    projectId: 1,
+    scanTaskId: 1,
+    evaluatedCount: 2,
+    skippedCount: 0,
+    semanticFallbackHits: 1,
+    intentRoleBoundHits: 0,
+    qualityMode: "SEMANTIC_FALLBACK",
+    lowKeywordCases: 2,
+    retrievalModeDistribution: {
+      SEMANTIC_FALLBACK: 1,
+      KEYWORD: 1,
+    },
+    totalChunks: 10,
+    embeddedChunks: 5,
+    embeddingCoverage: 50,
+    recommendation: "FOCUSED_OBSERVATION_ONLY",
+    llmSetup: {
+      status: "OK",
+      provider: "MOCK",
+    },
+    llmCleanup: {
+      status: "OK",
+    },
+    boundary: "Focused weak keyword semantic fallback observability only.",
+    cases: [
+      {
+        sampleId: "worker-tools-policy",
+        question: "子任务可以使用哪些能力在哪里判断",
+        intent: "agent-coordination",
+        responseStatus: "OK",
+        scanTaskId: 1,
+        retrievalMode: "SEMANTIC_FALLBACK",
+        matchedChunks: 0,
+        resultCount: 1,
+        embeddedChunks: 5,
+        totalChunks: 10,
+        rawRetrievedChunkContentAbsent: true,
+        contentPreviewMaxLength: 120,
+        retrievedChunkScanTaskIds: [1],
+        thresholdBucket: "WEAK_LT_45",
+        observation: "SEMANTIC_AVAILABLE",
+        expectedFallbackPrimaryRoles: ["SERVICE"],
+        intentRoleBoundPrimary: false,
+        primary: {
+          id: 10,
+          filePath: "src/main/java/DemoController.java",
+          startLine: 1,
+          endLine: 5,
+          contextRole: "PRIMARY",
+          hasEmbedding: true,
+          score: 0.91,
+        },
+      },
+      {
+        sampleId: "query-run-config",
+        question: "运行时固定配置在哪里准备",
+        intent: "runtime-config",
+        responseStatus: "OK",
+        scanTaskId: 1,
+        retrievalMode: "KEYWORD",
+        matchedChunks: 1,
+        resultCount: 1,
+        embeddedChunks: 5,
+        totalChunks: 10,
+        rawRetrievedChunkContentAbsent: true,
+        contentPreviewMaxLength: 120,
+        retrievedChunkScanTaskIds: [1],
+        thresholdBucket: "KEYWORD",
+        observation: "KEYWORD_AVAILABLE",
+        expectedFallbackPrimaryRoles: ["CONFIG"],
+        intentRoleBoundPrimary: false,
+      },
+    ],
+  },
+};
+
+switch (mutation) {
+  case "valid":
+    break;
+  case "db-mutation-used":
+    payload.projectQaWeakKeywordEvaluation.dbMutationUsed = true;
+    break;
+  case "provider-quality-claim":
+    payload.projectQaWeakKeywordEvaluation.providerQualityClaim = true;
+    break;
+  case "zero-semantic-fallback":
+    payload.projectQaWeakKeywordEvaluation.semanticFallbackHits = 0;
+    payload.projectQaWeakKeywordEvaluation.retrievalModeDistribution.SEMANTIC_FALLBACK = 0;
+    payload.projectQaWeakKeywordEvaluation.cases[0].retrievalMode = "KEYWORD";
+    break;
+  case "scan-task-mismatch":
+    payload.projectQaWeakKeywordEvaluation.scanTaskId = 2;
+    break;
+  case "cleanup-warning":
+    payload.projectQaWeakKeywordEvaluation.llmCleanup.status = "WARN";
+    break;
+  case "case-scan-task-mismatch":
+    payload.projectQaWeakKeywordEvaluation.cases[0].retrievedChunkScanTaskIds = [2];
+    break;
+  case "matched-chunks-on-semantic":
+    payload.projectQaWeakKeywordEvaluation.cases[0].matchedChunks = 1;
+    break;
+  case "primary-not-embedded":
+    payload.projectQaWeakKeywordEvaluation.cases[0].primary.hasEmbedding = false;
+    break;
+  case "non-ok-claims-hits":
+    payload.projectQaWeakKeywordEvaluation.status = "INCONCLUSIVE";
+    payload.projectQaWeakKeywordEvaluation.reason = "no embedding coverage";
+    break;
+  default:
+    throw new Error(`unknown mutation: ${mutation}`);
+}
+
+process.stdout.write(JSON.stringify(payload));
+NODE
+  }
+
+  write_public_repo_marker_payload() {
+    local payload="$1"
+    printf 'PUBLIC_REPO_SMOKE_OK %s\n' "$payload" > "$run_dir/public-repo-smoke.log" \
+      || return 1
+    chmod 600 "$run_dir/public-repo-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  verify_public_repo_weak_keyword_eval_rejects() {
+    local mutation="$1"
+    local payload
+    payload="$(public_repo_weak_keyword_eval_payload "$mutation")" || {
+      failure="could not build public repo weak keyword eval payload for $mutation"
+      return
+    }
+    add_public_repo_marker_batch_payload_case \
+      "$batch_dir" \
+      "weak-keyword-${mutation}" \
+      "$payload" \
+      "reject" \
+      "projectQaWeakKeywordEvaluation"
+  }
+
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a package for public repo weak keyword eval marker verification"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN {
+        OFS = "\t"
+      }
+      NR == 1 {
+        print
+        next
+      }
+      $2 == "public-repo-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge public repo weak keyword eval status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- FAIL `public-repo-smoke`: / && !changed {
+        print "- OK `public-repo-smoke`: Public repo analysis smoke (completed)"
+        changed = 1
+        next
+      }
+      /^- required_failures: `/ {
+        line = $0
+        sub(/^- required_failures: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- required_failures: `" line - 1 "`"
+        next
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge public repo weak keyword eval summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged public repo weak keyword eval OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged public repo weak keyword eval OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep public repo weak keyword eval marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    valid_payload="$(public_repo_weak_keyword_eval_payload valid)" \
+      || failure="could not build valid public repo weak keyword eval payload"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_public_repo_marker_payload "$valid_payload"; then
+      failure="could not write valid public repo weak keyword eval payload"
+    elif ! run_verify_release_evidence "$run_dir" > "$marker_output_file" 2>&1; then
+      cat "$marker_output_file" >&2
+      failure="release evidence verifier must accept valid optional public repo weak keyword eval marker"
+    fi
+  fi
+
+  for mutation in \
+    db-mutation-used \
+    provider-quality-claim \
+    zero-semantic-fallback \
+    scan-task-mismatch \
+    cleanup-warning \
+    case-scan-task-mismatch \
+    matched-chunks-on-semantic \
+    primary-not-embedded \
+    non-ok-claims-hits; do
+    if [[ -z "$failure" ]]; then
+      verify_public_repo_weak_keyword_eval_rejects "$mutation"
+    fi
+  done
+  if [[ -z "$failure" ]]; then
+    if ! run_public_repo_marker_batch "$batch_dir" "$batch_output_file"; then
+      cat "$batch_output_file" >&2
+      failure="public repo weak keyword marker batch validation failed"
+    elif ! rg -q 'PUBLIC_REPO_MARKER_BATCH_OK' "$batch_output_file"; then
+      cat "$batch_output_file" >&2
+      failure="public repo weak keyword marker batch validation must report a success marker"
+    fi
+  fi
+
+  cleanup_public_repo_weak_keyword_eval_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_public_repo_ui_smoke_marker_forgery() {
+  local tmp_dir
+  local evidence_root
+  local probe_suffix
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local release_code
+	  local failure=""
+	  local valid_main_payload
+	  local valid_ui_payload
+	  local valid_governance_timeline_payload
+	  local valid_code_knowledge_payload
+	  local valid_code_qa_payload
+	  local valid_cross_file_retrieval_payload
+	  local valid_report_quality_payload
+	  local valid_code_understanding_payload
+	  local valid_code_understanding_lens_payload
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-public-repo-ui-marker.XXXXXX")" \
+    || fail "could not create public repo UI marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden public repo UI marker probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="public-repo-ui-${probe_suffix}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+
+  cleanup_public_repo_ui_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+	  valid_code_qa_payload='{"retrievalMode":"KEYWORD","resultCount":1,"readiness":"READY","confidence":90,"uniqueFiles":1,"groundingStatus":"VERIFIED","citationEnforcementStatus":"FALLBACK_CITED","citationCount":1,"citedChunkCount":1,"citationCoverage":{"status":"FULL","coveragePercent":100,"totalEvidenceCount":1,"citedEvidenceCount":1,"uncitedCandidateCount":0,"repairCandidateCount":1,"uniqueEvidenceFileCount":1,"citedEvidenceFileCount":1,"primaryEvidenceFileCount":1,"citedPrimaryEvidenceFileCount":1,"contextEvidenceFileCount":0,"citedContextEvidenceFileCount":0,"evidenceRoleDistribution":{"status":"PRIMARY_SINGLE_FILE","totalFileCount":1,"citedFileCount":1,"primaryFileCount":1,"citedPrimaryFileCount":1,"contextFileCount":0,"citedContextFileCount":0,"roleCount":1,"fileEntryCount":1}},"claimCitationCoverage":{"status":"READY","readyForRepair":true,"readinessReason":"PRIMARY_BOUND_READY","claimCoveragePercent":100,"requiredClaimCount":1,"citedRequiredClaimCount":1,"uncitedRequiredClaimCount":0,"invalidCitationClaimCount":0,"validCitationFileCount":1,"requiredClaimCitationFileCount":1,"roleDistribution":{"status":"PRIMARY_BOUND","requiredClaimCount":1,"requiredPrimaryBoundClaimCount":1,"requiredContextOnlyClaimCount":0,"requiredUnknownOnlyClaimCount":0,"unbackedRequiredClaimCount":0,"invalidRequiredClaimCount":0,"validCitationFileCount":1,"requiredClaimCitationFileCount":1,"requiredPrimaryFileCount":1,"roleCount":1,"fileEntryCount":1}},"citationScanTaskIds":[1],"citedAnswerScanTaskIds":[1],"retrievedChunkScanTaskIds":[1]}'
+	  valid_cross_file_retrieval_payload='{"status":"OK","endpoint":"/api/projects/1/code-chunks/search","query":"","limit":24,"responseScanTaskId":1,"resultCount":2,"totalChunks":100,"embeddedChunks":0,"uniqueFiles":2,"currentScanOnly":true,"fileStatsVisible":true,"fileStatsUniqueFiles":2,"sourceLabelsVisible":true,"retrievalMode":"STABLE_FALLBACK","readiness":"GAP","minFileEvidenceSatisfied":true}'
+	  valid_report_quality_payload='{"readiness":"REVIEW","confidence":74,"gaps":0,"nextActions":1,"evidenceChecks":6,"reportCitationQuality":{"status":"OK","artifactType":"ARCHITECTURE_REPORT","scanTaskId":1,"requiredCheckCount":6,"boundCheckCount":6,"evidenceCheckKeys":["api_data_surface","fingerprint","module_map","risk_signal","scan_scope","test_signal"],"sectionBindings":[{"key":"api_data_surface","sourceSection":"apiRoutes/dbEntities","status":"READY"},{"key":"fingerprint","sourceSection":"scanFingerprint","status":"READY"},{"key":"module_map","sourceSection":"modules","status":"READY"},{"key":"risk_signal","sourceSection":"codeQuality.risks","status":"READY"},{"key":"scan_scope","sourceSection":"overview","status":"READY"},{"key":"test_signal","sourceSection":"overview","status":"READY"}],"overviewBound":true,"moduleMapBound":true,"apiDataSurfaceBound":true,"fingerprintBound":true,"riskSignalBound":true,"nextActionsBound":true,"noRawPromptOrAnswer":true,"providerQualityClaim":false,"llmFactClaim":false}}'
+	  valid_report_quality_payload="$(
+	    VALID_REPORT_QUALITY_PAYLOAD="$valid_report_quality_payload" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_REPORT_QUALITY_PAYLOAD);
+const proof = payload.reportCitationQuality;
+proof.narrativeBindingStatus = "ALL_BOUND";
+proof.requiredNarrativeBindingCount = 6;
+proof.narrativeBindingCount = 6;
+proof.narrativeBindings = [
+  { key: "summary_risk_posture", sourceSection: "reportQuality.summary/codeQuality.risks", sourceMetric: "highRiskCount", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "high_risk_count", sourceSection: "codeQuality.risks", sourceMetric: "severity=HIGH", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "medium_risk_count", sourceSection: "codeQuality.risks", sourceMetric: "severity=MEDIUM", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "technical_debt_count", sourceSection: "technicalDebt", sourceMetric: "array.length", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "suggestion_count", sourceSection: "suggestions", sourceMetric: "array.length", reportedCount: 1, actualCount: 1, status: "BOUND" },
+  { key: "next_actions_risk_priority", sourceSection: "reportQuality.nextActions/codeQuality.risks", sourceMetric: "risk-priority-action", reportedCount: 1, actualCount: 1, status: "BOUND" },
+];
+process.stdout.write(JSON.stringify(payload));
+NODE
+	  )"
+	  valid_code_understanding_payload='{"contractVersion":1,"status":"OK","probeKind":"METHOD_ANCHOR_STACK_TRACE","projectId":1,"scanTaskId":1,"source":"DB_SYMBOL","anchor":{"language":"Java","filePath":"src/main/java/DemoController.java","className":"DemoController","methodName":"list","methodLine":42,"startLine":42,"endLine":42},"methodSearch":{"queryShape":"class#method","responseScanTaskId":1,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedStartLine":41,"matchedEndLine":80,"matchedEvidenceType":"CONTROLLER"},"stackTraceSearch":{"queryShape":"java-stack-frame","stackClass":"DemoController","stackMethod":"list","stackFile":"DemoController.java","stackLine":42,"responseScanTaskId":1,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedStartLine":41,"matchedEndLine":80,"matchedEvidenceType":"CONTROLLER"},"codeQa":{"requestScanTaskId":1,"responseScanTaskId":1,"retrievalMode":"KEYWORD","resultCount":1,"primaryMatched":true,"firstPrimaryIndex":0,"firstPrimaryFile":"src/main/java/DemoController.java","firstPrimaryStartLine":41,"firstPrimaryEndLine":80,"firstPrimaryContextRole":"PRIMARY","firstPrimaryExactAnchorPreserved":true,"primaryFile":"src/main/java/DemoController.java","primaryStartLine":41,"primaryEndLine":80},"currentScanOnly":true,"noRawPromptOrAnswer":true,"providerQualityClaim":false,"llmFactClaim":false}'
+	  valid_main_payload='{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"reportQuality":'"$valid_report_quality_payload"',"chunkSearch":{"crossFileRetrievalProof":'"$valid_cross_file_retrieval_payload"',"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"codeUnderstandingFixture":'"$valid_code_understanding_payload"',"codeQa":'"$valid_code_qa_payload"',"publicRepoUiSmoke":{"status":"OK","expectedEvidenceFile":"DemoController.java","marker":"PUBLIC_REPO_UI_SMOKE_OK"}}'
+	  valid_governance_timeline_payload='{"status":"OK","aggregateApiCalled":true,"endpoint":"/api/projects/1/scan-tasks/1/governance-timeline","responseStatus":200,"visible":true,"projectId":1,"repositoryId":1,"scanTaskId":1,"scanStatus":"SUCCESS","summaryStatus":"BOUND","hasErrors":false,"attributionGapCount":0,"counts":{"artifacts":3,"scanExecutions":1,"autoRepairs":1,"agentTasks":1,"agentToolCalls":0,"auditLogs":2,"repairExecutions":1,"agentExecutions":1},"hasSummary":true,"hasResources":true,"hasLimits":true,"resourceArrays":["agentExecutions","agentTasks","agentToolCalls","artifacts","auditLogs","autoRepairs","repairExecutions"],"derivedAuditResourceTypes":["AGENT_TASK","AUTO_REPAIR"],"derivedArtifactOwnerTypes":["AGENT_TASK","AUTO_REPAIR"],"derivedArtifactTypes":["AGENT_REPORT","CHANGE_PATCH"],"derivedGovernanceVisible":true,"patchEvidence":{"status":"OK","repairVisible":true,"autoRepairId":101,"repairStatus":"PATCH_READY","scanTaskIdBound":true,"targetFileVisible":true,"diffVisible":true,"patchArtifactVisible":true,"patchArtifactOwnerType":"AUTO_REPAIR","patchArtifactOwnerId":101,"patchArtifactType":"CHANGE_PATCH","patchReadyAuditVisible":true,"patchReadyAuditAction":"AUTO_REPAIR_PATCH_READY","patchReadyAuditStatus":"SUCCESS","auditSourceBound":true,"repairExecutionVisible":true,"repairExecutionSourceType":"AUTO_REPAIR","repairExecutionSourceId":101,"repairExecutionStatus":"SUCCESS","patchGenerationStepVisible":true,"patchGenerationStepKey":"generate_patch","foreignPatchEvidenceHidden":true},"agentReview":{"status":"OK","agentTaskVisible":true,"agentTaskId":202,"agentTaskStatus":"COMPLETED","scanTaskIdBound":true,"agentReportArtifactVisible":true,"agentReportOwnerType":"AGENT_TASK","agentReportOwnerId":202,"agentReportArtifactType":"AGENT_REPORT","agentAuditVisible":true,"agentAuditAction":"AGENT_TASK_SMOKE_READY","agentAuditStatus":"SUCCESS","agentAuditSourceBound":true,"agentExecutionVisible":true,"agentExecutionSourceType":"AGENT_TASK","agentExecutionSourceId":202,"agentExecutionStatus":"SUCCESS","agentExecutionStepVisible":true,"agentExecutionStepKey":"generate_report","foreignAgentEvidenceHidden":true,"noRawPromptOrAnswer":true},"eventCount":3,"resourcesBound":true,"truncated":false}'
+	  valid_code_knowledge_payload='{"status":"OK","scanTaskId":1,"responseStatus":200,"resultCount":1,"totalChunks":100,"embeddedChunks":0,"retrievalModes":["KEYWORD"],"readiness":["REVIEW"],"minConfidence":58,"uniqueFiles":1,"dominantEvidenceTypes":["CONTROLLER"],"evidenceProfileVisible":true,"currentScanOnly":true,"sourceLabelsVisible":true,"filePathsVisible":true,"expectedEvidenceFileVisible":true,"fileStatsVisible":true,"contextRoles":["PRIMARY"],"evidenceTypes":["CONTROLLER"],"readinessUsable":true,"crossFileEvidence":{"status":"OK","endpoint":"/api/projects/1/code-chunks/search","query":"","limit":24,"responseStatus":200,"scanTaskId":1,"resultCount":2,"totalChunks":100,"uniqueFiles":2,"currentScanOnly":true,"fileStatsVisible":true,"fileStatsUniqueFiles":2,"sourceLabelsVisible":true,"retrievalModes":["STABLE_FALLBACK"],"readiness":["REVIEW"],"minFileEvidenceSatisfied":true}}'
+	  valid_code_understanding_lens_payload='{"status":"OK","surface":"PROJECT_QA_CODE_UNDERSTANDING_LENS","visible":true,"scanTaskId":1,"requestScanTaskId":1,"responseScanTaskId":1,"responseStatus":200,"resultCount":1,"currentScanOnly":true,"inputKinds":["FILE_LINE"],"queryShapes":["file:line"],"primaryMatched":true,"sourceLabels":["C1"],"primaryReferences":["src/main/java/DemoController.java:41-80"],"primaryContextRoles":["PRIMARY"],"evidenceTypes":["CONTROLLER"],"retrievalModes":["KEYWORD"],"readiness":["READY"],"readinessUsable":true,"targetFileMatchesExpected":true,"entryVisible":true,"primaryReferenceVisible":true,"currentScanVisible":true,"primaryEvidenceVisible":true,"sourceLabelVisible":true,"retrievalModeVisible":true,"readinessVisible":true,"locateSearchVisible":true,"explainHereVisible":true,"copyReferenceVisible":true,"derivedFromVisibleResults":true,"resultSetOnly":true,"rawAnswerStored":false,"rawQueryStored":false,"rawStackStored":false,"rawPromptStored":false,"providerQualityClaim":false,"llmFactClaim":false,"noHorizontalOverflow":true}'
+	  valid_qa_from_evidence_payload='{"status":"OK","scanTaskId":1,"responseStatus":200,"resultCount":1,"citationCount":1,"citationCoverage":{"statuses":["FULL"],"minCoveragePercent":100,"minTotalEvidenceCount":1,"minCitedEvidenceCount":1,"minUncitedCandidateCount":0,"minRepairCandidateCount":1,"minRequiredEvidenceCoveragePercent":100,"minRequiredEvidenceCount":1,"minCitedRequiredEvidenceCount":1,"minUniqueEvidenceFileCount":1,"minCitedEvidenceFileCount":1,"minPrimaryEvidenceFileCount":1,"minCitedPrimaryEvidenceFileCount":1,"minContextEvidenceFileCount":0,"minCitedContextEvidenceCount":0,"minContextEvidenceFileCount":0,"minCitedContextEvidenceFileCount":0,"minRequiredEvidenceFileCount":1,"minCitedRequiredEvidenceFileCount":1,"coverageScopes":["PRIMARY"],"evidenceRoleDistribution":{"statuses":["PRIMARY_SINGLE_FILE"],"minTotalFileCount":1,"minCitedFileCount":1,"minPrimaryFileCount":1,"minCitedPrimaryFileCount":1,"minContextFileCount":0,"minCitedContextFileCount":0,"minRoleCount":1,"minFileEntryCount":1}},"crossFileCitationSummary":{"visible":true,"tones":["ready"],"statuses":["PRIMARY_SINGLE_FILE"],"crossFileEvidenceSatisfied":false,"citationBindingSatisfied":true,"claimBindingSatisfied":true,"currentScanOnly":true,"sourceEvidenceMatchTypes":["REPORT_LINE_ANCHOR"],"minEvidenceFileCount":1,"minCitedEvidenceFileCount":1,"minPrimaryEvidenceFileCount":1,"minCitedPrimaryEvidenceFileCount":1,"minContextEvidenceFileCount":0,"minCitedContextEvidenceFileCount":0,"minRequiredEvidenceFileCount":1,"minCitedRequiredEvidenceFileCount":1,"minRequiredClaimCount":1,"minRequiredClaimCitationFileCount":1,"minRequiredPrimaryFileCount":1,"minRequiredPrimaryBoundClaimCount":1},"claimCitationCoverage":{"statuses":["READY"],"readyForRepair":true,"readinessReasons":["PRIMARY_BOUND_READY"],"minClaimCoveragePercent":100,"minRequiredClaimCount":1,"minCitedRequiredClaimCount":1,"maxUncitedRequiredClaimCount":0,"maxInvalidCitationClaimCount":0,"minValidCitationFileCount":1,"minRequiredClaimCitationFileCount":1,"roleDistribution":{"statuses":["PRIMARY_BOUND"],"minRequiredClaimCount":1,"minRequiredPrimaryBoundClaimCount":1,"maxRequiredContextOnlyClaimCount":0,"maxRequiredUnknownOnlyClaimCount":0,"maxUnbackedRequiredClaimCount":0,"maxInvalidRequiredClaimCount":0,"minValidCitationFileCount":1,"minRequiredClaimCitationFileCount":1,"minRequiredPrimaryFileCount":1,"minRoleCount":1,"minFileEntryCount":1}},"groundingStatuses":["VERIFIED"],"citationEnforcementStatuses":["FALLBACK_CITED"],"citationEnforcementReasons":["FALLBACK_PRIMARY_CITED"],"citedChunkCount":1,"expectedEvidenceFileVisible":true,"evidenceRef":{"requestBound":true,"responseBound":true,"contextVisible":true,"filePath":"src/main/java/DemoController.java"},"evidenceHandoff":{"status":"OK","surface":"PROJECT_QA_REPORT_EVIDENCE_HANDOFF","visible":true,"sourceBridgeVisible":true,"answerSourceReceiptVisible":true,"scanTaskId":1,"requestScanTaskId":1,"responseScanTaskId":1,"requestBound":true,"responseBound":true,"contextVisible":true,"sourceEvidenceMatchTypes":["REPORT_LINE_ANCHOR"],"lineAnchorVisible":true,"sourceLocationConfidenceVisible":true,"sourceLocationConfidenceReadyVisible":true,"titleVisible":true,"categoryVisible":true,"sourceVisible":true,"fileReferenceVisible":true,"scanLabelVisible":true,"readyForAutoRepair":true,"repairCandidateActionVisible":true,"autoRepairDraftUrlBound":true,"sourceTypes":["PROJECT_QA_VERIFIED_CITATION"],"repositoryIdBound":true,"scanTaskIdBound":true,"fileBoundToEvidence":true,"citationIdBound":true,"chunkIdBound":true,"sourceEvidenceParamsBound":true,"candidateFormOpened":true,"candidateFormScanVisible":true,"candidateFormFilePrefilled":true,"candidateTargetDescBound":true,"noRawPromptOrAnswer":true,"providerQualityClaim":false,"llmFactClaim":false,"noHorizontalOverflow":true},"sourceFileMatchRelease":{"status":"OK","surface":"PROJECT_QA_SOURCE_FILE_MATCH_RELEASE","visible":true,"scanTaskId":1,"requestScanTaskId":1,"responseScanTaskId":1,"currentScanOnly":true,"releaseState":"READY","reportTargetVisible":true,"citedSliceVisible":true,"reportTargetLineVisible":true,"sourceEvidenceMatchTypes":["REPORT_LINE_ANCHOR"],"lineAnchorVisible":true,"pathMatchType":"PATH_SUFFIX","fileNameOnlyReviewVisible":false,"requiredEvidenceCovered":true,"primaryClaimBound":true,"readyForAutoRepair":true,"nextActionKey":"AUTO_REPAIR_REVIEW","riskNoticeVisible":true,"sourceBindingOnlyNoticeVisible":true,"noRawPromptOrAnswer":true,"providerQualityClaim":false,"llmFactClaim":false,"noHorizontalOverflow":true}}'
+	  valid_ui_payload='{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Recommended Next Step","Scan Governance Timeline","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"recommendedNextStep":{"status":"OK","visible":true,"primaryActionVisible":true,"secondaryActionVisible":true,"keys":["qa-review-ready-report"],"titles":["基于报告进入 QA 复核"]},"codeKnowledge":'"$valid_code_knowledge_payload"',"codeUnderstandingLens":'"$valid_code_understanding_lens_payload"',"qaFromEvidence":'"$valid_qa_from_evidence_payload"',"projectQaEvidenceCombinationSummary":{"status":"OK","surface":"PROJECT_QA_CODE_CHUNKS_SEARCH","visible":true,"scanTaskId":1,"requestScanTaskId":1,"responseScanTaskId":1,"currentScanOnly":true,"resultCount":1,"visibleCardCount":1,"labels":["跨文件复核路径"],"topSourceLabels":["C1"],"primaryContextRoles":["PRIMARY"],"minPrimaryCount":1,"minAdjacentContextCount":0,"minUniqueFileCount":1,"minEmbeddedEvidenceCount":0,"minNextQuestionCount":3,"sourceLabelsVisible":true,"filePathsVisible":true,"fileCoverageVisible":true,"rolePathVisible":true,"embeddingStateVisible":true,"topReferenceVisible":true,"derivedFromVisibleResults":true,"resultSetOnly":true,"providerQualityClaim":false,"llmFactClaim":false,"noHorizontalOverflow":true},"governanceTimeline":'"$valid_governance_timeline_payload"',"realBackend":true,"mockedApi":false}'
+  if [[ -z "$failure" ]]; then
+    valid_ui_payload="$(
+      VALID_UI_PAYLOAD="$valid_ui_payload" node <<'NODE'
+	const payload = JSON.parse(process.env.VALID_UI_PAYLOAD);
+	payload.qaFromEvidence.citationCount = 2;
+	payload.qaFromEvidence.citedChunkCount = 1;
+	payload.qaFromEvidence.citationCoverage = {
+	  ...payload.qaFromEvidence.citationCoverage,
+	  statuses: ["PARTIAL"],
+	  minCoveragePercent: 50,
+	  minTotalEvidenceCount: 2,
+	  minCitedEvidenceCount: 1,
+	  minUncitedCandidateCount: 1,
+	  minUniqueEvidenceFileCount: 2,
+	  minCitedEvidenceFileCount: 1,
+	  minPrimaryEvidenceFileCount: 1,
+	  minCitedPrimaryEvidenceFileCount: 1,
+	  maxUncitedPrimaryEvidenceCount: 0,
+	  maxUncitedPrimaryEvidenceFileCount: 0,
+	  minContextEvidenceFileCount: 1,
+	  minCitedContextEvidenceCount: 0,
+	  minCitedContextEvidenceFileCount: 0,
+	  minUncitedContextEvidenceCount: 1,
+	  minUncitedContextEvidenceFileCount: 1,
+	  evidenceRoleDistribution: {
+	    statuses: ["MIXED_PRIMARY_CONTEXT"],
+	    minTotalFileCount: 2,
+	    minCitedFileCount: 1,
+	    minPrimaryFileCount: 1,
+	    minCitedPrimaryFileCount: 1,
+	    minContextFileCount: 1,
+	    minCitedContextFileCount: 0,
+	    minRoleCount: 2,
+	    minFileEntryCount: 2,
+	  },
+	};
+	payload.qaFromEvidence.crossFileCitationSummary = {
+	  ...payload.qaFromEvidence.crossFileCitationSummary,
+	  tones: ["warning"],
+	  statuses: ["MIXED_PRIMARY_CONTEXT"],
+	  crossFileEvidenceSatisfied: true,
+	  minEvidenceFileCount: 2,
+	  minCitedEvidenceFileCount: 1,
+	  minPrimaryEvidenceFileCount: 1,
+	  minCitedPrimaryEvidenceFileCount: 1,
+	  minContextEvidenceFileCount: 1,
+	  minCitedContextEvidenceFileCount: 0,
+	  contextGapVisible: true,
+	  minUncitedContextEvidenceCount: 1,
+	  minUncitedContextEvidenceFileCount: 1,
+	};
+	payload.qaFromEvidence.startEndOnlyEvidenceRef = {
+  status: "OK",
+  surface: "PUBLIC_REPO_UI_QA_START_END_ONLY_EVIDENCE_REF",
+  scanTaskId: 1,
+  requestScanTaskId: 1,
+  responseScanTaskId: 1,
+  responseStatus: 200,
+  filePath: "src/main/java/DemoController.java",
+  startLine: 41,
+  endLine: 80,
+  requestBound: true,
+  responseBound: true,
+  requestHasLegacyLineNumber: false,
+  responseHasLegacyLineNumber: false,
+  sourceEvidenceMatched: true,
+  sourceEvidenceMatchTypes: ["REPORT_LINE_ANCHOR"],
+  minResultCount: 1,
+  primaryChunkBound: true,
+  coverageScopes: ["PRIMARY"],
+  currentScanOnly: true,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+};
+	payload.qaFromEvidence.claimCitationNoiseBoundary = {
+  status: "OK",
+  surface: "PUBLIC_REPO_UI_CLAIM_CITATION_NOISE_BOUNDARY",
+  scanTaskId: 1,
+  requestScanTaskId: 1,
+  responseScanTaskId: 1,
+  currentScanOnly: true,
+  requestCount: 3,
+  responseStatus: 200,
+  resultCount: 1,
+  citationCount: 1,
+  noiseKinds: ["exception-line", "fenced-code", "inline-code", "timestamp-log"],
+  coverageStatus: "NONE",
+  maxCitedEvidenceCount: 0,
+  maxRepairCandidateCount: 0,
+  claimCitationStatus: "REVIEW",
+  maxCitedRequiredClaimCount: 0,
+  maxInvalidCitationClaimCount: 0,
+  roleDistributionStatus: "REVIEW_UNCITED",
+  maxRequiredPrimaryBoundClaimCount: 0,
+  groundingStatuses: ["UNVERIFIED"],
+  citationEnforcementStatuses: ["RETRY_FAILED"],
+  answerCitationsCitedByAnswer: false,
+  trustSummaryReadyVisible: false,
+  repairCandidateActionVisible: false,
+  repairEvidenceGateBlockedVisible: true,
+  evidenceRefRequestBound: true,
+  evidenceRefResponseBound: true,
+  rawAnswerStored: false,
+  rawPromptStored: false,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+  noHorizontalOverflow: true,
+  llmSetup: { status: "OK" },
+	  llmCleanup: { status: "OK" },
+	};
+	payload.qaFromEvidence.relationAwareEvidenceReason = {
+	  status: "OK",
+	  surface: "PUBLIC_REPO_UI_RELATION_AWARE_EVIDENCE_REASON",
+	  marker: "Graph relation:",
+	  proofCount: 3,
+	  minCitationReasonCount: 1,
+	  minRetrievedChunkReasonCount: 1,
+	  adjacentContextReasonVisible: true,
+	  citedPrimaryStillPresent: true,
+	  uiReasonVisible: true,
+	  providerQualityClaim: false,
+	  llmFactClaim: false,
+	};
+	payload.qaFromEvidence.fileAnchorDrift = {
+  status: "OK",
+  surface: "PUBLIC_REPO_UI_FILE_ANCHOR_DRIFT",
+  scanTaskId: 1,
+  requestScanTaskId: 1,
+  responseScanTaskId: 1,
+  currentScanOnly: true,
+  requestCount: 3,
+  responseStatus: 200,
+  resultCount: 1,
+  citationCount: 1,
+  sourceEvidenceMatchTypes: ["REPORT_FILE_ANCHOR"],
+  citationCoverage: {
+    statuses: ["PARTIAL"],
+    coverageScopes: ["ALL"],
+    maxPrimaryEvidenceCount: 0,
+    minContextEvidenceCount: 1,
+    maxRepairCandidateCount: 0,
+    evidenceRoleDistribution: {
+      statuses: ["CONTEXT_ONLY"],
+    },
+  },
+  claimCitationCoverage: {
+    statuses: ["READY"],
+    readyForRepair: false,
+    readinessReasons: ["CONTEXT_ONLY_CLAIM"],
+    minRequiredClaimCount: 1,
+    minCitedRequiredClaimCount: 1,
+    roleDistribution: {
+      statuses: ["CONTEXT_ONLY"],
+      maxRequiredPrimaryBoundClaimCount: 0,
+      maxRequiredPrimaryFileCount: 0,
+      minRequiredContextOnlyClaimCount: 1,
+    },
+  },
+  groundingStatuses: ["PARTIAL"],
+  citationEnforcementStatuses: ["RETRY_FAILED"],
+  repairEvidenceGateBlockedVisible: true,
+  trustSummaryBlockedVisible: true,
+  crossFileSummaryContextGapVisible: true,
+  sourceLocationConfidenceReviewVisible: true,
+  latestNextActionRepairHidden: true,
+  latestCitationRepairHidden: true,
+  evidenceRefRequestBound: true,
+  evidenceRefResponseBound: true,
+  rawAnswerStored: false,
+  rawPromptStored: false,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+  noHorizontalOverflow: true,
+  llmSetup: { status: "OK" },
+  llmCleanup: { status: "OK" },
+};
+payload.qaFromEvidence.sourceLocationReadability = {
+  status: "OK",
+  surface: "PUBLIC_REPO_UI_SOURCE_LOCATION_READABILITY",
+  proofCount: 6,
+  mobile390Covered: true,
+  narrow320Covered: true,
+  sourceReceipt: {
+    readyContained: true,
+    reviewContained: true,
+    referenceWraps: true,
+    titleNotClipped: true,
+    tagsNotClipped: true,
+  },
+  sourceLocationConfidence: {
+    readyContained: true,
+    reviewContained: true,
+    metricsNotClipped: true,
+    checksWrap: true,
+  },
+  sourceFileMatchRelease: {
+    readyContained: true,
+    reviewContained: true,
+    targetReferenceNotClipped: true,
+    citedReferenceNotClipped: true,
+    checksNotClipped: true,
+    noRepairOnReview: true,
+  },
+  noHorizontalOverflow: true,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+};
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )" || failure="could not inject valid public repo UI claim citation noise boundary payload"
+  fi
+
+  write_public_repo_ui_marker_log() {
+    local main_payload="$1"
+    local ui_log_body="$2"
+    {
+      printf 'PUBLIC_REPO_SMOKE_OK %s\n' "$main_payload"
+      if [[ -n "$ui_log_body" ]]; then
+        printf '%s\n' "$ui_log_body"
+      fi
+    } > "$run_dir/public-repo-smoke.log" || return 1
+    chmod 600 "$run_dir/public-repo-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+	  verify_public_repo_ui_marker_rejects() {
+    local label="$1"
+    local main_payload="$2"
+    local ui_log_body="$3"
+    local reject_output_file="$tmp_dir/verify-release-evidence-ui-${label}.txt"
+    if ! write_public_repo_ui_marker_log "$main_payload" "$ui_log_body"; then
+      failure="could not write forged public repo UI smoke payload for $label"
+      return
+    fi
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid public repo UI smoke marker: $label"
+    elif ! rg -q 'public-repo-smoke OK must include PUBLIC_REPO_SMOKE_OK marker with natural endpoint controller probes, source location probes when required, and required UI smoke marker' "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain invalid public repo UI smoke marker rejection: $label"
+    fi
+	  }
+
+	  mutated_public_repo_ui_marker() {
+	    local mutation="$1"
+	    node - "$valid_ui_payload" "$mutation" <<'NODE'
+const payload = JSON.parse(process.argv[2]);
+const mutation = process.argv[3];
+switch (mutation) {
+  case "missing-recommended-next-step":
+    delete payload.recommendedNextStep;
+    break;
+  case "recommended-next-step-array":
+    payload.recommendedNextStep = [];
+    break;
+  case "recommended-next-step-hidden":
+    payload.recommendedNextStep.visible = false;
+    break;
+  case "recommended-next-step-primary-hidden":
+    payload.recommendedNextStep.primaryActionVisible = false;
+    break;
+  case "recommended-next-step-secondary-hidden":
+    payload.recommendedNextStep.secondaryActionVisible = false;
+    break;
+  case "recommended-next-step-bad-key":
+    payload.recommendedNextStep.keys = ["unsafe-ai-autofix"];
+    break;
+  case "recommended-next-step-empty-title":
+    payload.recommendedNextStep.titles = [];
+    break;
+  case "missing-governance-timeline":
+    delete payload.governanceTimeline;
+    break;
+  case "governance-aggregate-api-false":
+    payload.governanceTimeline.aggregateApiCalled = false;
+    break;
+  case "governance-response-status-500":
+    payload.governanceTimeline.responseStatus = 500;
+    break;
+  case "governance-path-mismatch":
+    payload.governanceTimeline.endpoint = "/api/projects/1/scan-tasks/2/governance-timeline";
+    break;
+  case "governance-scan-id-mismatch":
+    payload.governanceTimeline.scanTaskId = 2;
+    break;
+  case "governance-missing-summary":
+    payload.governanceTimeline.hasSummary = false;
+    break;
+  case "governance-missing-resources":
+    payload.governanceTimeline.hasResources = false;
+    break;
+  case "governance-missing-limits":
+    payload.governanceTimeline.hasLimits = false;
+    break;
+  case "governance-resources-unbound":
+    payload.governanceTimeline.resourcesBound = false;
+    break;
+  case "governance-empty-events":
+    payload.governanceTimeline.eventCount = 0;
+    break;
+  case "governance-missing-page":
+    payload.pages = payload.pages.filter((page) => page !== "Scan Governance Timeline");
+    break;
+  case "governance-missing-resource-array":
+    payload.governanceTimeline.resourceArrays = payload.governanceTimeline.resourceArrays.filter((entry) => entry !== "artifacts");
+    break;
+  case "governance-artifacts-zero":
+    payload.governanceTimeline.counts.artifacts = 0;
+    break;
+  case "governance-scan-executions-two":
+    payload.governanceTimeline.counts.scanExecutions = 2;
+    break;
+  case "governance-missing-derived-audit-auto-repair":
+    payload.governanceTimeline.derivedAuditResourceTypes = payload.governanceTimeline.derivedAuditResourceTypes.filter((entry) => entry !== "AUTO_REPAIR");
+    break;
+  case "governance-missing-derived-audit-agent-task":
+    payload.governanceTimeline.derivedAuditResourceTypes = payload.governanceTimeline.derivedAuditResourceTypes.filter((entry) => entry !== "AGENT_TASK");
+    break;
+  case "governance-missing-derived-artifact-auto-repair":
+    payload.governanceTimeline.derivedArtifactOwnerTypes = payload.governanceTimeline.derivedArtifactOwnerTypes.filter((entry) => entry !== "AUTO_REPAIR");
+    break;
+  case "governance-missing-derived-artifact-agent-task":
+    payload.governanceTimeline.derivedArtifactOwnerTypes = payload.governanceTimeline.derivedArtifactOwnerTypes.filter((entry) => entry !== "AGENT_TASK");
+    break;
+  case "governance-missing-change-patch":
+    payload.governanceTimeline.derivedArtifactTypes = payload.governanceTimeline.derivedArtifactTypes.filter((entry) => entry !== "CHANGE_PATCH");
+    break;
+  case "governance-missing-agent-report":
+    payload.governanceTimeline.derivedArtifactTypes = payload.governanceTimeline.derivedArtifactTypes.filter((entry) => entry !== "AGENT_REPORT");
+    break;
+	  case "governance-derived-not-visible":
+	    payload.governanceTimeline.derivedGovernanceVisible = false;
+	    break;
+	  case "governance-missing-patch-evidence":
+	    delete payload.governanceTimeline.patchEvidence;
+	    break;
+	  case "governance-patch-evidence-array":
+	    payload.governanceTimeline.patchEvidence = [];
+	    break;
+	  case "governance-patch-evidence-status-fail":
+	    payload.governanceTimeline.patchEvidence.status = "FAIL";
+	    break;
+	  case "governance-patch-repair-hidden":
+	    payload.governanceTimeline.patchEvidence.repairVisible = false;
+	    break;
+	  case "governance-patch-auto-repair-id-missing":
+	    payload.governanceTimeline.patchEvidence.autoRepairId = 0;
+	    break;
+	  case "governance-patch-repair-status-not-ready":
+	    payload.governanceTimeline.patchEvidence.repairStatus = "PENDING";
+	    break;
+	  case "governance-patch-scan-unbound":
+	    payload.governanceTimeline.patchEvidence.scanTaskIdBound = false;
+	    break;
+	  case "governance-patch-target-file-hidden":
+	    payload.governanceTimeline.patchEvidence.targetFileVisible = false;
+	    break;
+	  case "governance-patch-diff-hidden":
+	    payload.governanceTimeline.patchEvidence.diffVisible = false;
+	    break;
+	  case "governance-patch-artifact-hidden":
+	    payload.governanceTimeline.patchEvidence.patchArtifactVisible = false;
+	    break;
+	  case "governance-patch-artifact-owner-type-mismatch":
+	    payload.governanceTimeline.patchEvidence.patchArtifactOwnerType = "SCAN_TASK";
+	    break;
+	  case "governance-patch-artifact-owner-id-mismatch":
+	    payload.governanceTimeline.patchEvidence.patchArtifactOwnerId = 202;
+	    break;
+	  case "governance-patch-artifact-type-mismatch":
+	    payload.governanceTimeline.patchEvidence.patchArtifactType = "AGENT_REPORT";
+	    break;
+	  case "governance-patch-ready-audit-hidden":
+	    payload.governanceTimeline.patchEvidence.patchReadyAuditVisible = false;
+	    break;
+	  case "governance-patch-ready-audit-action-mismatch":
+	    payload.governanceTimeline.patchEvidence.patchReadyAuditAction = "AUTO_REPAIR_PR_REJECTED";
+	    break;
+	  case "governance-patch-ready-audit-status-mismatch":
+	    payload.governanceTimeline.patchEvidence.patchReadyAuditStatus = "FAILED";
+	    break;
+	  case "governance-patch-ready-audit-source-unbound":
+	    payload.governanceTimeline.patchEvidence.auditSourceBound = false;
+	    break;
+	  case "governance-patch-repair-execution-hidden":
+	    payload.governanceTimeline.patchEvidence.repairExecutionVisible = false;
+	    break;
+	  case "governance-patch-repair-execution-source-mismatch":
+	    payload.governanceTimeline.patchEvidence.repairExecutionSourceId = 202;
+	    break;
+	  case "governance-patch-repair-execution-status-mismatch":
+	    payload.governanceTimeline.patchEvidence.repairExecutionStatus = "FAILED";
+	    break;
+	  case "governance-patch-generation-step-hidden":
+	    payload.governanceTimeline.patchEvidence.patchGenerationStepVisible = false;
+	    break;
+	  case "governance-patch-generation-step-mismatch":
+	    payload.governanceTimeline.patchEvidence.patchGenerationStepKey = "create_pull_request";
+	    break;
+  case "governance-foreign-patch-evidence-visible":
+    payload.governanceTimeline.patchEvidence.foreignPatchEvidenceHidden = false;
+    break;
+  case "governance-missing-agent-review":
+    delete payload.governanceTimeline.agentReview;
+    break;
+  case "governance-agent-review-array":
+    payload.governanceTimeline.agentReview = [];
+    break;
+  case "governance-agent-review-status-fail":
+    payload.governanceTimeline.agentReview.status = "FAIL";
+    break;
+  case "governance-agent-task-hidden":
+    payload.governanceTimeline.agentReview.agentTaskVisible = false;
+    break;
+  case "governance-agent-task-id-missing":
+    payload.governanceTimeline.agentReview.agentTaskId = 0;
+    break;
+  case "governance-agent-task-status-not-completed":
+    payload.governanceTimeline.agentReview.agentTaskStatus = "RUNNING";
+    break;
+  case "governance-agent-task-scan-unbound":
+    payload.governanceTimeline.agentReview.scanTaskIdBound = false;
+    break;
+  case "governance-agent-report-hidden":
+    payload.governanceTimeline.agentReview.agentReportArtifactVisible = false;
+    break;
+  case "governance-agent-report-owner-type-mismatch":
+    payload.governanceTimeline.agentReview.agentReportOwnerType = "SCAN_TASK";
+    break;
+  case "governance-agent-report-owner-id-mismatch":
+    payload.governanceTimeline.agentReview.agentReportOwnerId = 101;
+    break;
+  case "governance-agent-report-artifact-type-mismatch":
+    payload.governanceTimeline.agentReview.agentReportArtifactType = "CHANGE_PATCH";
+    break;
+  case "governance-agent-audit-hidden":
+    payload.governanceTimeline.agentReview.agentAuditVisible = false;
+    break;
+  case "governance-agent-audit-action-mismatch":
+    payload.governanceTimeline.agentReview.agentAuditAction = "AUTO_REPAIR_PATCH_READY";
+    break;
+  case "governance-agent-audit-status-mismatch":
+    payload.governanceTimeline.agentReview.agentAuditStatus = "FAILED";
+    break;
+  case "governance-agent-audit-source-unbound":
+    payload.governanceTimeline.agentReview.agentAuditSourceBound = false;
+    break;
+  case "governance-agent-execution-hidden":
+    payload.governanceTimeline.agentReview.agentExecutionVisible = false;
+    break;
+  case "governance-agent-execution-source-type-mismatch":
+    payload.governanceTimeline.agentReview.agentExecutionSourceType = "AUTO_REPAIR";
+    break;
+  case "governance-agent-execution-source-id-mismatch":
+    payload.governanceTimeline.agentReview.agentExecutionSourceId = 101;
+    break;
+  case "governance-agent-execution-status-mismatch":
+    payload.governanceTimeline.agentReview.agentExecutionStatus = "FAILED";
+    break;
+  case "governance-agent-execution-step-hidden":
+    payload.governanceTimeline.agentReview.agentExecutionStepVisible = false;
+    break;
+  case "governance-agent-execution-step-mismatch":
+    payload.governanceTimeline.agentReview.agentExecutionStepKey = "generate_patch";
+    break;
+  case "governance-foreign-agent-evidence-visible":
+    payload.governanceTimeline.agentReview.foreignAgentEvidenceHidden = false;
+    break;
+  case "governance-agent-raw-prompt-visible":
+    payload.governanceTimeline.agentReview.noRawPromptOrAnswer = false;
+    break;
+  case "missing-code-knowledge":
+    delete payload.codeKnowledge;
+    break;
+  case "code-knowledge-array":
+    payload.codeKnowledge = [];
+    break;
+  case "code-knowledge-status-fail":
+    payload.codeKnowledge.status = "FAIL";
+    break;
+  case "code-knowledge-scan-mismatch":
+    payload.codeKnowledge.scanTaskId = 2;
+    break;
+  case "code-knowledge-response-500":
+    payload.codeKnowledge.responseStatus = 500;
+    break;
+  case "code-knowledge-empty-results":
+    payload.codeKnowledge.resultCount = 0;
+    break;
+  case "code-knowledge-total-zero":
+    payload.codeKnowledge.totalChunks = 0;
+    break;
+  case "code-knowledge-embedded-over-total":
+    payload.codeKnowledge.embeddedChunks = 101;
+    break;
+  case "code-knowledge-bad-retrieval-mode":
+    payload.codeKnowledge.retrievalModes = ["MOCK"];
+    break;
+  case "code-knowledge-no-context-mode":
+    payload.codeKnowledge.retrievalModes = ["NO_CONTEXT"];
+    break;
+  case "code-knowledge-gap-readiness":
+    payload.codeKnowledge.readiness = ["GAP"];
+    break;
+  case "code-knowledge-confidence-out-of-range":
+    payload.codeKnowledge.minConfidence = 101;
+    break;
+  case "code-knowledge-unique-files-zero":
+    payload.codeKnowledge.uniqueFiles = 0;
+    break;
+  case "code-knowledge-profile-hidden":
+    payload.codeKnowledge.evidenceProfileVisible = false;
+    break;
+  case "code-knowledge-foreign-scan":
+    payload.codeKnowledge.currentScanOnly = false;
+    break;
+  case "code-knowledge-source-label-hidden":
+    payload.codeKnowledge.sourceLabelsVisible = false;
+    break;
+  case "code-knowledge-file-path-hidden":
+    payload.codeKnowledge.filePathsVisible = false;
+    break;
+  case "code-knowledge-evidence-file-hidden":
+    payload.codeKnowledge.expectedEvidenceFileVisible = false;
+    break;
+  case "code-knowledge-file-stats-hidden":
+    payload.codeKnowledge.fileStatsVisible = false;
+    break;
+  case "code-knowledge-missing-primary-role":
+    payload.codeKnowledge.contextRoles = [];
+    break;
+  case "code-knowledge-empty-evidence-types":
+    payload.codeKnowledge.evidenceTypes = [];
+    break;
+  case "code-knowledge-readiness-unusable":
+    payload.codeKnowledge.readinessUsable = false;
+    break;
+  case "code-knowledge-missing-cross-file":
+    delete payload.codeKnowledge.crossFileEvidence;
+    break;
+  case "code-knowledge-cross-file-array":
+    payload.codeKnowledge.crossFileEvidence = [];
+    break;
+  case "code-knowledge-cross-file-status-fail":
+    payload.codeKnowledge.crossFileEvidence.status = "FAIL";
+    break;
+  case "code-knowledge-cross-file-endpoint-mismatch":
+    payload.codeKnowledge.crossFileEvidence.endpoint = "/api/projects/1/code-chunks/other";
+    break;
+  case "code-knowledge-cross-file-limit-mismatch":
+    payload.codeKnowledge.crossFileEvidence.limit = 3;
+    break;
+  case "code-knowledge-cross-file-scan-mismatch":
+    payload.codeKnowledge.crossFileEvidence.scanTaskId = 2;
+    break;
+  case "code-knowledge-cross-file-one-result":
+    payload.codeKnowledge.crossFileEvidence.resultCount = 1;
+    break;
+  case "code-knowledge-cross-file-one-file":
+    payload.codeKnowledge.crossFileEvidence.uniqueFiles = 1;
+    break;
+  case "code-knowledge-cross-file-foreign-scan":
+    payload.codeKnowledge.crossFileEvidence.currentScanOnly = false;
+    break;
+  case "code-knowledge-cross-file-stats-hidden":
+    payload.codeKnowledge.crossFileEvidence.fileStatsVisible = false;
+    break;
+  case "code-knowledge-cross-file-one-stat-file":
+    payload.codeKnowledge.crossFileEvidence.fileStatsUniqueFiles = 1;
+    break;
+  case "code-knowledge-cross-file-source-label-hidden":
+    payload.codeKnowledge.crossFileEvidence.sourceLabelsVisible = false;
+    break;
+  case "code-knowledge-cross-file-bad-retrieval-mode":
+    payload.codeKnowledge.crossFileEvidence.retrievalModes = ["NO_CONTEXT"];
+    break;
+  case "code-knowledge-cross-file-not-satisfied":
+    payload.codeKnowledge.crossFileEvidence.minFileEvidenceSatisfied = false;
+    break;
+  case "missing-code-understanding-lens":
+    delete payload.codeUnderstandingLens;
+    break;
+  case "code-understanding-lens-array":
+    payload.codeUnderstandingLens = [];
+    break;
+  case "code-understanding-lens-hidden":
+    payload.codeUnderstandingLens.visible = false;
+    break;
+  case "code-understanding-lens-scan-mismatch":
+    payload.codeUnderstandingLens.scanTaskId = 2;
+    break;
+  case "code-understanding-lens-request-scan-mismatch":
+    payload.codeUnderstandingLens.requestScanTaskId = 2;
+    break;
+  case "code-understanding-lens-response-scan-mismatch":
+    payload.codeUnderstandingLens.responseScanTaskId = 2;
+    break;
+  case "code-understanding-lens-foreign-scan":
+    payload.codeUnderstandingLens.currentScanOnly = false;
+    break;
+  case "code-understanding-lens-general-kind":
+    payload.codeUnderstandingLens.inputKinds = ["GENERAL"];
+    break;
+  case "code-understanding-lens-empty-result":
+    payload.codeUnderstandingLens.resultCount = 0;
+    break;
+  case "code-understanding-lens-primary-unmatched":
+    payload.codeUnderstandingLens.primaryMatched = false;
+    break;
+  case "code-understanding-lens-target-file-mismatch":
+    payload.codeUnderstandingLens.targetFileMatchesExpected = false;
+    break;
+  case "code-understanding-lens-unsafe-path":
+    payload.codeUnderstandingLens.primaryReferences = ["../DemoController.java:41-80"];
+    break;
+  case "code-understanding-lens-invalid-line-range":
+    payload.codeUnderstandingLens.primaryReferences = ["src/main/java/DemoController.java:80-41"];
+    break;
+  case "code-understanding-lens-locate-hidden":
+    payload.codeUnderstandingLens.locateSearchVisible = false;
+    break;
+  case "code-understanding-lens-explain-hidden":
+    payload.codeUnderstandingLens.explainHereVisible = false;
+    break;
+  case "code-understanding-lens-copy-hidden":
+    payload.codeUnderstandingLens.copyReferenceVisible = false;
+    break;
+  case "code-understanding-lens-raw-stack":
+    payload.codeUnderstandingLens.rawStackStored = true;
+    break;
+  case "code-understanding-lens-raw-prompt":
+    payload.codeUnderstandingLens.rawPrompt = "unsafe prompt";
+    break;
+  case "code-understanding-lens-provider-claim":
+    payload.codeUnderstandingLens.providerQualityClaim = true;
+    break;
+  case "code-understanding-lens-llm-fact-claim":
+    payload.codeUnderstandingLens.llmFactClaim = true;
+    break;
+  case "missing-project-qa-evidence-combination":
+    delete payload.projectQaEvidenceCombinationSummary;
+    break;
+  case "project-qa-evidence-combination-array":
+    payload.projectQaEvidenceCombinationSummary = [];
+    break;
+  case "project-qa-evidence-combination-status-fail":
+    payload.projectQaEvidenceCombinationSummary.status = "FAIL";
+    break;
+  case "project-qa-evidence-combination-surface-mismatch":
+    payload.projectQaEvidenceCombinationSummary.surface = "REPORT_DRAWER";
+    break;
+  case "project-qa-evidence-combination-hidden":
+    payload.projectQaEvidenceCombinationSummary.visible = false;
+    break;
+  case "project-qa-evidence-combination-scan-mismatch":
+    payload.projectQaEvidenceCombinationSummary.scanTaskId = 2;
+    break;
+  case "project-qa-evidence-combination-request-scan-mismatch":
+    payload.projectQaEvidenceCombinationSummary.requestScanTaskId = 2;
+    break;
+  case "project-qa-evidence-combination-response-scan-mismatch":
+    payload.projectQaEvidenceCombinationSummary.responseScanTaskId = 2;
+    break;
+  case "project-qa-evidence-combination-foreign-scan":
+    payload.projectQaEvidenceCombinationSummary.currentScanOnly = false;
+    break;
+  case "project-qa-evidence-combination-empty-result":
+    payload.projectQaEvidenceCombinationSummary.resultCount = 0;
+    break;
+  case "project-qa-evidence-combination-hidden-cards":
+    payload.projectQaEvidenceCombinationSummary.visibleCardCount = 0;
+    break;
+  case "project-qa-evidence-combination-empty-labels":
+    payload.projectQaEvidenceCombinationSummary.labels = [];
+    break;
+  case "project-qa-evidence-combination-bad-label":
+    payload.projectQaEvidenceCombinationSummary.labels = ["LLM 事实已验证"];
+    break;
+  case "project-qa-evidence-combination-empty-source-labels":
+    payload.projectQaEvidenceCombinationSummary.topSourceLabels = [];
+    break;
+  case "project-qa-evidence-combination-bad-source-label":
+    payload.projectQaEvidenceCombinationSummary.topSourceLabels = ["source://C1"];
+    break;
+  case "project-qa-evidence-combination-adjacent-only":
+    payload.projectQaEvidenceCombinationSummary.primaryContextRoles = ["ADJACENT_CONTEXT"];
+    break;
+  case "project-qa-evidence-combination-primary-zero":
+    payload.projectQaEvidenceCombinationSummary.minPrimaryCount = 0;
+    break;
+  case "project-qa-evidence-combination-unique-files-zero":
+    payload.projectQaEvidenceCombinationSummary.minUniqueFileCount = 0;
+    break;
+  case "project-qa-evidence-combination-embedded-negative":
+    payload.projectQaEvidenceCombinationSummary.minEmbeddedEvidenceCount = -1;
+    break;
+  case "project-qa-evidence-combination-next-question-low":
+    payload.projectQaEvidenceCombinationSummary.minNextQuestionCount = 2;
+    break;
+  case "project-qa-evidence-combination-source-labels-hidden":
+    payload.projectQaEvidenceCombinationSummary.sourceLabelsVisible = false;
+    break;
+  case "project-qa-evidence-combination-file-paths-hidden":
+    payload.projectQaEvidenceCombinationSummary.filePathsVisible = false;
+    break;
+  case "project-qa-evidence-combination-file-coverage-hidden":
+    payload.projectQaEvidenceCombinationSummary.fileCoverageVisible = false;
+    break;
+  case "project-qa-evidence-combination-role-path-hidden":
+    payload.projectQaEvidenceCombinationSummary.rolePathVisible = false;
+    break;
+  case "project-qa-evidence-combination-embedding-hidden":
+    payload.projectQaEvidenceCombinationSummary.embeddingStateVisible = false;
+    break;
+  case "project-qa-evidence-combination-top-ref-hidden":
+    payload.projectQaEvidenceCombinationSummary.topReferenceVisible = false;
+    break;
+  case "project-qa-evidence-combination-not-visible-derived":
+    payload.projectQaEvidenceCombinationSummary.derivedFromVisibleResults = false;
+    break;
+  case "project-qa-evidence-combination-not-result-set-only":
+    payload.projectQaEvidenceCombinationSummary.resultSetOnly = false;
+    break;
+  case "project-qa-evidence-combination-provider-claim":
+    payload.projectQaEvidenceCombinationSummary.providerQualityClaim = true;
+    break;
+  case "project-qa-evidence-combination-llm-fact-claim":
+    payload.projectQaEvidenceCombinationSummary.llmFactClaim = true;
+    break;
+  case "project-qa-evidence-combination-overflow":
+    payload.projectQaEvidenceCombinationSummary.noHorizontalOverflow = false;
+    break;
+  case "project-qa-evidence-combination-raw-content":
+    payload.projectQaEvidenceCombinationSummary.rawAnswer = "unsafe";
+    break;
+  case "qa-evidence-handoff-array":
+    payload.qaFromEvidence.evidenceHandoff = [];
+    break;
+  case "qa-evidence-handoff-status-fail":
+    payload.qaFromEvidence.evidenceHandoff.status = "FAIL";
+    break;
+  case "qa-evidence-handoff-surface-mismatch":
+    payload.qaFromEvidence.evidenceHandoff.surface = "PROJECT_QA_VERIFIED_CITATION";
+    break;
+  case "qa-evidence-handoff-hidden":
+    payload.qaFromEvidence.evidenceHandoff.visible = false;
+    break;
+  case "qa-evidence-handoff-source-bridge-hidden":
+    payload.qaFromEvidence.evidenceHandoff.sourceBridgeVisible = false;
+    break;
+  case "qa-evidence-handoff-receipt-hidden":
+    payload.qaFromEvidence.evidenceHandoff.answerSourceReceiptVisible = false;
+    break;
+  case "qa-evidence-handoff-scan-mismatch":
+    payload.qaFromEvidence.evidenceHandoff.scanTaskId = 2;
+    break;
+  case "qa-evidence-handoff-response-scan-mismatch":
+    payload.qaFromEvidence.evidenceHandoff.responseScanTaskId = 2;
+    break;
+  case "qa-evidence-handoff-request-unbound":
+    payload.qaFromEvidence.evidenceHandoff.requestBound = false;
+    break;
+  case "qa-evidence-handoff-response-unbound":
+    payload.qaFromEvidence.evidenceHandoff.responseBound = false;
+    break;
+  case "qa-evidence-handoff-report-file-anchor":
+    payload.qaFromEvidence.evidenceHandoff.sourceEvidenceMatchTypes = ["REPORT_FILE_ANCHOR"];
+    break;
+  case "qa-evidence-handoff-line-anchor-hidden":
+    payload.qaFromEvidence.evidenceHandoff.lineAnchorVisible = false;
+    break;
+  case "qa-evidence-handoff-title-hidden":
+    payload.qaFromEvidence.evidenceHandoff.titleVisible = false;
+    break;
+  case "qa-evidence-handoff-not-ready":
+    payload.qaFromEvidence.evidenceHandoff.readyForAutoRepair = false;
+    break;
+  case "qa-evidence-handoff-action-hidden":
+    payload.qaFromEvidence.evidenceHandoff.repairCandidateActionVisible = false;
+    break;
+  case "qa-evidence-handoff-url-unbound":
+    payload.qaFromEvidence.evidenceHandoff.autoRepairDraftUrlBound = false;
+    break;
+  case "qa-evidence-handoff-source-type-manual":
+    payload.qaFromEvidence.evidenceHandoff.sourceTypes = ["MANUAL_CANDIDATE"];
+    break;
+  case "qa-evidence-handoff-repository-unbound":
+    payload.qaFromEvidence.evidenceHandoff.repositoryIdBound = false;
+    break;
+  case "qa-evidence-handoff-citation-unbound":
+    payload.qaFromEvidence.evidenceHandoff.citationIdBound = false;
+    break;
+  case "qa-evidence-handoff-source-params-unbound":
+    payload.qaFromEvidence.evidenceHandoff.sourceEvidenceParamsBound = false;
+    break;
+  case "qa-evidence-handoff-form-hidden":
+    payload.qaFromEvidence.evidenceHandoff.candidateFormOpened = false;
+    break;
+  case "qa-evidence-handoff-form-file-unbound":
+    payload.qaFromEvidence.evidenceHandoff.candidateFormFilePrefilled = false;
+    break;
+  case "qa-evidence-handoff-target-desc-unbound":
+    payload.qaFromEvidence.evidenceHandoff.candidateTargetDescBound = false;
+    break;
+  case "qa-evidence-handoff-provider-claim":
+    payload.qaFromEvidence.evidenceHandoff.providerQualityClaim = true;
+    break;
+  case "qa-evidence-handoff-raw-answer":
+    payload.qaFromEvidence.evidenceHandoff.rawAnswer = "unsafe";
+    break;
+  case "qa-evidence-handoff-token-field":
+    payload.qaFromEvidence.evidenceHandoff.token = "secret";
+    break;
+  case "source-file-match-release-array":
+    payload.qaFromEvidence.sourceFileMatchRelease = [];
+    break;
+  case "source-file-match-release-status-fail":
+    payload.qaFromEvidence.sourceFileMatchRelease.status = "FAIL";
+    break;
+  case "source-file-match-release-surface-mismatch":
+    payload.qaFromEvidence.sourceFileMatchRelease.surface = "PROJECT_QA_REPORT_EVIDENCE_HANDOFF";
+    break;
+  case "source-file-match-release-hidden":
+    payload.qaFromEvidence.sourceFileMatchRelease.visible = false;
+    break;
+  case "source-file-match-release-scan-mismatch":
+    payload.qaFromEvidence.sourceFileMatchRelease.scanTaskId = 2;
+    break;
+  case "source-file-match-release-request-scan-mismatch":
+    payload.qaFromEvidence.sourceFileMatchRelease.requestScanTaskId = 2;
+    break;
+  case "source-file-match-release-response-scan-mismatch":
+    payload.qaFromEvidence.sourceFileMatchRelease.responseScanTaskId = 2;
+    break;
+  case "source-file-match-release-review-state":
+    payload.qaFromEvidence.sourceFileMatchRelease.releaseState = "REVIEW";
+    break;
+  case "source-file-match-release-report-target-hidden":
+    payload.qaFromEvidence.sourceFileMatchRelease.reportTargetVisible = false;
+    break;
+  case "source-file-match-release-cited-slice-hidden":
+    payload.qaFromEvidence.sourceFileMatchRelease.citedSliceVisible = false;
+    break;
+  case "source-file-match-release-line-hidden":
+    payload.qaFromEvidence.sourceFileMatchRelease.reportTargetLineVisible = false;
+    break;
+  case "source-file-match-release-file-anchor":
+    payload.qaFromEvidence.sourceFileMatchRelease.sourceEvidenceMatchTypes = ["REPORT_FILE_ANCHOR"];
+    break;
+  case "source-file-match-release-line-anchor-hidden":
+    payload.qaFromEvidence.sourceFileMatchRelease.lineAnchorVisible = false;
+    break;
+  case "source-file-match-release-filename-only":
+    payload.qaFromEvidence.sourceFileMatchRelease.pathMatchType = "FILE_NAME_ONLY";
+    payload.qaFromEvidence.sourceFileMatchRelease.fileNameOnlyReviewVisible = true;
+    break;
+  case "source-file-match-release-evidence-uncovered":
+    payload.qaFromEvidence.sourceFileMatchRelease.requiredEvidenceCovered = false;
+    break;
+  case "source-file-match-release-primary-unbound":
+    payload.qaFromEvidence.sourceFileMatchRelease.primaryClaimBound = false;
+    break;
+  case "source-file-match-release-autorepair-not-ready":
+    payload.qaFromEvidence.sourceFileMatchRelease.readyForAutoRepair = false;
+    break;
+  case "source-file-match-release-next-action-mismatch":
+    payload.qaFromEvidence.sourceFileMatchRelease.nextActionKey = "SOURCE_BINDING_REVIEW";
+    break;
+  case "source-file-match-release-risk-hidden":
+    payload.qaFromEvidence.sourceFileMatchRelease.riskNoticeVisible = false;
+    break;
+  case "source-file-match-release-binding-notice-hidden":
+    payload.qaFromEvidence.sourceFileMatchRelease.sourceBindingOnlyNoticeVisible = false;
+    break;
+  case "source-file-match-release-provider-claim":
+    payload.qaFromEvidence.sourceFileMatchRelease.providerQualityClaim = true;
+    break;
+  case "source-file-match-release-llm-fact-claim":
+    payload.qaFromEvidence.sourceFileMatchRelease.llmFactClaim = true;
+    break;
+  case "source-file-match-release-overflow":
+    payload.qaFromEvidence.sourceFileMatchRelease.noHorizontalOverflow = false;
+    break;
+  case "source-file-match-release-raw-answer":
+    payload.qaFromEvidence.sourceFileMatchRelease.rawAnswer = "unsafe";
+    break;
+  case "source-file-match-release-token-field":
+    payload.qaFromEvidence.sourceFileMatchRelease.token = "secret";
+    break;
+  case "source-location-readability-array":
+    payload.qaFromEvidence.sourceLocationReadability = [];
+    break;
+  case "source-location-readability-status-fail":
+    payload.qaFromEvidence.sourceLocationReadability.status = "FAIL";
+    break;
+  case "source-location-readability-proof-count-low":
+    payload.qaFromEvidence.sourceLocationReadability.proofCount = 5;
+    break;
+  case "source-location-readability-mobile-missing":
+    payload.qaFromEvidence.sourceLocationReadability.mobile390Covered = false;
+    break;
+  case "source-location-readability-narrow-missing":
+    payload.qaFromEvidence.sourceLocationReadability.narrow320Covered = false;
+    break;
+  case "source-location-readability-ready-uncontained":
+    payload.qaFromEvidence.sourceLocationReadability.sourceReceipt.readyContained = false;
+    break;
+  case "source-location-readability-review-uncontained":
+    payload.qaFromEvidence.sourceLocationReadability.sourceLocationConfidence.reviewContained = false;
+    break;
+  case "source-location-readability-metrics-clipped":
+    payload.qaFromEvidence.sourceLocationReadability.sourceLocationConfidence.metricsNotClipped = false;
+    break;
+  case "source-location-readability-checks-nowrap":
+    payload.qaFromEvidence.sourceLocationReadability.sourceLocationConfidence.checksWrap = false;
+    break;
+  case "source-location-readability-target-clipped":
+    payload.qaFromEvidence.sourceLocationReadability.sourceFileMatchRelease.targetReferenceNotClipped = false;
+    break;
+  case "source-location-readability-repair-review-forged":
+    payload.qaFromEvidence.sourceLocationReadability.sourceFileMatchRelease.noRepairOnReview = false;
+    break;
+  case "source-location-readability-overflow":
+    payload.qaFromEvidence.sourceLocationReadability.noHorizontalOverflow = false;
+    break;
+  case "source-location-readability-provider-claim":
+    payload.qaFromEvidence.sourceLocationReadability.providerQualityClaim = true;
+    break;
+  case "source-location-readability-llm-fact-claim":
+    payload.qaFromEvidence.sourceLocationReadability.llmFactClaim = true;
+    break;
+  case "source-location-readability-raw-answer":
+    payload.qaFromEvidence.sourceLocationReadability.rawAnswer = "unsafe";
+    break;
+  case "ui-marker-sensitive-value":
+    payload.pages.push("Authorization: Bearer public-repo-ui-smoke-token");
+    break;
+	  case "missing-qa-from-evidence":
+	    delete payload.qaFromEvidence;
+	    break;
+  case "qa-from-evidence-scan-mismatch":
+    payload.qaFromEvidence.scanTaskId = 2;
+    break;
+  case "qa-from-evidence-response-500":
+    payload.qaFromEvidence.responseStatus = 500;
+    break;
+  case "qa-from-evidence-empty-citations":
+    payload.qaFromEvidence.citationCount = 0;
+    break;
+  case "qa-from-evidence-empty-results":
+    payload.qaFromEvidence.resultCount = 0;
+    break;
+  case "qa-from-evidence-missing-grounding":
+    payload.qaFromEvidence.groundingStatuses = [];
+    break;
+  case "qa-from-evidence-unverified-grounding":
+    payload.qaFromEvidence.groundingStatuses = ["UNVERIFIED"];
+    break;
+  case "qa-from-evidence-zero-cited-chunks":
+    payload.qaFromEvidence.citedChunkCount = 0;
+    break;
+  case "qa-from-evidence-missing-coverage":
+    delete payload.qaFromEvidence.citationCoverage;
+    break;
+	  case "qa-from-evidence-coverage-count-mismatch":
+	    payload.qaFromEvidence.citationCoverage.minTotalEvidenceCount = 3;
+    break;
+  case "qa-from-evidence-coverage-repair-zero":
+    payload.qaFromEvidence.citationCoverage.minRepairCandidateCount = 0;
+    break;
+  case "qa-from-evidence-missing-required-coverage":
+    delete payload.qaFromEvidence.citationCoverage.minRequiredEvidenceCoveragePercent;
+    break;
+  case "qa-from-evidence-low-required-coverage":
+    payload.qaFromEvidence.citationCoverage.minRequiredEvidenceCoveragePercent = 99;
+    break;
+  case "qa-from-evidence-required-count-zero":
+    payload.qaFromEvidence.citationCoverage.minRequiredEvidenceCount = 0;
+    break;
+  case "qa-from-evidence-required-file-count-zero":
+    payload.qaFromEvidence.citationCoverage.minRequiredEvidenceFileCount = 0;
+    break;
+  case "qa-from-evidence-cited-required-file-count-zero":
+    payload.qaFromEvidence.citationCoverage.minCitedRequiredEvidenceFileCount = 0;
+    break;
+  case "qa-from-evidence-primary-file-count-zero":
+    payload.qaFromEvidence.citationCoverage.minPrimaryEvidenceFileCount = 0;
+    break;
+	  case "qa-from-evidence-cited-primary-file-count-zero":
+	    payload.qaFromEvidence.citationCoverage.minCitedPrimaryEvidenceFileCount = 0;
+	    break;
+	  case "qa-from-evidence-uncited-primary-count-positive":
+	    payload.qaFromEvidence.citationCoverage.maxUncitedPrimaryEvidenceCount = 1;
+	    break;
+	  case "qa-from-evidence-uncited-primary-file-count-positive":
+	    payload.qaFromEvidence.citationCoverage.maxUncitedPrimaryEvidenceFileCount = 1;
+	    break;
+	  case "qa-from-evidence-uncited-context-count-zero":
+	    payload.qaFromEvidence.citationCoverage.minUncitedContextEvidenceCount = 0;
+	    break;
+	  case "qa-from-evidence-uncited-context-file-count-zero":
+	    payload.qaFromEvidence.citationCoverage.minUncitedContextEvidenceFileCount = 0;
+	    break;
+	  case "qa-from-evidence-missing-role-distribution":
+	    delete payload.qaFromEvidence.citationCoverage.evidenceRoleDistribution;
+	    break;
+  case "qa-from-evidence-role-primary-mismatch":
+    payload.qaFromEvidence.citationCoverage.evidenceRoleDistribution.minPrimaryFileCount = 2;
+    break;
+  case "qa-from-evidence-role-cited-primary-zero":
+    payload.qaFromEvidence.citationCoverage.evidenceRoleDistribution.minCitedPrimaryFileCount = 0;
+    break;
+  case "qa-from-evidence-illegal-coverage-scope":
+    payload.qaFromEvidence.citationCoverage.coverageScopes = ["SECONDARY"];
+    break;
+  case "qa-from-evidence-missing-claim-coverage":
+    delete payload.qaFromEvidence.claimCitationCoverage;
+    break;
+  case "qa-from-evidence-low-claim-coverage":
+    payload.qaFromEvidence.claimCitationCoverage.minClaimCoveragePercent = 99;
+    break;
+  case "qa-from-evidence-claim-status-review":
+    payload.qaFromEvidence.claimCitationCoverage.statuses = ["REVIEW"];
+    break;
+  case "qa-from-evidence-claim-ready-for-repair-missing":
+    delete payload.qaFromEvidence.claimCitationCoverage.readyForRepair;
+    break;
+  case "qa-from-evidence-claim-ready-for-repair-false":
+    payload.qaFromEvidence.claimCitationCoverage.readyForRepair = false;
+    break;
+  case "qa-from-evidence-claim-readiness-reason-context":
+    payload.qaFromEvidence.claimCitationCoverage.readinessReasons = ["CONTEXT_ONLY_CLAIM"];
+    break;
+  case "qa-from-evidence-invalid-claim-citation":
+    payload.qaFromEvidence.claimCitationCoverage.maxInvalidCitationClaimCount = 1;
+    break;
+  case "qa-from-evidence-claim-file-count-zero":
+    payload.qaFromEvidence.claimCitationCoverage.minValidCitationFileCount = 0;
+    payload.qaFromEvidence.claimCitationCoverage.minRequiredClaimCitationFileCount = 0;
+    break;
+  case "qa-from-evidence-missing-claim-role-distribution":
+    delete payload.qaFromEvidence.claimCitationCoverage.roleDistribution;
+    break;
+  case "qa-from-evidence-claim-role-status-context":
+    payload.qaFromEvidence.claimCitationCoverage.roleDistribution.statuses = ["CONTEXT_ONLY"];
+    break;
+  case "qa-from-evidence-claim-role-primary-under-covered":
+    payload.qaFromEvidence.claimCitationCoverage.roleDistribution.minRequiredPrimaryBoundClaimCount = 0;
+    break;
+  case "qa-from-evidence-missing-cross-file-summary":
+    delete payload.qaFromEvidence.crossFileCitationSummary;
+    break;
+	  case "qa-from-evidence-cross-file-count-mismatch":
+	    payload.qaFromEvidence.crossFileCitationSummary.minEvidenceFileCount = 3;
+	    break;
+	  case "qa-from-evidence-cross-file-context-gap-hidden":
+	    payload.qaFromEvidence.crossFileCitationSummary.contextGapVisible = false;
+	    break;
+	  case "qa-from-evidence-cross-file-raw-field":
+	    payload.qaFromEvidence.crossFileCitationSummary.sourceUrl = "http://example.com/source";
+	    break;
+  case "qa-from-evidence-cross-file-unexpected-field":
+    payload.qaFromEvidence.crossFileCitationSummary.notes = "unexpected";
+    break;
+  case "qa-from-evidence-missing-enforcement":
+    delete payload.qaFromEvidence.citationEnforcementStatuses;
+    break;
+  case "qa-from-evidence-retry-failed-enforcement":
+    payload.qaFromEvidence.citationEnforcementStatuses = ["RETRY_FAILED"];
+    break;
+  case "qa-from-evidence-file-hidden":
+    payload.qaFromEvidence.expectedEvidenceFileVisible = false;
+    break;
+  case "qa-from-evidence-missing-evidence-ref":
+    delete payload.qaFromEvidence.evidenceRef;
+    break;
+  case "qa-from-evidence-evidence-ref-unbound":
+    payload.qaFromEvidence.evidenceRef.requestBound = false;
+    break;
+  case "qa-from-evidence-evidence-ref-response-unbound":
+    payload.qaFromEvidence.evidenceRef.responseBound = false;
+    break;
+  case "qa-from-evidence-evidence-ref-context-hidden":
+    payload.qaFromEvidence.evidenceRef.contextVisible = false;
+    break;
+  case "qa-from-evidence-evidence-ref-unsafe-path":
+    payload.qaFromEvidence.evidenceRef.filePath = "../DemoController.java";
+    break;
+  case "qa-from-evidence-start-end-only-missing":
+    delete payload.qaFromEvidence.startEndOnlyEvidenceRef;
+    break;
+  case "qa-from-evidence-start-end-only-legacy-line":
+    payload.qaFromEvidence.startEndOnlyEvidenceRef.requestHasLegacyLineNumber = true;
+    payload.qaFromEvidence.startEndOnlyEvidenceRef.responseHasLegacyLineNumber = true;
+    break;
+  case "qa-from-evidence-start-end-only-file-anchor":
+    payload.qaFromEvidence.startEndOnlyEvidenceRef.sourceEvidenceMatchTypes = ["REPORT_FILE_ANCHOR"];
+    break;
+  case "qa-from-evidence-start-end-only-primary-unbound":
+    payload.qaFromEvidence.startEndOnlyEvidenceRef.primaryChunkBound = false;
+    break;
+  case "qa-from-evidence-claim-noise-missing":
+    delete payload.qaFromEvidence.claimCitationNoiseBoundary;
+    break;
+  case "qa-from-evidence-claim-noise-ready-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.claimCitationStatus = "READY";
+    payload.qaFromEvidence.claimCitationNoiseBoundary.roleDistributionStatus = "PRIMARY_BOUND";
+    break;
+  case "qa-from-evidence-claim-noise-verified-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.groundingStatuses = ["VERIFIED"];
+    break;
+  case "qa-from-evidence-claim-noise-cited-evidence-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.maxCitedEvidenceCount = 1;
+    break;
+  case "qa-from-evidence-claim-noise-answer-cited-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.answerCitationsCitedByAnswer = true;
+    break;
+  case "qa-from-evidence-claim-noise-repair-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.maxRepairCandidateCount = 1;
+    break;
+  case "qa-from-evidence-claim-noise-repair-visible":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.repairCandidateActionVisible = true;
+    break;
+  case "qa-from-evidence-claim-noise-blocked-hidden":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.repairEvidenceGateBlockedVisible = false;
+    break;
+  case "qa-from-evidence-claim-noise-ready-summary-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.trustSummaryReadyVisible = true;
+    break;
+  case "qa-from-evidence-claim-noise-unknown-kind":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.noiseKinds = ["fenced-code", "unknown-noise"];
+    break;
+  case "qa-from-evidence-claim-noise-raw-answer":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.rawAnswer = "AuthService validates token [C1]";
+    break;
+  case "qa-from-evidence-claim-noise-raw-prompt":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.rawPrompt = "secret prompt";
+    break;
+  case "qa-from-evidence-claim-noise-scan-mismatch":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.responseScanTaskId = 2;
+    break;
+  case "qa-from-evidence-claim-noise-setup-warn":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.llmSetup.status = "WARN";
+    break;
+	  case "qa-from-evidence-claim-noise-cleanup-warn":
+	    payload.qaFromEvidence.claimCitationNoiseBoundary.llmCleanup.status = "WARN";
+	    break;
+	  case "qa-relation-aware-array":
+	    payload.qaFromEvidence.relationAwareEvidenceReason = [];
+	    break;
+	  case "qa-relation-aware-status-fail":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.status = "FAIL";
+	    break;
+	  case "qa-relation-aware-surface-mismatch":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.surface = "PROJECT_QA_RELATION_AWARE_EVIDENCE_REASON";
+	    break;
+	  case "qa-relation-aware-marker-forged":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.marker = "File name match:";
+	    break;
+	  case "qa-relation-aware-proof-count-zero":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.proofCount = 0;
+	    break;
+	  case "qa-relation-aware-citation-and-chunk-zero":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.minCitationReasonCount = 0;
+	    payload.qaFromEvidence.relationAwareEvidenceReason.minRetrievedChunkReasonCount = 0;
+	    break;
+	  case "qa-relation-aware-adjacent-hidden":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.adjacentContextReasonVisible = false;
+	    break;
+	  case "qa-relation-aware-primary-missing":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.citedPrimaryStillPresent = false;
+	    break;
+	  case "qa-relation-aware-ui-hidden":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.uiReasonVisible = false;
+	    break;
+	  case "qa-relation-aware-provider-claim":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.providerQualityClaim = true;
+	    break;
+	  case "qa-relation-aware-llm-fact-claim":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.llmFactClaim = true;
+	    break;
+	  case "qa-relation-aware-raw-answer":
+	    payload.qaFromEvidence.relationAwareEvidenceReason.rawAnswer = "Graph relation: leaked raw answer";
+	    break;
+	  case "qa-from-evidence-file-anchor-missing":
+	    delete payload.qaFromEvidence.fileAnchorDrift;
+	    break;
+  case "qa-from-evidence-file-anchor-grounding-verified":
+    payload.qaFromEvidence.fileAnchorDrift.groundingStatuses = ["VERIFIED"];
+    break;
+  case "qa-from-evidence-file-anchor-enforcement-direct":
+    payload.qaFromEvidence.fileAnchorDrift.citationEnforcementStatuses = ["DIRECT_VERIFIED"];
+    break;
+  case "qa-from-evidence-file-anchor-line-anchor-forged":
+    payload.qaFromEvidence.fileAnchorDrift.sourceEvidenceMatchTypes = ["REPORT_LINE_ANCHOR"];
+    break;
+  case "qa-from-evidence-file-anchor-coverage-primary-forged":
+    payload.qaFromEvidence.fileAnchorDrift.citationCoverage.maxPrimaryEvidenceCount = 1;
+    break;
+  case "qa-from-evidence-file-anchor-coverage-scope-primary":
+    payload.qaFromEvidence.fileAnchorDrift.citationCoverage.coverageScopes = ["PRIMARY"];
+    break;
+  case "qa-from-evidence-file-anchor-repair-candidate-forged":
+    payload.qaFromEvidence.fileAnchorDrift.citationCoverage.maxRepairCandidateCount = 1;
+    break;
+  case "qa-from-evidence-file-anchor-role-primary-bound":
+    payload.qaFromEvidence.fileAnchorDrift.claimCitationCoverage.roleDistribution.statuses = ["PRIMARY_BOUND"];
+    break;
+  case "qa-from-evidence-file-anchor-claim-review-forged":
+    payload.qaFromEvidence.fileAnchorDrift.claimCitationCoverage.statuses = ["REVIEW"];
+    break;
+  case "qa-from-evidence-file-anchor-primary-bound-count-forged":
+    payload.qaFromEvidence.fileAnchorDrift.claimCitationCoverage.roleDistribution.maxRequiredPrimaryBoundClaimCount = 1;
+    break;
+  case "qa-from-evidence-file-anchor-repair-action-visible":
+    payload.qaFromEvidence.fileAnchorDrift.latestNextActionRepairHidden = false;
+    break;
+  case "qa-from-evidence-file-anchor-cleanup-warn":
+    payload.qaFromEvidence.fileAnchorDrift.llmCleanup.status = "WARN";
+    break;
+  default:
+    throw new Error(`unknown public repo UI marker mutation: ${mutation}`);
+}
+process.stdout.write(`PUBLIC_REPO_UI_SMOKE_OK ${JSON.stringify(payload)}`);
+NODE
+	  }
+
+  if [[ -z "$failure" ]]; then
+    set +e
+    run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=true \
+      SOURCELENS_RELEASE_EVIDENCE_PUBLIC_REPO_SMOKE_UI=true \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1
+    release_code=$?
+    set -e
+    if (( release_code == 0 )); then
+      cat "$output_file" >&2
+      failure="required public repo UI smoke release evidence probe should record a required failure before marker forgery"
+    fi
+  fi
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a package for public repo UI marker verification"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="untampered required public repo UI smoke package must pass verifier before marker probe"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! rg -q '^public_repo_smoke_ui: true$' "$run_dir/manifest.txt"; then
+      cat "$run_dir/manifest.txt" >&2
+      failure="release evidence manifest must record public_repo_smoke_ui=true for UI marker probe"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN {
+        OFS = "\t"
+      }
+      NR == 1 {
+        print
+        next
+      }
+      $2 == "public-repo-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge public repo UI smoke status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- FAIL `public-repo-smoke`: / && !changed {
+        print "- OK `public-repo-smoke`: Public repo analysis smoke (completed)"
+        changed = 1
+        next
+      }
+      /^- required_failures: `/ {
+        line = $0
+        sub(/^- required_failures: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- required_failures: `" line - 1 "`"
+        next
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge public repo UI smoke summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged public repo UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged public repo UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep public repo UI marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_public_repo_ui_marker_log "$valid_main_payload" "PUBLIC_REPO_UI_SMOKE_OK $valid_ui_payload"; then
+      failure="could not write valid forged public repo UI smoke markers"
+    elif ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must accept valid public repo smoke and UI smoke markers"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "missing-ui-marker" "$valid_main_payload" ""
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "duplicate-ui-marker" "$valid_main_payload" "PUBLIC_REPO_UI_SMOKE_OK $valid_ui_payload
+PUBLIC_REPO_UI_SMOKE_OK $valid_ui_payload"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "array-json" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK []'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "id-mismatch" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":2,"repositoryId":1,"scanTaskId":1,"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "real-backend-false" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":false,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "mocked-api-true" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":true}'
+  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "missing-page" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+	  fi
+	  for recommended_step_mutation in \
+	    missing-recommended-next-step \
+	    recommended-next-step-array \
+	    recommended-next-step-hidden \
+	    recommended-next-step-primary-hidden \
+	    recommended-next-step-secondary-hidden \
+	    recommended-next-step-bad-key \
+	    recommended-next-step-empty-title; do
+	    if [[ -z "$failure" ]]; then
+	      verify_public_repo_ui_marker_rejects "$recommended_step_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$recommended_step_mutation")"
+	    fi
+	  done
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "missing-governance-timeline" "$valid_main_payload" "$(mutated_public_repo_ui_marker "missing-governance-timeline")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-aggregate-api-false" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-aggregate-api-false")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-response-status-500" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-response-status-500")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-path-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-path-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-scan-id-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-scan-id-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-summary" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-summary")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-resources" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-resources")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-limits" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-limits")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-resources-unbound" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-resources-unbound")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-empty-events" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-empty-events")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-page" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-page")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-resource-array" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-resource-array")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-artifacts-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-artifacts-zero")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-scan-executions-two" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-scan-executions-two")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-derived-audit-auto-repair" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-derived-audit-auto-repair")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-derived-audit-agent-task" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-derived-audit-agent-task")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-derived-artifact-auto-repair" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-derived-artifact-auto-repair")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-derived-artifact-agent-task" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-derived-artifact-agent-task")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-change-patch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-change-patch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-agent-report" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-agent-report")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-derived-not-visible" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-derived-not-visible")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-missing-patch-evidence" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-missing-patch-evidence")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-evidence-array" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-evidence-array")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-evidence-status-fail" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-evidence-status-fail")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-repair-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-repair-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-auto-repair-id-missing" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-auto-repair-id-missing")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-repair-status-not-ready" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-repair-status-not-ready")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-scan-unbound" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-scan-unbound")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-target-file-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-target-file-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-diff-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-diff-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-artifact-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-artifact-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-artifact-owner-type-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-artifact-owner-type-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-artifact-owner-id-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-artifact-owner-id-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-artifact-type-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-artifact-type-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-ready-audit-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-ready-audit-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-ready-audit-action-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-ready-audit-action-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-ready-audit-status-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-ready-audit-status-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-ready-audit-source-unbound" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-ready-audit-source-unbound")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-repair-execution-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-repair-execution-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-repair-execution-source-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-repair-execution-source-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-repair-execution-status-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-repair-execution-status-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-generation-step-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-generation-step-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-patch-generation-step-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-patch-generation-step-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "governance-foreign-patch-evidence-visible" "$valid_main_payload" "$(mutated_public_repo_ui_marker "governance-foreign-patch-evidence-visible")"
+	  fi
+	  for agent_review_mutation in \
+	    governance-missing-agent-review \
+	    governance-agent-review-array \
+	    governance-agent-review-status-fail \
+	    governance-agent-task-hidden \
+	    governance-agent-task-id-missing \
+	    governance-agent-task-status-not-completed \
+	    governance-agent-task-scan-unbound \
+	    governance-agent-report-hidden \
+	    governance-agent-report-owner-type-mismatch \
+	    governance-agent-report-owner-id-mismatch \
+	    governance-agent-report-artifact-type-mismatch \
+	    governance-agent-audit-hidden \
+	    governance-agent-audit-action-mismatch \
+	    governance-agent-audit-status-mismatch \
+	    governance-agent-audit-source-unbound \
+	    governance-agent-execution-hidden \
+	    governance-agent-execution-source-type-mismatch \
+	    governance-agent-execution-source-id-mismatch \
+	    governance-agent-execution-status-mismatch \
+	    governance-agent-execution-step-hidden \
+	    governance-agent-execution-step-mismatch \
+	    governance-foreign-agent-evidence-visible \
+	    governance-agent-raw-prompt-visible; do
+	    if [[ -n "$failure" ]]; then
+	      break
+	    fi
+	    verify_public_repo_ui_marker_rejects "$agent_review_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$agent_review_mutation")"
+	  done
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "missing-code-knowledge" "$valid_main_payload" "$(mutated_public_repo_ui_marker "missing-code-knowledge")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-array" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-array")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-status-fail" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-status-fail")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-scan-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-scan-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-response-500" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-response-500")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-empty-results" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-empty-results")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-total-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-total-zero")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-embedded-over-total" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-embedded-over-total")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-bad-retrieval-mode" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-bad-retrieval-mode")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-no-context-mode" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-no-context-mode")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-gap-readiness" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-gap-readiness")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-confidence-out-of-range" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-confidence-out-of-range")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-unique-files-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-unique-files-zero")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-profile-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-profile-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-foreign-scan" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-foreign-scan")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-source-label-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-source-label-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-file-path-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-file-path-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-evidence-file-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-evidence-file-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-file-stats-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-file-stats-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-missing-primary-role" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-missing-primary-role")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "code-knowledge-empty-evidence-types" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-empty-evidence-types")"
+	  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-readiness-unusable" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-readiness-unusable")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-missing-cross-file" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-missing-cross-file")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-array" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-array")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-status-fail" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-status-fail")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-endpoint-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-endpoint-mismatch")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-limit-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-limit-mismatch")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-scan-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-scan-mismatch")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-one-result" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-one-result")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-one-file" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-one-file")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-foreign-scan" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-foreign-scan")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-stats-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-stats-hidden")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-one-stat-file" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-one-stat-file")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-source-label-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-source-label-hidden")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-bad-retrieval-mode" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-bad-retrieval-mode")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "code-knowledge-cross-file-not-satisfied" "$valid_main_payload" "$(mutated_public_repo_ui_marker "code-knowledge-cross-file-not-satisfied")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    for code_understanding_lens_mutation in \
+		      missing-code-understanding-lens \
+		      code-understanding-lens-array \
+		      code-understanding-lens-hidden \
+		      code-understanding-lens-scan-mismatch \
+		      code-understanding-lens-request-scan-mismatch \
+		      code-understanding-lens-response-scan-mismatch \
+		      code-understanding-lens-foreign-scan \
+		      code-understanding-lens-general-kind \
+		      code-understanding-lens-empty-result \
+		      code-understanding-lens-primary-unmatched \
+		      code-understanding-lens-target-file-mismatch \
+		      code-understanding-lens-unsafe-path \
+		      code-understanding-lens-invalid-line-range \
+		      code-understanding-lens-locate-hidden \
+		      code-understanding-lens-explain-hidden \
+		      code-understanding-lens-copy-hidden \
+		      code-understanding-lens-raw-stack \
+		      code-understanding-lens-raw-prompt \
+		      code-understanding-lens-provider-claim \
+		      code-understanding-lens-llm-fact-claim; do
+		      if [[ -n "$failure" ]]; then
+		        break
+		      fi
+		      verify_public_repo_ui_marker_rejects "$code_understanding_lens_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$code_understanding_lens_mutation")"
+		    done
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    for evidence_combination_mutation in \
+		      project-qa-evidence-combination-array \
+		      project-qa-evidence-combination-status-fail \
+		      project-qa-evidence-combination-surface-mismatch \
+		      project-qa-evidence-combination-hidden \
+		      project-qa-evidence-combination-scan-mismatch \
+		      project-qa-evidence-combination-request-scan-mismatch \
+		      project-qa-evidence-combination-response-scan-mismatch \
+		      project-qa-evidence-combination-foreign-scan \
+		      project-qa-evidence-combination-empty-result \
+		      project-qa-evidence-combination-hidden-cards \
+		      project-qa-evidence-combination-empty-labels \
+		      project-qa-evidence-combination-bad-label \
+		      project-qa-evidence-combination-empty-source-labels \
+		      project-qa-evidence-combination-bad-source-label \
+		      project-qa-evidence-combination-adjacent-only \
+		      project-qa-evidence-combination-primary-zero \
+		      project-qa-evidence-combination-unique-files-zero \
+		      project-qa-evidence-combination-embedded-negative \
+		      project-qa-evidence-combination-next-question-low \
+		      project-qa-evidence-combination-source-labels-hidden \
+		      project-qa-evidence-combination-file-paths-hidden \
+		      project-qa-evidence-combination-file-coverage-hidden \
+		      project-qa-evidence-combination-role-path-hidden \
+		      project-qa-evidence-combination-embedding-hidden \
+		      project-qa-evidence-combination-top-ref-hidden \
+		      project-qa-evidence-combination-not-visible-derived \
+		      project-qa-evidence-combination-not-result-set-only \
+		      project-qa-evidence-combination-provider-claim \
+		      project-qa-evidence-combination-llm-fact-claim \
+		      project-qa-evidence-combination-overflow \
+		      project-qa-evidence-combination-raw-content; do
+		      if [[ -n "$failure" ]]; then
+		        break
+		      fi
+		      verify_public_repo_ui_marker_rejects "$evidence_combination_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$evidence_combination_mutation")"
+		    done
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    for qa_evidence_handoff_mutation in \
+		      qa-evidence-handoff-array \
+		      qa-evidence-handoff-status-fail \
+		      qa-evidence-handoff-surface-mismatch \
+		      qa-evidence-handoff-hidden \
+		      qa-evidence-handoff-source-bridge-hidden \
+		      qa-evidence-handoff-receipt-hidden \
+		      qa-evidence-handoff-scan-mismatch \
+		      qa-evidence-handoff-response-scan-mismatch \
+		      qa-evidence-handoff-request-unbound \
+		      qa-evidence-handoff-response-unbound \
+		      qa-evidence-handoff-report-file-anchor \
+		      qa-evidence-handoff-line-anchor-hidden \
+		      qa-evidence-handoff-title-hidden \
+		      qa-evidence-handoff-not-ready \
+		      qa-evidence-handoff-action-hidden \
+		      qa-evidence-handoff-url-unbound \
+		      qa-evidence-handoff-source-type-manual \
+		      qa-evidence-handoff-repository-unbound \
+		      qa-evidence-handoff-citation-unbound \
+		      qa-evidence-handoff-source-params-unbound \
+		      qa-evidence-handoff-form-hidden \
+		      qa-evidence-handoff-form-file-unbound \
+		      qa-evidence-handoff-target-desc-unbound \
+		      qa-evidence-handoff-provider-claim \
+		      qa-evidence-handoff-raw-answer \
+		      qa-evidence-handoff-token-field; do
+		      if [[ -n "$failure" ]]; then
+		        break
+		      fi
+		      verify_public_repo_ui_marker_rejects "$qa_evidence_handoff_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$qa_evidence_handoff_mutation")"
+		    done
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    for source_file_match_release_mutation in \
+		      source-file-match-release-array \
+		      source-file-match-release-status-fail \
+		      source-file-match-release-surface-mismatch \
+		      source-file-match-release-hidden \
+		      source-file-match-release-scan-mismatch \
+		      source-file-match-release-request-scan-mismatch \
+		      source-file-match-release-response-scan-mismatch \
+		      source-file-match-release-review-state \
+		      source-file-match-release-report-target-hidden \
+		      source-file-match-release-cited-slice-hidden \
+		      source-file-match-release-line-hidden \
+		      source-file-match-release-file-anchor \
+		      source-file-match-release-line-anchor-hidden \
+		      source-file-match-release-filename-only \
+		      source-file-match-release-evidence-uncovered \
+		      source-file-match-release-primary-unbound \
+		      source-file-match-release-autorepair-not-ready \
+		      source-file-match-release-next-action-mismatch \
+		      source-file-match-release-risk-hidden \
+		      source-file-match-release-binding-notice-hidden \
+		      source-file-match-release-provider-claim \
+		      source-file-match-release-llm-fact-claim \
+		      source-file-match-release-overflow \
+		      source-file-match-release-raw-answer \
+		      source-file-match-release-token-field; do
+		      if [[ -n "$failure" ]]; then
+		        break
+		      fi
+		      verify_public_repo_ui_marker_rejects "$source_file_match_release_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$source_file_match_release_mutation")"
+			    done
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    for relation_aware_evidence_reason_mutation in \
+			      qa-relation-aware-array \
+			      qa-relation-aware-status-fail \
+			      qa-relation-aware-surface-mismatch \
+			      qa-relation-aware-marker-forged \
+			      qa-relation-aware-proof-count-zero \
+			      qa-relation-aware-citation-and-chunk-zero \
+			      qa-relation-aware-adjacent-hidden \
+			      qa-relation-aware-primary-missing \
+			      qa-relation-aware-ui-hidden \
+			      qa-relation-aware-provider-claim \
+			      qa-relation-aware-llm-fact-claim \
+			      qa-relation-aware-raw-answer; do
+			      if [[ -n "$failure" ]]; then
+			        break
+			      fi
+			      verify_public_repo_ui_marker_rejects "$relation_aware_evidence_reason_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$relation_aware_evidence_reason_mutation")"
+			    done
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    for source_location_readability_mutation in \
+		      source-location-readability-array \
+		      source-location-readability-status-fail \
+		      source-location-readability-proof-count-low \
+		      source-location-readability-mobile-missing \
+		      source-location-readability-narrow-missing \
+		      source-location-readability-ready-uncontained \
+		      source-location-readability-review-uncontained \
+		      source-location-readability-metrics-clipped \
+		      source-location-readability-checks-nowrap \
+		      source-location-readability-target-clipped \
+		      source-location-readability-repair-review-forged \
+		      source-location-readability-overflow \
+		      source-location-readability-provider-claim \
+		      source-location-readability-llm-fact-claim \
+		      source-location-readability-raw-answer; do
+		      if [[ -n "$failure" ]]; then
+		        break
+		      fi
+		      verify_public_repo_ui_marker_rejects "$source_location_readability_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$source_location_readability_mutation")"
+		    done
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "ui-marker-sensitive-value" "$valid_main_payload" "$(mutated_public_repo_ui_marker "ui-marker-sensitive-value")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "missing-qa-from-evidence" "$valid_main_payload" "$(mutated_public_repo_ui_marker "missing-qa-from-evidence")"
+		  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-scan-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-scan-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-response-500" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-response-500")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-empty-citations" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-empty-citations")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-empty-results" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-empty-results")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-grounding" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-grounding")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-unverified-grounding" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-unverified-grounding")"
+	  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-zero-cited-chunks" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-zero-cited-chunks")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-coverage" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-coverage")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-coverage-count-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-coverage-count-mismatch")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-coverage-repair-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-coverage-repair-zero")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-required-coverage" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-required-coverage")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-low-required-coverage" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-low-required-coverage")"
+	  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "qa-from-evidence-required-count-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-required-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "qa-from-evidence-required-file-count-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-required-file-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "qa-from-evidence-cited-required-file-count-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-cited-required-file-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "qa-from-evidence-primary-file-count-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-primary-file-count-zero")"
+  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-cited-primary-file-count-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-cited-primary-file-count-zero")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-uncited-primary-count-positive" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-uncited-primary-count-positive")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-uncited-primary-file-count-positive" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-uncited-primary-file-count-positive")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-uncited-context-count-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-uncited-context-count-zero")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-uncited-context-file-count-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-uncited-context-file-count-zero")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-role-distribution" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-role-distribution")"
+	  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "qa-from-evidence-role-primary-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-role-primary-mismatch")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "qa-from-evidence-role-cited-primary-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-role-cited-primary-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-illegal-coverage-scope" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-illegal-coverage-scope")"
+	  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-claim-coverage" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-claim-coverage")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-low-claim-coverage" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-low-claim-coverage")"
+		  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-claim-status-review" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-claim-status-review")"
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-claim-ready-for-repair-missing" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-claim-ready-for-repair-missing")"
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-claim-ready-for-repair-false" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-claim-ready-for-repair-false")"
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-claim-readiness-reason-context" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-claim-readiness-reason-context")"
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-invalid-claim-citation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-invalid-claim-citation")"
+			  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-claim-file-count-zero" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-claim-file-count-zero")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-claim-role-distribution" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-claim-role-distribution")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-claim-role-status-context" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-claim-role-status-context")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-claim-role-primary-under-covered" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-claim-role-primary-under-covered")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-cross-file-summary" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-cross-file-summary")"
+		  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-cross-file-count-mismatch" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-cross-file-count-mismatch")"
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-cross-file-context-gap-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-cross-file-context-gap-hidden")"
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-cross-file-raw-field" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-cross-file-raw-field")"
+			  fi
+			  if [[ -z "$failure" ]]; then
+			    verify_public_repo_ui_marker_rejects "qa-from-evidence-cross-file-unexpected-field" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-cross-file-unexpected-field")"
+			  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-enforcement" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-enforcement")"
+		  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-retry-failed-enforcement" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-retry-failed-enforcement")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-file-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-file-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-missing-evidence-ref" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-missing-evidence-ref")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-evidence-ref-unbound" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-evidence-ref-unbound")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-evidence-ref-response-unbound" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-evidence-ref-response-unbound")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-evidence-ref-context-hidden" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-evidence-ref-context-hidden")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_public_repo_ui_marker_rejects "qa-from-evidence-evidence-ref-unsafe-path" "$valid_main_payload" "$(mutated_public_repo_ui_marker "qa-from-evidence-evidence-ref-unsafe-path")"
+	  fi
+  if [[ -z "$failure" ]]; then
+    for qa_start_end_mutation in \
+      qa-from-evidence-start-end-only-missing \
+      qa-from-evidence-start-end-only-legacy-line \
+      qa-from-evidence-start-end-only-file-anchor \
+      qa-from-evidence-start-end-only-primary-unbound; do
+      if [[ -n "$failure" ]]; then
+        break
+      fi
+      verify_public_repo_ui_marker_rejects "$qa_start_end_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$qa_start_end_mutation")"
+    done
+  fi
+  if [[ -z "$failure" ]]; then
+    for qa_claim_noise_mutation in \
+      qa-from-evidence-claim-noise-missing \
+      qa-from-evidence-claim-noise-ready-forged \
+      qa-from-evidence-claim-noise-verified-forged \
+      qa-from-evidence-claim-noise-cited-evidence-forged \
+      qa-from-evidence-claim-noise-answer-cited-forged \
+      qa-from-evidence-claim-noise-repair-forged \
+      qa-from-evidence-claim-noise-repair-visible \
+      qa-from-evidence-claim-noise-blocked-hidden \
+      qa-from-evidence-claim-noise-ready-summary-forged \
+      qa-from-evidence-claim-noise-unknown-kind \
+      qa-from-evidence-claim-noise-raw-answer \
+      qa-from-evidence-claim-noise-raw-prompt \
+      qa-from-evidence-claim-noise-scan-mismatch \
+      qa-from-evidence-claim-noise-setup-warn \
+      qa-from-evidence-claim-noise-cleanup-warn; do
+      if [[ -n "$failure" ]]; then
+        break
+      fi
+      verify_public_repo_ui_marker_rejects "$qa_claim_noise_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$qa_claim_noise_mutation")"
+    done
+  fi
+  if [[ -z "$failure" ]]; then
+    for qa_file_anchor_mutation in \
+      qa-from-evidence-file-anchor-missing \
+      qa-from-evidence-file-anchor-grounding-verified \
+      qa-from-evidence-file-anchor-enforcement-direct \
+      qa-from-evidence-file-anchor-line-anchor-forged \
+      qa-from-evidence-file-anchor-coverage-primary-forged \
+      qa-from-evidence-file-anchor-coverage-scope-primary \
+      qa-from-evidence-file-anchor-repair-candidate-forged \
+      qa-from-evidence-file-anchor-role-primary-bound \
+      qa-from-evidence-file-anchor-claim-review-forged \
+      qa-from-evidence-file-anchor-primary-bound-count-forged \
+      qa-from-evidence-file-anchor-repair-action-visible \
+      qa-from-evidence-file-anchor-cleanup-warn; do
+      if [[ -n "$failure" ]]; then
+        break
+      fi
+      verify_public_repo_ui_marker_rejects "$qa_file_anchor_mutation" "$valid_main_payload" "$(mutated_public_repo_ui_marker "$qa_file_anchor_mutation")"
+    done
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "missing-viewport" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-file-mismatch" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"OtherController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"OtherController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-file-path-traversal" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"../DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"../DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "missing-evidence-drawer" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-drawer-status-fail" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"FAIL","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-drawer-not-opened" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":false,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-drawer-summary-hidden" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":false,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-drawer-scan-mismatch" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":2,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-drawer-limit-mismatch" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":1,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-drawer-empty-result" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":0,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "evidence-drawer-file-mismatch" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"OtherController.java"},"realBackend":true,"mockedApi":false}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "secret-field" "$valid_main_payload" 'PUBLIC_REPO_UI_SMOKE_OK {"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"expectedEvidenceFile":"DemoController.java","viewports":["1440x900","390x844","320x740"],"pages":["ProjectDetail","ScanTaskDetail","Report Evidence Drawer","ProjectDetail QA","ProjectDetail Graph","Artifacts","AuditLogs","AutoRepair candidate"],"evidenceDrawer":{"status":"OK","opened":true,"codeChunksSummaryVisible":true,"displayedChunk":true,"scanTaskId":1,"limit":3,"resultCount":1,"expectedEvidenceFile":"DemoController.java"},"realBackend":true,"mockedApi":false,"token":"eyJaaaaaaaaaaa.bbbbbbbbbbbbb.ccccccccccccc"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_public_repo_ui_marker_rejects "outer-ui-skipped" '{"projectId":1,"repositoryId":1,"scanTaskId":1,"rawScanContract":{"schemaVersion":2,"language":"Java","symbols":1,"graphNodes":1,"totalFiles":1,"apiRoutes":0,"entities":0},"chunkSearch":{"roleProbes":[{"role":"naturalEndpointCn","query":"业务接口","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"},{"role":"naturalEndpointEn","query":"business endpoint","status":"OK","matched":true,"resultCount":1,"matchedFile":"src/main/java/DemoController.java","matchedEvidenceType":"CONTROLLER","matchedReason":"evidenceType:CONTROLLER"}]},"publicRepoUiSmoke":{"status":"SKIPPED","expectedEvidenceFile":"DemoController.java","marker":"PUBLIC_REPO_UI_SMOKE_OK"}}' "PUBLIC_REPO_UI_SMOKE_OK $valid_ui_payload"
+  fi
+
+  cleanup_public_repo_ui_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_evidence_required_autorepair_patch_smoke_failure_is_verifiable() {
+  local tmp_dir
+  local evidence_root
+  local probe_suffix
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-release-autorepair-patch-probe.XXXXXX")" \
+    || fail "could not create release evidence AutoRepair patch smoke probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden release evidence AutoRepair patch smoke probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="autorepair-patch-required-${probe_suffix}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+
+  cleanup_release_autorepair_patch_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=true \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence must fail when AutoRepair patch smoke is required without SOURCELENS_BASE_URL"
+    fi
+  fi
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a verifiable package for required AutoRepair patch smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q $'^FAIL\tautorepair-patch-smoke\t-\tautorepair-patch-smoke\\.log\tSOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=true$' "$run_dir/status.tsv"; then
+    cat "$run_dir/status.tsv" >&2
+    failure="release evidence status table must record required AutoRepair patch smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q 'required_failures: `1`' "$run_dir/summary.md"; then
+    cat "$run_dir/summary.md" >&2
+    failure="release evidence summary must count required AutoRepair patch smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q 'SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=true' "$run_dir/autorepair-patch-smoke.log"; then
+    cat "$run_dir/autorepair-patch-smoke.log" >&2
+    failure="release evidence AutoRepair patch smoke log must explain missing SOURCELENS_BASE_URL"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="required AutoRepair patch smoke failure release evidence package must pass verifier"
+    fi
+  fi
+
+  cleanup_release_autorepair_patch_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_autorepair_patch_smoke_ok_without_marker() {
+  local tmp_dir
+  local evidence_root
+  local probe_suffix
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local marker_output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local release_code
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-autorepair-patch-marker-probe.XXXXXX")" \
+    || fail "could not create AutoRepair patch marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden AutoRepair patch marker probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="autorepair-patch-marker-${probe_suffix}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+  marker_output_file="$tmp_dir/verify-release-evidence-marker-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+
+  cleanup_autorepair_patch_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    set +e
+    run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=true \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1
+    release_code=$?
+    set -e
+    if (( release_code == 0 )); then
+      cat "$output_file" >&2
+      failure="required AutoRepair patch smoke release evidence probe should record a required failure before marker forgery"
+    fi
+  fi
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a package for AutoRepair patch marker verification"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="untampered required AutoRepair patch smoke package must pass verifier before marker probe"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN {
+        OFS = "\t"
+      }
+      NR == 1 {
+        print
+        next
+      }
+      $2 == "autorepair-patch-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge AutoRepair patch smoke status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- FAIL `autorepair-patch-smoke`: / && !changed {
+        print "- OK `autorepair-patch-smoke`: AutoRepair patch readiness smoke (completed)"
+        changed = 1
+        next
+      }
+      /^- required_failures: `/ {
+        line = $0
+        sub(/^- required_failures: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- required_failures: `" line - 1 "`"
+        next
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge AutoRepair patch smoke summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged AutoRepair patch smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged AutoRepair patch smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep AutoRepair patch marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$marker_output_file" 2>&1; then
+      cat "$marker_output_file" >&2
+      failure="release evidence verifier must reject AutoRepair patch smoke OK rows without AUTOREPAIR_PATCH_SMOKE_OK marker"
+    elif ! rg -q 'autorepair-patch-smoke OK must prove PATCH_READY' "$marker_output_file"; then
+      cat "$marker_output_file" >&2
+      failure="release evidence verifier must explain missing AutoRepair patch smoke marker rejection"
+    fi
+  fi
+
+  cleanup_autorepair_patch_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_patch_ready_ui_smoke_ok_without_marker() {
+  local tmp_dir
+  local tmp_bin
+  local evidence_root
+  local probe_suffix
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local marker_output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local release_code
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-patch-ready-ui-marker-probe.XXXXXX")" \
+    || fail "could not create PATCH_READY UI marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden PATCH_READY UI marker probe temp dir"
+  tmp_bin="$tmp_dir/bin"
+  mkdir -p "$tmp_bin" || failure="could not create PATCH_READY UI marker probe bin dir"
+  evidence_root="$tmp_dir/evidence"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="patch-ready-ui-marker-${probe_suffix}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+  marker_output_file="$tmp_dir/verify-release-evidence-marker-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+
+  cleanup_patch_ready_ui_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  valid_marker_payload='{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/autorepair/readability/VeryLargeControllerWithLongNameForPatchReadyReview.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","390x844","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true,"space":true},"accessibleSelection":true},"sharedSelectableRow":{"ariaControlsLinked":true,"detailRegionLinked":true,"selectedRepairIds":[101,103]},"layoutDensity":{"mobile390Covered":true,"narrow320Covered":true,"detailCardContained":true,"reviewChecklistContained":true,"sourceBridgeContained":true,"tableScrollerContained":true,"prPopconfirmContained":true,"noHorizontalOverflow":true},"mobileReadability":{"criticalTextsWrap":true,"targetFileNotClipped":true,"reviewGateTextNotClipped":true,"candidateReceiptTextNotClipped":true,"prConfirmTextNotClipped":true,"primaryButtonLabelNotClipped":true,"primaryButtonLabelIconSvgWhite":true},"tableScroller":{"containedInViewport":true,"overflowXAuto":true},"executionDetailGuard":{"selectedDetailSourceBound":true,"staleExecutionDetailRejected":true},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"prConfirmCandidateGate":{"sourceType":"PROJECT_QA_VERIFIED_CITATION","repairEvidenceGate":"READY","repairEvidenceGateSource":"SERVER_DERIVED","visible":true,"warningOnlyForPatchReady":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"runtimeIssues":0,"noHorizontalOverflow":true,"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+
+  write_patch_ready_ui_marker_log() {
+    local marker_payload="$1"
+    {
+      printf 'patch-ready-smoke.spec.ts\n'
+      printf 'PATCH_READY_UI_SMOKE_OK %s\n' "$marker_payload"
+    } > "$run_dir/patch-ready-ui-smoke.log" || return 1
+    chmod 600 "$run_dir/patch-ready-ui-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  verify_patch_ready_ui_marker_rejects() {
+    local label="$1"
+    local marker_payload="$2"
+    local reject_output_file="$tmp_dir/verify-release-evidence-patch-ready-ui-${label}.txt"
+    if [[ "$label" != "missing-table-detail-action" \
+      && "$label" != "legacy-keyboard-open-boolean" \
+      && "$label" != "missing-keyboard-enter" \
+      && "$label" != "missing-keyboard-space" ]]; then
+      marker_payload="$(node -e 'const payload = JSON.parse(process.argv[1]); payload.tableDetailAction = { visible: true, clickedRepairId: 101, detailPanelMatched: true, keyboardOpen: { enter: true, space: true }, accessibleSelection: true }; process.stdout.write(JSON.stringify(payload));' "$marker_payload")" \
+        || {
+          failure="could not enrich forged PATCH_READY UI smoke payload for $label"
+          return
+        }
+    fi
+	    if [[ "$label" != "missing-shared-selectable-row" \
+	      && "$label" != "missing-aria-controls-linked" \
+	      && "$label" != "missing-detail-region-linked" \
+	      && "$label" != "bad-selected-repair-ids" \
+	      && "$label" != "wrong-selected-repair-ids" \
+	      && "$label" != "reordered-selected-repair-ids" ]]; then
+      marker_payload="$(node -e 'const payload = JSON.parse(process.argv[1]); payload.sharedSelectableRow = { ariaControlsLinked: true, detailRegionLinked: true, selectedRepairIds: [101, 103] }; process.stdout.write(JSON.stringify(payload));' "$marker_payload")" \
+        || {
+          failure="could not enrich forged PATCH_READY UI smoke shared selectable row payload for $label"
+          return
+	        }
+	    fi
+    marker_payload="$(node -e '
+const payload = JSON.parse(process.argv[1]);
+const label = process.argv[2];
+payload.targetFile = "src/main/java/demo/autorepair/readability/VeryLargeControllerWithLongNameForPatchReadyReview.java";
+if (label !== "missing-narrow-viewport" && label !== "missing-mobile-viewport") {
+  payload.viewports = ["1440x900", "390x844", "320x740"];
+}
+if (label !== "missing-layout-density") {
+  payload.layoutDensity = { mobile390Covered: true, narrow320Covered: true, detailCardContained: true, reviewChecklistContained: true, sourceBridgeContained: true, tableScrollerContained: true, prPopconfirmContained: true, noHorizontalOverflow: true };
+}
+if (label !== "missing-mobile-readability") {
+  payload.mobileReadability = { criticalTextsWrap: true, targetFileNotClipped: true, reviewGateTextNotClipped: true, candidateReceiptTextNotClipped: true, prConfirmTextNotClipped: true, primaryButtonLabelNotClipped: true, primaryButtonLabelIconSvgWhite: true };
+}
+if (label !== "missing-table-scroller") {
+  payload.tableScroller = { containedInViewport: true, overflowXAuto: true };
+}
+if (label !== "missing-execution-detail-guard") {
+  payload.executionDetailGuard = { selectedDetailSourceBound: true, staleExecutionDetailRejected: true };
+}
+if (label !== "runtime-issues-nonzero") {
+  payload.runtimeIssues = 0;
+}
+if (label !== "horizontal-overflow-true") {
+  payload.noHorizontalOverflow = true;
+}
+process.stdout.write(JSON.stringify(payload));
+' "$marker_payload" "$label")" \
+      || {
+        failure="could not enrich forged PATCH_READY UI smoke readability payload for $label"
+        return
+      }
+	    if ! write_patch_ready_ui_marker_log "$marker_payload"; then
+	      failure="could not write forged PATCH_READY UI smoke payload for $label"
+	      return
+	    fi
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid PATCH_READY UI smoke marker: $label"
+    elif ! rg -q 'patch-ready-ui-smoke OK must prove mocked PATCH_READY browser flow' "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain invalid PATCH_READY UI smoke marker rejection: $label"
+    fi
+  }
+
+  if [[ -z "$failure" ]]; then
+    cat > "$tmp_bin/npm" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "exec" ]]; then
+  printf 'Version 1.61.1\n'
+  exit 0
+fi
+exit 1
+EOF
+    cat > "$tmp_bin/make" <<'EOF'
+#!/usr/bin/env bash
+printf 'fake patch-ready-ui-smoke failure without success marker\n'
+exit 7
+EOF
+    chmod 0700 "$tmp_bin/npm" "$tmp_bin/make" \
+      || failure="could not make PATCH_READY UI marker probe shims executable"
+  fi
+  if [[ -z "$failure" ]]; then
+    set +e
+    run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="$tmp_bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=true \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1
+    release_code=$?
+    set -e
+    if (( release_code == 0 )); then
+      cat "$output_file" >&2
+      failure="required PATCH_READY UI smoke release evidence probe should record a required failure before marker forgery"
+    fi
+  fi
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a package for PATCH_READY UI marker verification"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="untampered required PATCH_READY UI smoke package must pass verifier before marker probe"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN {
+        OFS = "\t"
+      }
+      NR == 1 {
+        print
+        next
+      }
+      $2 == "patch-ready-ui-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge PATCH_READY UI smoke status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- FAIL `patch-ready-ui-smoke`: / && !changed {
+        print "- OK `patch-ready-ui-smoke`: PATCH_READY browser UI smoke (mocked) (completed)"
+        changed = 1
+        next
+      }
+      /^- required_failures: `/ {
+        line = $0
+        sub(/^- required_failures: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- required_failures: `" line - 1 "`"
+        next
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge PATCH_READY UI smoke summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged PATCH_READY UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged PATCH_READY UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep PATCH_READY UI marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$marker_output_file" 2>&1; then
+      cat "$marker_output_file" >&2
+      failure="release evidence verifier must reject PATCH_READY UI smoke OK rows without PATCH_READY_UI_SMOKE_OK marker"
+    elif ! rg -q 'patch-ready-ui-smoke OK must prove mocked PATCH_READY browser flow' "$marker_output_file"; then
+      cat "$marker_output_file" >&2
+      failure="release evidence verifier must explain missing PATCH_READY UI smoke marker rejection"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_patch_ready_ui_marker_log "$valid_marker_payload"; then
+      failure="could not write valid forged PATCH_READY UI smoke marker"
+    elif ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must accept valid PATCH_READY UI smoke marker with required viewports"
+    fi
+  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_patch_ready_ui_marker_rejects "missing-narrow-viewport" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_patch_ready_ui_marker_rejects "missing-layout-density" "$(node -e 'const payload = JSON.parse(process.argv[1]); delete payload.layoutDensity; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_patch_ready_ui_marker_rejects "missing-mobile-readability" "$(node -e 'const payload = JSON.parse(process.argv[1]); delete payload.mobileReadability; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_patch_ready_ui_marker_rejects "missing-table-scroller" "$(node -e 'const payload = JSON.parse(process.argv[1]); delete payload.tableScroller; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_patch_ready_ui_marker_rejects "missing-execution-detail-guard" "$(node -e 'const payload = JSON.parse(process.argv[1]); delete payload.executionDetailGuard; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_patch_ready_ui_marker_rejects "runtime-issues-nonzero" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.runtimeIssues = 1; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_patch_ready_ui_marker_rejects "horizontal-overflow-true" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.noHorizontalOverflow = false; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_patch_ready_ui_marker_rejects "missing-pr-confirm-candidate-gate" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true,"space":true},"accessibleSelection":true},"sharedSelectableRow":{"ariaControlsLinked":true,"detailRegionLinked":true,"selectedRepairIds":[101,103]},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+	  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "missing-table-detail-action" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "legacy-keyboard-open-boolean" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":true,"accessibleSelection":true},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "missing-keyboard-enter" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"space":true},"accessibleSelection":true},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "missing-keyboard-space" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true},"accessibleSelection":true},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "missing-shared-selectable-row" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true,"space":true},"accessibleSelection":true},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "missing-aria-controls-linked" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true,"space":true},"accessibleSelection":true},"sharedSelectableRow":{"ariaControlsLinked":false,"detailRegionLinked":true,"selectedRepairIds":[101,103]},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "missing-detail-region-linked" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true,"space":true},"accessibleSelection":true},"sharedSelectableRow":{"ariaControlsLinked":true,"detailRegionLinked":false,"selectedRepairIds":[101,103]},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "bad-selected-repair-ids" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true,"space":true},"accessibleSelection":true},"sharedSelectableRow":{"ariaControlsLinked":true,"detailRegionLinked":true,"selectedRepairIds":[101]},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "wrong-selected-repair-ids" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true,"space":true},"accessibleSelection":true},"sharedSelectableRow":{"ariaControlsLinked":true,"detailRegionLinked":true,"selectedRepairIds":[101,102]},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "reordered-selected-repair-ids" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"tableDetailAction":{"visible":true,"clickedRepairId":101,"detailPanelMatched":true,"keyboardOpen":{"enter":true,"space":true},"accessibleSelection":true},"sharedSelectableRow":{"ariaControlsLinked":true,"detailRegionLinked":true,"selectedRepairIds":[103,101]},"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "missing-attempt-split" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "split-flag-false" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":false,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "bad-attempt-ids" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "bad-attempt-nos" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2,3],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "missing-patch-step" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "pr-step-drift" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","generate_patch"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "patch-evidence-false" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":false,"prFailureDoesNotBlockPatchEvidence":true},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_patch_ready_ui_marker_rejects "pr-failure-pollutes-patch-evidence" '{"projectId":1,"repairId":101,"scanTaskId":501,"executionTaskId":701,"auditLogId":801,"targetFile":"src/main/java/demo/LargeController.java","patchArtifactPath":"artifacts/auto-repairs/101/change.patch","detailFallbackCount":1,"submitPrCount":0,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"mockedApiOnly":true,"auditDeepLink":true,"prConfirmCancelled":true,"reviewGate":{"requiredEvidence":["diff","patchArtifact","patchGenerationStep","auditEvent"],"blockingEvidenceSatisfied":true,"missingEvidenceBlocked":true,"manualCandidateScanTaskWarningOnly":true,"popconfirmSummaryVisible":true},"attemptSplit":{"prExecutionAttemptSplit":true,"attemptIds":[1,2],"attemptNos":[1,2],"patchAttemptStepKeys":["prepare_workspace","generate_patch"],"prAttemptStepKeys":["create_branch","push_branch","create_pull_request"],"patchEvidenceFromStep":true,"prFailureDoesNotBlockPatchEvidence":false},"spec":"patch-ready-smoke.spec.ts","baseURLHost":"127.0.0.1"}'
+  fi
+
+  cleanup_patch_ready_ui_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_dashboard_next_action_ui_smoke_ok_without_marker() {
+  local tmp_dir
+  local run_id
+  local run_dir
+  local output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local tampered_manifest_file
+  local valid_marker_payload
+  local desktop_png_bytes
+  local tablet_png_bytes
+  local tablet_portrait_png_bytes
+  local mobile_png_bytes
+  local narrow_png_bytes
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-dashboard-next-action-ui-marker-probe.XXXXXX")" \
+    || fail "could not create Dashboard next action UI marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden Dashboard next action UI marker probe temp dir"
+  run_id="dashboard-next-action-ui-marker-${tmp_dir##*.}"
+  run_dir="$tmp_dir/$run_id"
+  output_file="$tmp_dir/verify-release-evidence-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+  tampered_manifest_file="$tmp_dir/manifest.txt"
+  valid_marker_payload=""
+
+  cleanup_dashboard_next_action_ui_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  write_dashboard_next_action_ui_marker_log() {
+    local marker_payload="$1"
+    {
+      printf 'dashboard-next-action-smoke.spec.ts\n'
+      printf 'DASHBOARD_NEXT_ACTION_SMOKE_OK %s\n' "$marker_payload"
+    } > "$run_dir/dashboard-next-action-ui-smoke.log" || return 1
+    chmod 600 "$run_dir/dashboard-next-action-ui-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  write_dashboard_next_action_png_fixtures() {
+    mkdir -p "$run_dir/dashboard-next-action-ui-smoke" || return 1
+    rm -f \
+      "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png" \
+      "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1024x768.png" \
+      "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-768x1024.png" \
+      "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-390x844.png" \
+      "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-320x740.png" || return 1
+    node - "$run_dir/dashboard-next-action-ui-smoke" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const { deflateSync } = require("node:zlib");
+
+const outDir = process.argv[2];
+
+function chunk(type, data) {
+  const output = Buffer.alloc(12 + data.length);
+  output.writeUInt32BE(data.length, 0);
+  output.write(type, 4, 4, "ascii");
+  data.copy(output, 8);
+  output.writeUInt32BE(0, 8 + data.length);
+  return output;
+}
+
+function png(width, height) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  const rowLength = 1 + width * 3;
+  const raw = Buffer.alloc(rowLength * height);
+  for (let y = 0; y < height; y += 1) {
+    const rowOffset = y * rowLength;
+    raw[rowOffset] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const i = rowOffset + 1 + x * 3;
+      raw[i] = (x * 17 + y * 13) & 0xff;
+      raw[i + 1] = (x * 7 + y * 19 + 41) & 0xff;
+      raw[i + 2] = (x * 3 + y * 5 + 97) & 0xff;
+    }
+  }
+  return Buffer.concat([
+    Buffer.from("89504e470d0a1a0a", "hex"),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw, { level: 1 })),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+fs.writeFileSync(path.join(outDir, "dashboard-next-action-review-risk-report-1440x900.png"), png(1440, 900), { mode: 0o600 });
+fs.writeFileSync(path.join(outDir, "dashboard-next-action-review-risk-report-1024x768.png"), png(1024, 768), { mode: 0o600 });
+fs.writeFileSync(path.join(outDir, "dashboard-next-action-review-risk-report-768x1024.png"), png(768, 1024), { mode: 0o600 });
+fs.writeFileSync(path.join(outDir, "dashboard-next-action-review-risk-report-390x844.png"), png(390, 844), { mode: 0o600 });
+fs.writeFileSync(path.join(outDir, "dashboard-next-action-review-risk-report-320x740.png"), png(320, 740), { mode: 0o600 });
+NODE
+    chmod 700 "$run_dir/dashboard-next-action-ui-smoke" || return 1
+    chmod 600 "$run_dir/dashboard-next-action-ui-smoke/"*.png || return 1
+  }
+
+  build_dashboard_next_action_ui_valid_marker_payload() {
+    desktop_png_bytes="$(wc -c < "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png" | tr -d '[:space:]')"
+    tablet_png_bytes="$(wc -c < "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1024x768.png" | tr -d '[:space:]')"
+    tablet_portrait_png_bytes="$(wc -c < "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-768x1024.png" | tr -d '[:space:]')"
+    mobile_png_bytes="$(wc -c < "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-390x844.png" | tr -d '[:space:]')"
+    narrow_png_bytes="$(wc -c < "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-320x740.png" | tr -d '[:space:]')"
+    node - "$desktop_png_bytes" "$tablet_png_bytes" "$tablet_portrait_png_bytes" "$mobile_png_bytes" "$narrow_png_bytes" <<'NODE'
+const desktopBytes = Number(process.argv[2]);
+const tabletBytes = Number(process.argv[3]);
+const tabletPortraitBytes = Number(process.argv[4]);
+const mobileBytes = Number(process.argv[5]);
+const narrowBytes = Number(process.argv[6]);
+const dashboardCases = ["recover-dashboard", "connect-repository", "watch-running-scan", "start-first-scan", "inspect-code-chunks", "review-risk-report", "ask-code-qa"];
+const dashboardViewports = ["1440x900", "1024x768", "768x1024", "390x844", "320x740"];
+const productPlaneColumns = new Map([
+  ["1440x900", 3],
+  ["1024x768", 2],
+  ["768x1024", 2],
+  ["390x844", 1],
+  ["320x740", 1],
+]);
+process.stdout.write(JSON.stringify({
+  mockedApiOnly: true,
+  unhandledApiRequests: 0,
+  cases: dashboardCases,
+  nextActions: ["恢复仪表盘数据", "接入第一个公开仓库", "跟踪运行中的扫描任务", "触发一次仓库扫描", "检查 code_chunks 生成状态", "复盘风险证据并生成修复候选", "进入代码问答复盘主链路"],
+  viewports: dashboardViewports,
+  visitedCases: dashboardCases.flatMap((caseKey) => dashboardViewports.map((viewport) => `${caseKey}:${viewport}`)),
+  productPlaneMap: {
+    scope: "DASHBOARD_THREE_PLANE_PRODUCT_STRUCTURE_READABILITY",
+    surface: "FRONT_OFFICE_DEVELOPER_CONSOLE_BACK_OFFICE",
+    visible: true,
+    planeCount: 3,
+    actionCount: 3,
+    expectedColumnsHonored: true,
+    desktopColumns: true,
+    tabletColumns: true,
+    tabletPortraitColumns: true,
+    mobileColumns: true,
+    narrowColumns: true,
+    copyReadable: true,
+    rbacCompleteClaim: false,
+    productionDeploymentClaim: false,
+    proofs: dashboardCases.flatMap((caseKey) => dashboardViewports.map((viewport) => {
+      const columns = productPlaneColumns.get(viewport);
+      return {
+        caseKey,
+        viewport,
+        visible: true,
+        planeCount: 3,
+        expectedColumns: columns,
+        actualColumns: columns,
+        expectedColumnsHonored: true,
+        copyReadable: true,
+        actionCount: 3,
+        rbacCompleteClaim: false,
+        productionDeploymentClaim: false,
+      };
+    })),
+  },
+  dashboardStatsApiSignals: {
+    sourceLabelSelector: ".sl-dashboard-metrics-source",
+    apiBackedCases: ["connect-repository", "watch-running-scan", "start-first-scan", "inspect-code-chunks", "review-risk-report", "ask-code-qa"],
+    fallbackCases: ["recover-dashboard"],
+    legacyStatsFallbackCase: "legacy-stats-without-api-fields",
+  },
+  executiveBriefing: {
+    scope: "DASHBOARD_EXECUTIVE_BRIEFING_DECISION_READABILITY",
+    signals: ["阶段进度", "质量状态", "风险阻塞", "下一步投入"],
+    signalCount: 4,
+    expectedColumnsHonored: true,
+    desktopColumns: true,
+    tabletColumns: true,
+    tabletPortraitColumns: true,
+    mobileColumns: true,
+    narrowColumns: true,
+    copyReadable: true,
+    actionVisible: true,
+    p9CompleteClaim: false,
+    rbacCompleteClaim: false,
+    productionDeploymentClaim: false,
+    commercializationClaim: false,
+  },
+  visualEvidence: [
+    {
+      caseKey: "review-risk-report",
+      viewport: "1440x900",
+      screenshot: "dashboard-next-action-review-risk-report-1440x900.png",
+      artifact: "dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png",
+      screenshotBytes: desktopBytes,
+      screenshotWidth: 1440,
+      screenshotHeight: 900,
+      distinctColorCount: 64,
+      panelTop: 120,
+      panelLeft: 240,
+      panelRight: 1200,
+      panelBottom: 680,
+      titleTop: 150,
+      titleBottom: 190,
+      primaryButtonTop: 520,
+      primaryButtonBottom: 568,
+      primaryButtonTextColor: "rgb(255, 255, 255)",
+    },
+    {
+      caseKey: "review-risk-report",
+      viewport: "1024x768",
+      screenshot: "dashboard-next-action-review-risk-report-1024x768.png",
+      artifact: "dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1024x768.png",
+      screenshotBytes: tabletBytes,
+      screenshotWidth: 1024,
+      screenshotHeight: 768,
+      distinctColorCount: 64,
+      panelTop: 100,
+      panelLeft: 120,
+      panelRight: 904,
+      panelBottom: 640,
+      titleTop: 130,
+      titleBottom: 170,
+      primaryButtonTop: 520,
+      primaryButtonBottom: 568,
+      primaryButtonTextColor: "rgb(255, 255, 255)",
+    },
+    {
+      caseKey: "review-risk-report",
+      viewport: "768x1024",
+      screenshot: "dashboard-next-action-review-risk-report-768x1024.png",
+      artifact: "dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-768x1024.png",
+      screenshotBytes: tabletPortraitBytes,
+      screenshotWidth: 768,
+      screenshotHeight: 1024,
+      distinctColorCount: 64,
+      panelTop: 100,
+      panelLeft: 40,
+      panelRight: 728,
+      panelBottom: 800,
+      titleTop: 130,
+      titleBottom: 170,
+      primaryButtonTop: 700,
+      primaryButtonBottom: 748,
+      primaryButtonTextColor: "rgb(255, 255, 255)",
+    },
+    {
+      caseKey: "review-risk-report",
+      viewport: "390x844",
+      screenshot: "dashboard-next-action-review-risk-report-390x844.png",
+      artifact: "dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-390x844.png",
+      screenshotBytes: mobileBytes,
+      screenshotWidth: 390,
+      screenshotHeight: 844,
+      distinctColorCount: 64,
+      panelTop: 90,
+      panelLeft: 0,
+      panelRight: 390,
+      panelBottom: 760,
+      titleTop: 120,
+      titleBottom: 156,
+      primaryButtonTop: 660,
+      primaryButtonBottom: 708,
+      primaryButtonTextColor: "rgb(255, 255, 255)",
+    },
+    {
+      caseKey: "review-risk-report",
+      viewport: "320x740",
+      screenshot: "dashboard-next-action-review-risk-report-320x740.png",
+      artifact: "dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-320x740.png",
+      screenshotBytes: narrowBytes,
+      screenshotWidth: 320,
+      screenshotHeight: 740,
+      distinctColorCount: 64,
+      panelTop: 90,
+      panelLeft: 0,
+      panelRight: 320,
+      panelBottom: 650,
+      titleTop: 120,
+      titleBottom: 156,
+      primaryButtonTop: 560,
+      primaryButtonBottom: 608,
+      primaryButtonTextColor: "rgb(255, 255, 255)",
+    },
+  ],
+  baseURLHost: "127.0.0.1",
+  spec: "dashboard-next-action-smoke.spec.ts",
+}));
+NODE
+  }
+
+  verify_dashboard_next_action_ui_marker_rejects() {
+    local label="$1"
+    local marker_payload="$2"
+    local expected_pattern="${3:-dashboard-next-action-ui-smoke OK must prove mocked Dashboard next action browser flow}"
+    local reject_output_file="$tmp_dir/verify-release-evidence-dashboard-next-action-ui-${label}.txt"
+    if ! write_dashboard_next_action_ui_marker_log "$marker_payload"; then
+      failure="could not write forged Dashboard next action UI smoke payload for $label"
+      return
+    fi
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid Dashboard next action UI smoke marker: $label"
+    elif ! rg -q "$expected_pattern" "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must precisely explain invalid Dashboard next action UI smoke marker rejection for $label using pattern: $expected_pattern"
+    fi
+  }
+
+  verify_dashboard_next_action_ui_package_rejects() {
+    local label="$1"
+    local expected_pattern="$2"
+    local reject_output_file="$tmp_dir/verify-release-evidence-dashboard-next-action-ui-package-${label}.txt"
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid Dashboard next action UI screenshot artifact package: $label"
+    elif ! rg -q "$expected_pattern" "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain invalid Dashboard next action UI screenshot artifact package rejection: $label"
+    fi
+    write_dashboard_next_action_png_fixtures || failure="could not restore Dashboard next action UI PNG artifact fixtures after $label"
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  dashboard_next_action_ui_marker_variant() {
+    local variant="$1"
+    node - "$valid_marker_payload" "$variant" <<'NODE'
+const payload = JSON.parse(process.argv[2]);
+const variant = process.argv[3];
+switch (variant) {
+  case "missing-product-plane-map":
+    delete payload.productPlaneMap;
+    break;
+  case "wrong-product-plane-scope":
+    payload.productPlaneMap.scope = "DASHBOARD_PRODUCT_PLANE_UNKNOWN";
+    break;
+  case "wrong-product-plane-surface":
+    payload.productPlaneMap.surface = "UNKNOWN_SURFACE";
+    break;
+  case "product-plane-not-visible":
+    payload.productPlaneMap.visible = false;
+    break;
+  case "wrong-product-plane-count":
+    payload.productPlaneMap.planeCount = 2;
+    break;
+  case "boolean-product-plane-action-count":
+    payload.productPlaneMap.actionCount = true;
+    break;
+  case "wrong-product-plane-action-count":
+    payload.productPlaneMap.actionCount = 2;
+    break;
+  case "product-plane-tablet-portrait-layout-false":
+    payload.productPlaneMap.tabletPortraitColumns = false;
+    break;
+  case "product-plane-copy-unreadable":
+    payload.productPlaneMap.copyReadable = false;
+    break;
+  case "product-plane-rbac-overclaim":
+    payload.productPlaneMap.rbacCompleteClaim = true;
+    break;
+  case "product-plane-production-overclaim":
+    payload.productPlaneMap.productionDeploymentClaim = true;
+    break;
+  case "product-plane-proof-missing":
+    payload.productPlaneMap.proofs.pop();
+    break;
+  case "product-plane-proof-duplicate":
+    payload.productPlaneMap.proofs[1].caseKey = payload.productPlaneMap.proofs[0].caseKey;
+    payload.productPlaneMap.proofs[1].viewport = payload.productPlaneMap.proofs[0].viewport;
+    break;
+  case "product-plane-proof-wrong-action-count":
+    payload.productPlaneMap.proofs[0].actionCount = 2;
+    break;
+  case "product-plane-proof-wrong-columns": {
+    const proof = payload.productPlaneMap.proofs.find((item) => item.viewport === "1024x768");
+    proof.actualColumns = 3;
+    break;
+  }
+  case "single-visual-viewport":
+    payload.visualEvidence.pop();
+    break;
+  case "repeated-visual-viewport":
+    payload.visualEvidence[1].viewport = "1440x900";
+    payload.visualEvidence[1].screenshot = "dashboard-next-action-review-risk-report-1440x900.png";
+    payload.visualEvidence[1].screenshotWidth = 1440;
+    payload.visualEvidence[1].screenshotHeight = 900;
+    break;
+  case "missing-tablet-portrait-visual-evidence":
+    payload.visualEvidence = payload.visualEvidence.filter((item) => item.viewport !== "768x1024");
+    break;
+  case "repeated-tablet-visual-viewport": {
+    const tabletPortrait = payload.visualEvidence.find((item) => item.viewport === "768x1024");
+    tabletPortrait.viewport = "1024x768";
+    break;
+  }
+  case "wrong-mobile-screenshot-dimensions": {
+    const mobile = payload.visualEvidence.find((item) => item.viewport === "390x844");
+    mobile.screenshotWidth = 391;
+    break;
+  }
+  case "wrong-visual-case":
+    payload.visualEvidence[0].caseKey = "ask-code-qa";
+    break;
+  case "low-screenshot-bytes":
+    payload.visualEvidence[0].screenshotBytes = 1000;
+    break;
+  case "negative-panel-top":
+    payload.visualEvidence[1].panelTop = -1;
+    break;
+  case "unsafe-screenshot-name":
+    payload.visualEvidence[0].screenshot = "../dashboard-next-action-review-risk-report-1440x900.png";
+    break;
+  case "missing-narrow-viewport":
+    payload.viewports = ["1440x900"];
+    payload.visitedCases = payload.visitedCases.filter((item) => item.endsWith(":1440x900"));
+    break;
+  case "missing-visual-evidence":
+    delete payload.visualEvidence;
+    break;
+  case "blank-screenshot-pixels":
+    payload.visualEvidence[0].distinctColorCount = 1;
+    break;
+  case "clipped-panel-right":
+    payload.visualEvidence.find((item) => item.viewport === "320x740").panelRight = 360;
+    break;
+  case "unreadable-primary-button":
+    payload.visualEvidence[0].primaryButtonTextColor = "rgb(99, 116, 139)";
+    break;
+  case "missing-dashboard-stats-signals":
+    delete payload.dashboardStatsApiSignals;
+    break;
+  case "missing-api-backed-case":
+    payload.dashboardStatsApiSignals.apiBackedCases = payload.dashboardStatsApiSignals.apiBackedCases.filter((item) => item !== "ask-code-qa");
+    break;
+  case "missing-fallback-case":
+    payload.dashboardStatsApiSignals.fallbackCases = [];
+    break;
+  case "missing-legacy-stats-fallback":
+    delete payload.dashboardStatsApiSignals.legacyStatsFallbackCase;
+    break;
+  case "wrong-source-label-selector":
+    payload.dashboardStatsApiSignals.sourceLabelSelector = ".wrong-selector";
+    break;
+  case "missing-tablet-portrait-viewport":
+    payload.viewports = payload.viewports.filter((item) => item !== "768x1024");
+    break;
+  case "missing-tablet-portrait-visited-coverage":
+    payload.visitedCases = payload.visitedCases.filter((item) => item !== "recover-dashboard:768x1024");
+    break;
+  case "missing-executive-briefing":
+    delete payload.executiveBriefing;
+    break;
+  case "wrong-executive-briefing-scope":
+    payload.executiveBriefing.scope = "DASHBOARD_EXECUTIVE_BRIEFING_UNKNOWN";
+    break;
+  case "missing-executive-briefing-signal":
+    payload.executiveBriefing.signals = payload.executiveBriefing.signals.filter((item) => item !== "风险阻塞");
+    break;
+  case "wrong-executive-briefing-signal-count":
+    payload.executiveBriefing.signalCount = 3;
+    break;
+  case "executive-briefing-tablet-portrait-columns-false":
+    payload.executiveBriefing.tabletPortraitColumns = false;
+    break;
+  case "executive-briefing-copy-unreadable":
+    payload.executiveBriefing.copyReadable = false;
+    break;
+  case "executive-briefing-action-hidden":
+    payload.executiveBriefing.actionVisible = false;
+    break;
+  case "executive-briefing-p9-complete-claim":
+    payload.executiveBriefing.p9CompleteClaim = true;
+    break;
+  case "executive-briefing-rbac-complete-claim":
+    payload.executiveBriefing.rbacCompleteClaim = true;
+    break;
+  case "executive-briefing-production-deployment-claim":
+    payload.executiveBriefing.productionDeploymentClaim = true;
+    break;
+  case "executive-briefing-commercialization-claim":
+    payload.executiveBriefing.commercializationClaim = true;
+    break;
+  default:
+    throw new Error(`unknown Dashboard next action marker variant: ${variant}`);
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+  }
+
+  if [[ -z "$failure" ]]; then
+    write_strict_audit_workbench_release_evidence_fixture "$run_dir" "$run_id" true 1 1 1
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_dashboard_next_action_png_fixtures; then
+      failure="could not write Dashboard next action UI PNG artifact fixtures"
+    else
+      valid_marker_payload="$(build_dashboard_next_action_ui_valid_marker_payload)" \
+        || failure="could not build valid Dashboard next action UI marker payload from PNG fixtures"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^include_dashboard_next_action_ui_smoke: / {
+        print "include_dashboard_next_action_ui_smoke: true"
+        changed = 1
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/manifest.txt" > "$tampered_manifest_file"; then
+      failure="could not mark Dashboard next action UI smoke include as true"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN { OFS = "\t" }
+      NR == 1 { print; next }
+      $2 == "dashboard-next-action-ui-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge Dashboard next action UI smoke status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- SKIP `dashboard-next-action-ui-smoke`: / && !changed {
+        print "- OK `dashboard-next-action-ui-smoke`: Dashboard next action browser UI smoke (mocked) (completed)"
+        changed = 1
+        next
+      }
+      /^- skipped: `/ {
+        line = $0
+        sub(/^- skipped: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- skipped: `" line - 1 "`"
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge Dashboard next action UI smoke summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_manifest_file" "$run_dir/manifest.txt" \
+      || failure="could not replace manifest with forged Dashboard next action UI smoke include"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged Dashboard next action UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged Dashboard next action UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/manifest.txt" "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep Dashboard next action UI marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must reject Dashboard next action UI smoke OK rows without DASHBOARD_NEXT_ACTION_SMOKE_OK marker"
+    elif ! rg -q 'dashboard-next-action-ui-smoke OK must prove mocked Dashboard next action browser flow' "$output_file"; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must explain missing Dashboard next action UI smoke marker rejection"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_dashboard_next_action_ui_marker_log "$valid_marker_payload"; then
+      failure="could not write valid forged Dashboard next action UI smoke marker"
+    elif ! run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must accept valid Dashboard next action UI smoke marker with required cases and viewports"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    rm -f "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png"
+    verify_dashboard_next_action_ui_package_rejects "missing-png-artifact" "dashboard-next-action-ui-smoke OK must prove mocked Dashboard next action browser flow"
+  fi
+  if [[ -z "$failure" ]]; then
+    printf 'not a png\n' > "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png"
+    chmod 600 "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png"
+    verify_dashboard_next_action_ui_package_rejects "non-png-artifact" "visualEvidence artifact (byte size must match marker screenshotBytes|must be a PNG image)"
+  fi
+  if [[ -z "$failure" ]]; then
+    cp "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-320x740.png" \
+      "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png"
+    chmod 600 "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png"
+    verify_dashboard_next_action_ui_package_rejects "mismatched-png-artifact" "visualEvidence artifact byte size must match marker screenshotBytes"
+  fi
+  if [[ -z "$failure" ]]; then
+    node - "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png" <<'NODE'
+const fs = require("node:fs");
+const { deflateSync } = require("node:zlib");
+const output = process.argv[2];
+function chunk(type, data) {
+  const buffer = Buffer.alloc(12 + data.length);
+  buffer.writeUInt32BE(data.length, 0);
+  buffer.write(type, 4, 4, "ascii");
+  data.copy(buffer, 8);
+  buffer.writeUInt32BE(0, 8 + data.length);
+  return buffer;
+}
+const width = 1440;
+const height = 900;
+const ihdr = Buffer.alloc(13);
+ihdr.writeUInt32BE(width, 0);
+ihdr.writeUInt32BE(height, 4);
+ihdr[8] = 8;
+ihdr[9] = 2;
+const rowLength = 1 + width * 3;
+const raw = Buffer.alloc(rowLength * height, 255);
+for (let y = 0; y < height; y += 1) raw[y * rowLength] = 0;
+fs.writeFileSync(output, Buffer.concat([
+  Buffer.from("89504e470d0a1a0a", "hex"),
+  chunk("IHDR", ihdr),
+  chunk("IDAT", deflateSync(raw, { level: 0 })),
+  chunk("IEND", Buffer.alloc(0)),
+]), { mode: 0o600 });
+NODE
+    local blank_png_bytes
+    local blank_marker_payload
+    blank_png_bytes="$(wc -c < "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png" | tr -d '[:space:]')"
+    blank_marker_payload="$(node - "$valid_marker_payload" "$blank_png_bytes" <<'NODE'
+const payload = JSON.parse(process.argv[2]);
+payload.visualEvidence[0].screenshotBytes = Number(process.argv[3]);
+process.stdout.write(JSON.stringify(payload));
+NODE
+)"
+    if ! write_dashboard_next_action_ui_marker_log "$blank_marker_payload"; then
+      failure="could not write blank Dashboard next action UI marker payload"
+    else
+      verify_dashboard_next_action_ui_package_rejects "blank-png-artifact" "visualEvidence artifact PNG color diversity must match marker distinctColorCount"
+    fi
+    if [[ -z "$failure" ]]; then
+      write_dashboard_next_action_ui_marker_log "$valid_marker_payload" \
+        || failure="could not restore valid Dashboard next action UI marker payload after blank artifact probe"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    printf 'unexpected\n' > "$run_dir/dashboard-next-action-ui-smoke/unexpected.png"
+    chmod 600 "$run_dir/dashboard-next-action-ui-smoke/unexpected.png"
+    verify_dashboard_next_action_ui_package_rejects "unexpected-extra-png" "release evidence package contains unexpected file"
+    rm -f "$run_dir/dashboard-next-action-ui-smoke/unexpected.png"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 644 "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png"
+    verify_dashboard_next_action_ui_package_rejects "png-permission" "must have 600 permissions"
+  fi
+  if [[ -z "$failure" ]]; then
+    cp "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png" "$tmp_dir/dashboard-next-action-desktop-target.png"
+    rm -f "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png"
+    ln -s "$tmp_dir/dashboard-next-action-desktop-target.png" "$run_dir/dashboard-next-action-ui-smoke/dashboard-next-action-review-risk-report-1440x900.png"
+    verify_dashboard_next_action_ui_package_rejects "png-symlink" "release evidence directory must not contain symlinks"
+    rm -f "$tmp_dir/dashboard-next-action-desktop-target.png"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "missing-product-plane-map" \
+      "$(dashboard_next_action_ui_marker_variant missing-product-plane-map)" \
+      'productPlaneMap must be an object'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "wrong-product-plane-scope" \
+      "$(dashboard_next_action_ui_marker_variant wrong-product-plane-scope)" \
+      'productPlaneMap scope must identify Dashboard three-plane product structure evidence'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "wrong-product-plane-surface" \
+      "$(dashboard_next_action_ui_marker_variant wrong-product-plane-surface)" \
+      'productPlaneMap surface must identify front office, developer console and back office'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-not-visible" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-not-visible)" \
+      'productPlaneMap visible must be true'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "wrong-product-plane-count" \
+      "$(dashboard_next_action_ui_marker_variant wrong-product-plane-count)" \
+      'productPlaneMap planeCount must be 3'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "boolean-product-plane-action-count" \
+      "$(dashboard_next_action_ui_marker_variant boolean-product-plane-action-count)" \
+      'productPlaneMap actionCount must be 3'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "wrong-product-plane-action-count" \
+      "$(dashboard_next_action_ui_marker_variant wrong-product-plane-action-count)" \
+      'productPlaneMap actionCount must be 3'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-tablet-portrait-layout-false" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-tablet-portrait-layout-false)" \
+      'productPlaneMap tabletPortraitColumns must be true'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-copy-unreadable" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-copy-unreadable)" \
+      'productPlaneMap copyReadable must be true'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-rbac-overclaim" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-rbac-overclaim)" \
+      'productPlaneMap rbacCompleteClaim must be false'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-production-overclaim" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-production-overclaim)" \
+      'productPlaneMap productionDeploymentClaim must be false'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-proof-missing" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-proof-missing)" \
+      'productPlaneMap proofs must contain exactly 35 case/viewport entries'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-proof-duplicate" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-proof-duplicate)" \
+      'productPlaneMap proofs must not repeat recover-dashboard:1440x900'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-proof-wrong-action-count" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-proof-wrong-action-count)" \
+      'productPlaneMap proofs recover-dashboard:1440x900 actionCount must be 3'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "product-plane-proof-wrong-columns" \
+      "$(dashboard_next_action_ui_marker_variant product-plane-proof-wrong-columns)" \
+      'productPlaneMap proofs recover-dashboard:1024x768 actualColumns must be 2'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "missing-narrow-viewport" "$(dashboard_next_action_ui_marker_variant missing-narrow-viewport)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "missing-visual-evidence" "$(dashboard_next_action_ui_marker_variant missing-visual-evidence)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "blank-screenshot-pixels" "$(dashboard_next_action_ui_marker_variant blank-screenshot-pixels)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "clipped-panel-right" "$(dashboard_next_action_ui_marker_variant clipped-panel-right)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "unreadable-primary-button" "$(dashboard_next_action_ui_marker_variant unreadable-primary-button)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "single-visual-viewport" "$(dashboard_next_action_ui_marker_variant single-visual-viewport)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "repeated-visual-viewport" "$(dashboard_next_action_ui_marker_variant repeated-visual-viewport)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "missing-tablet-portrait-visual-evidence" \
+      "$(dashboard_next_action_ui_marker_variant missing-tablet-portrait-visual-evidence)" \
+      'visualEvidence must include exactly five required Dashboard screenshots'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "repeated-tablet-visual-viewport" \
+      "$(dashboard_next_action_ui_marker_variant repeated-tablet-visual-viewport)" \
+      'visualEvidence must not repeat viewport 1024x768'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "wrong-mobile-screenshot-dimensions" \
+      "$(dashboard_next_action_ui_marker_variant wrong-mobile-screenshot-dimensions)" \
+      'visualEvidence screenshotWidth must match the viewport'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "wrong-visual-case" "$(dashboard_next_action_ui_marker_variant wrong-visual-case)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "low-screenshot-bytes" "$(dashboard_next_action_ui_marker_variant low-screenshot-bytes)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "negative-panel-top" "$(dashboard_next_action_ui_marker_variant negative-panel-top)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "unsafe-screenshot-name" "$(dashboard_next_action_ui_marker_variant unsafe-screenshot-name)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "missing-dashboard-stats-signals" "$(dashboard_next_action_ui_marker_variant missing-dashboard-stats-signals)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "missing-api-backed-case" "$(dashboard_next_action_ui_marker_variant missing-api-backed-case)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "missing-fallback-case" "$(dashboard_next_action_ui_marker_variant missing-fallback-case)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "missing-legacy-stats-fallback" "$(dashboard_next_action_ui_marker_variant missing-legacy-stats-fallback)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects "wrong-source-label-selector" "$(dashboard_next_action_ui_marker_variant wrong-source-label-selector)"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "missing-tablet-portrait-viewport" \
+      "$(dashboard_next_action_ui_marker_variant missing-tablet-portrait-viewport)" \
+      'DASHBOARD_NEXT_ACTION_SMOKE_OK viewports missing 768x1024'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "missing-tablet-portrait-visited-coverage" \
+      "$(dashboard_next_action_ui_marker_variant missing-tablet-portrait-visited-coverage)" \
+      'visitedCases missing recover-dashboard:768x1024'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "missing-executive-briefing" \
+      "$(dashboard_next_action_ui_marker_variant missing-executive-briefing)" \
+      'executiveBriefing.*object'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "wrong-executive-briefing-scope" \
+      "$(dashboard_next_action_ui_marker_variant wrong-executive-briefing-scope)" \
+      'executiveBriefing.*scope'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "missing-executive-briefing-signal" \
+      "$(dashboard_next_action_ui_marker_variant missing-executive-briefing-signal)" \
+      'executiveBriefing.*signals.*风险阻塞'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "wrong-executive-briefing-signal-count" \
+      "$(dashboard_next_action_ui_marker_variant wrong-executive-briefing-signal-count)" \
+      'executiveBriefing.*signalCount'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "executive-briefing-tablet-portrait-columns-false" \
+      "$(dashboard_next_action_ui_marker_variant executive-briefing-tablet-portrait-columns-false)" \
+      'executiveBriefing.*tabletPortraitColumns'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "executive-briefing-copy-unreadable" \
+      "$(dashboard_next_action_ui_marker_variant executive-briefing-copy-unreadable)" \
+      'executiveBriefing.*copyReadable'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "executive-briefing-action-hidden" \
+      "$(dashboard_next_action_ui_marker_variant executive-briefing-action-hidden)" \
+      'executiveBriefing.*actionVisible'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "executive-briefing-p9-complete-claim" \
+      "$(dashboard_next_action_ui_marker_variant executive-briefing-p9-complete-claim)" \
+      'executiveBriefing.*p9CompleteClaim'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "executive-briefing-rbac-complete-claim" \
+      "$(dashboard_next_action_ui_marker_variant executive-briefing-rbac-complete-claim)" \
+      'executiveBriefing.*rbacCompleteClaim'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "executive-briefing-production-deployment-claim" \
+      "$(dashboard_next_action_ui_marker_variant executive-briefing-production-deployment-claim)" \
+      'executiveBriefing.*productionDeploymentClaim'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_dashboard_next_action_ui_marker_rejects \
+      "executive-briefing-commercialization-claim" \
+      "$(dashboard_next_action_ui_marker_variant executive-briefing-commercialization-claim)" \
+      'executiveBriefing.*commercializationClaim'
+  fi
+
+  cleanup_dashboard_next_action_ui_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_report_evidence_drawer_ui_smoke_ok_without_marker() {
+  local tmp_dir
+  local run_id
+  local run_dir
+  local output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local tampered_manifest_file
+  local valid_marker_payload
+  local valid_qa_marker_payload
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-report-evidence-drawer-ui-marker-probe.XXXXXX")" \
+    || fail "could not create report evidence drawer UI marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden report evidence drawer UI marker probe temp dir"
+  run_id="report-evidence-drawer-ui-marker-${tmp_dir##*.}"
+  run_dir="$tmp_dir/$run_id"
+  output_file="$tmp_dir/verify-release-evidence-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+  tampered_manifest_file="$tmp_dir/manifest.txt"
+  valid_marker_payload='{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","drawerQueryCount":6,"readyDrawerQueryCount":3,"gapDrawerQueryCount":3,"drawerActionRail":{"readyVisible":true,"gapVisible":true,"readyRepairActionVisible":true,"gapRepairCreationActionHidden":true,"gapLocalizationActionVisible":true,"gapLocalizationActionDisabled":true},"mainPathGuide":{"visible":true,"stepCount":3,"order":["recommended-action","citation-quality","evidence-priority"],"labels":["01","02","03"],"mobile390Covered":true,"narrow320Covered":true,"noHorizontalOverflow":true},"actionBoard":{"visible":true,"actionCount":6,"actionKeys":["risk-review","code-qa","agent-review","audit-trace","dependency-review","repair-candidate"],"codeQaLinkVisible":true,"repairCandidateVisible":true,"mobile390Covered":true,"narrow320Covered":true,"noHorizontalOverflow":true},"reviewGate":{"visible":true,"gateCount":6,"gateKeys":["report-readiness","evidence-bundle","code-knowledge","repair-readiness","audit-trace","governance-timeline"],"minReadyCount":4,"mobile390Covered":true,"narrow320Covered":true,"textNotClipped":true,"noHorizontalOverflow":true},"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  valid_qa_marker_payload='{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","qaRequestCount":6,"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"qaFromEvidence":{"status":"OK","responseStatus":200,"resultCount":2,"citationCount":2,"citationCoverage":{"statuses":["PARTIAL"],"minCoveragePercent":50,"minTotalEvidenceCount":2,"minCitedEvidenceCount":1,"minUncitedCandidateCount":1,"minRepairCandidateCount":1,"minRequiredEvidenceCoveragePercent":100,"minRequiredEvidenceCount":1,"minCitedRequiredEvidenceCount":1,"minUniqueEvidenceFileCount":2,"minCitedEvidenceFileCount":1,"minPrimaryEvidenceFileCount":1,"minCitedPrimaryEvidenceFileCount":1,"minContextEvidenceFileCount":1,"minCitedContextEvidenceFileCount":0,"minRequiredEvidenceFileCount":1,"minCitedRequiredEvidenceFileCount":1,"coverageScopes":["PRIMARY"],"evidenceRoleDistribution":{"statuses":["PRIMARY_SINGLE_FILE"],"minTotalFileCount":2,"minCitedFileCount":1,"minPrimaryFileCount":1,"minCitedPrimaryFileCount":1,"minContextFileCount":1,"minCitedContextFileCount":0,"minRoleCount":2,"minFileEntryCount":2}},"claimCitationCoverage":{"statuses":["READY"],"readyForRepair":true,"readinessReasons":["PRIMARY_BOUND_READY"],"minClaimCoveragePercent":100,"minRequiredClaimCount":1,"minCitedRequiredClaimCount":1,"maxUncitedRequiredClaimCount":0,"maxInvalidCitationClaimCount":0,"minValidCitationFileCount":1,"minRequiredClaimCitationFileCount":1,"roleDistribution":{"statuses":["PRIMARY_BOUND"],"minRequiredClaimCount":1,"minRequiredPrimaryBoundClaimCount":1,"maxRequiredContextOnlyClaimCount":0,"maxRequiredUnknownOnlyClaimCount":0,"maxUnbackedRequiredClaimCount":0,"maxInvalidRequiredClaimCount":0,"minValidCitationFileCount":1,"minRequiredClaimCitationFileCount":1,"minRequiredPrimaryFileCount":1,"minRoleCount":1,"minFileEntryCount":1}},"groundingStatuses":["VERIFIED"],"citationEnforcementStatuses":["DIRECT_VERIFIED"],"citationEnforcementReasons":["DIRECT_VERIFIED"],"citedChunkCount":1,"expectedEvidenceFileVisible":true,"evidenceRef":{"requestBound":true,"responseBound":true,"contextVisible":true,"filePath":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java"},"repairEvidenceGate":{"readyVisible":true,"sourceEvidenceMatchType":"REPORT_LINE_ANCHOR"},"unverifiedCitation":{"status":"OK","responseStatus":200,"resultCount":1,"citationCount":1,"citationCoverage":{"statuses":["NONE"],"minCoveragePercent":0,"minTotalEvidenceCount":1,"minCitedEvidenceCount":0,"minUncitedCandidateCount":1,"minRepairCandidateCount":0,"minRequiredEvidenceCoveragePercent":0,"minRequiredEvidenceCount":1,"minCitedRequiredEvidenceCount":0,"minUniqueEvidenceFileCount":2,"maxCitedEvidenceFileCount":0,"minPrimaryEvidenceFileCount":1,"maxCitedPrimaryEvidenceFileCount":0,"minContextEvidenceFileCount":1,"maxCitedContextEvidenceFileCount":0,"minRequiredEvidenceFileCount":1,"maxCitedRequiredEvidenceFileCount":0,"coverageScopes":["PRIMARY"],"evidenceRoleDistribution":{"statuses":["PRIMARY_SINGLE_FILE"],"minTotalFileCount":2,"maxCitedFileCount":0,"minPrimaryFileCount":1,"maxCitedPrimaryFileCount":0,"minContextFileCount":1,"maxCitedContextFileCount":0,"minRoleCount":2,"minFileEntryCount":2}},"claimCitationCoverage":{"statuses":["REVIEW"],"minClaimCoveragePercent":0,"minRequiredClaimCount":1,"minCitedRequiredClaimCount":0,"maxUncitedRequiredClaimCount":1,"maxInvalidCitationClaimCount":0,"maxValidCitationFileCount":0,"maxRequiredClaimCitationFileCount":0,"roleDistribution":{"statuses":["REVIEW_UNCITED"],"maxRequiredPrimaryBoundClaimCount":0,"maxRequiredPrimaryFileCount":0,"maxValidCitationFileCount":0,"maxRequiredClaimCitationFileCount":0,"maxRoleCount":0,"maxFileEntryCount":0}},"groundingStatuses":["PARTIAL"],"citationEnforcementStatuses":["RETRY_FAILED"],"uncitedCandidateCount":1,"expectedEvidenceFileVisible":true,"evidenceRefRequestBound":true,"evidenceRefResponseBound":true,"repairEvidenceGateBlockedVisible":true}},"fullReleaseAuthorityRefreshed":false,"baseURLHost":"127.0.0.1","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  valid_qa_marker_payload="$(
+    VALID_QA_MARKER_PAYLOAD="$valid_qa_marker_payload" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_QA_MARKER_PAYLOAD);
+payload.qaFromEvidence.citationCoverage.maxUncitedPrimaryEvidenceCount = 0;
+payload.qaFromEvidence.citationCoverage.maxUncitedPrimaryEvidenceFileCount = 0;
+payload.qaFromEvidence.citationCoverage.minContextEvidenceCount = 1;
+payload.qaFromEvidence.citationCoverage.minCitedContextEvidenceCount = 0;
+payload.qaFromEvidence.citationCoverage.minUncitedContextEvidenceCount = 1;
+payload.qaFromEvidence.citationCoverage.minUncitedContextEvidenceFileCount = 1;
+payload.qaFromEvidence.citationCoverage.evidenceRoleDistribution.statuses = ["MIXED_PRIMARY_CONTEXT"];
+payload.reportCitationQuality = {
+  status: "OK",
+  surface: "SCAN_TASK_DETAIL_REPORT_CITATION_QUALITY_PANEL",
+  visibleAcrossViewports: true,
+  citationQuality: ["6/6"],
+  sourceDiversityVisible: true,
+  sourceCoverageVisible: true,
+  sourceSectionCount: 5,
+  sourceSections: ["apiRoutes/dbEntities", "codeQuality.risks", "modules", "overview", "scanFingerprint"],
+  sourceSectionLabels: ["API/数据面", "风险信号", "扫描指纹", "扫描范围", "模块图"],
+  sourceSectionOrder: ["overview", "modules", "apiRoutes/dbEntities", "scanFingerprint", "codeQuality.risks"],
+  sourceSectionLabelOrder: ["扫描范围", "模块图", "API/数据面", "扫描指纹", "风险信号"],
+  narrativeBinding: ["6/6"],
+  detailToggleVisible: true,
+  detailDefaultCollapsed: true,
+  detailOpens: true,
+  verdictVisible: true,
+  verdictItemCount: 4,
+  verdictBoundaryVisible: true,
+  boundaryVisible: true,
+  noOverclaim: true,
+  noHorizontalOverflow: true,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+};
+payload.qaFromEvidence.evidenceLineRangePriority = {
+  status: "OK",
+  proofCount: 3,
+  structuredRangePriority: true,
+  legacyLineHidden: true,
+  visibleRanges: ["24-42"],
+  conflictLegacyLineNumbers: ["999"],
+  mobile390Covered: true,
+  narrow320Covered: true,
+  noHorizontalOverflow: true,
+};
+payload.qaFromEvidence.deepEvidenceCardReadability = {
+  status: "OK",
+  mobile390Covered: true,
+  narrow320Covered: true,
+  sourceReceipt: {
+    readyVisible: true,
+    reviewVisible: true,
+    contained: true,
+    referenceWraps: true,
+    titleNotClipped: true,
+    tagsNotClipped: true,
+    structuredRangeVisible: true,
+  },
+  sourceLocationConfidence: {
+    readyContained: true,
+    reviewContained: true,
+    metricsNotClipped: true,
+    checksWrap: true,
+    llmFactBoundaryVisible: true,
+  },
+  sourceFileMatchRelease: {
+    readyContained: true,
+    reviewContained: true,
+    targetReferenceNotClipped: true,
+    citedReferenceNotClipped: true,
+    checksNotClipped: true,
+    noRepairOnReview: true,
+  },
+  noHorizontalOverflow: true,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+};
+payload.qaFromEvidence.relationAwareEvidenceReason = {
+  status: "OK",
+  marker: "Graph relation:",
+  minCitationReasonCount: 1,
+  minRetrievedChunkReasonCount: 1,
+  adjacentContextReasonVisible: true,
+  uiReasonVisible: true,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+};
+function verifiedSummary(coverage, claimCoverage) {
+  return {
+    visible: true,
+    tones: ["ready"],
+    statuses: coverage.evidenceRoleDistribution.statuses,
+    crossFileEvidenceSatisfied: coverage.minUniqueEvidenceFileCount >= 2,
+    citationBindingSatisfied: true,
+    claimBindingSatisfied: true,
+    currentScanOnly: true,
+    sourceEvidenceMatchTypes: ["REPORT_LINE_ANCHOR"],
+    minEvidenceFileCount: coverage.minUniqueEvidenceFileCount,
+    minCitedEvidenceFileCount: coverage.minCitedEvidenceFileCount,
+    minPrimaryEvidenceFileCount: coverage.minPrimaryEvidenceFileCount,
+    minCitedPrimaryEvidenceFileCount: coverage.minCitedPrimaryEvidenceFileCount,
+    minContextEvidenceFileCount: coverage.minContextEvidenceFileCount,
+    minCitedContextEvidenceFileCount: coverage.minCitedContextEvidenceFileCount,
+    contextGapVisible: true,
+    minUncitedContextEvidenceCount: coverage.minUncitedContextEvidenceCount,
+    minUncitedContextEvidenceFileCount: coverage.minUncitedContextEvidenceFileCount,
+    minRequiredEvidenceFileCount: coverage.minRequiredEvidenceFileCount,
+    minCitedRequiredEvidenceFileCount: coverage.minCitedRequiredEvidenceFileCount,
+    minRequiredClaimCount: claimCoverage.minRequiredClaimCount,
+    minRequiredClaimCitationFileCount: claimCoverage.minRequiredClaimCitationFileCount,
+    minRequiredPrimaryFileCount: claimCoverage.roleDistribution.minRequiredPrimaryFileCount,
+    minRequiredPrimaryBoundClaimCount: claimCoverage.roleDistribution.minRequiredPrimaryBoundClaimCount,
+  };
+}
+function unverifiedSummary(coverage, claimCoverage) {
+  return {
+    visible: true,
+    tones: ["blocked"],
+    statuses: coverage.evidenceRoleDistribution.statuses,
+    crossFileEvidenceSatisfied: coverage.minUniqueEvidenceFileCount >= 2,
+    citationBindingSatisfied: false,
+    claimBindingSatisfied: false,
+    currentScanOnly: true,
+    sourceEvidenceMatchTypes: ["REPORT_LINE_ANCHOR"],
+    minEvidenceFileCount: coverage.minUniqueEvidenceFileCount,
+    maxCitedEvidenceFileCount: coverage.maxCitedEvidenceFileCount,
+    minPrimaryEvidenceFileCount: coverage.minPrimaryEvidenceFileCount,
+    maxCitedPrimaryEvidenceFileCount: coverage.maxCitedPrimaryEvidenceFileCount,
+    minContextEvidenceFileCount: coverage.minContextEvidenceFileCount,
+    maxCitedContextEvidenceFileCount: coverage.maxCitedContextEvidenceFileCount,
+    minRequiredEvidenceFileCount: coverage.minRequiredEvidenceFileCount,
+    maxCitedRequiredEvidenceFileCount: coverage.maxCitedRequiredEvidenceFileCount,
+    minRequiredClaimCount: claimCoverage.minRequiredClaimCount,
+    maxRequiredClaimCitationFileCount: claimCoverage.maxRequiredClaimCitationFileCount,
+    maxRequiredPrimaryFileCount: claimCoverage.roleDistribution.maxRequiredPrimaryFileCount,
+    maxRequiredPrimaryBoundClaimCount: claimCoverage.roleDistribution.maxRequiredPrimaryBoundClaimCount,
+  };
+}
+payload.qaFromEvidence.crossFileCitationSummary = verifiedSummary(
+  payload.qaFromEvidence.citationCoverage,
+  payload.qaFromEvidence.claimCitationCoverage,
+);
+payload.qaFromEvidence.unverifiedCitation.crossFileCitationSummary = unverifiedSummary(
+  payload.qaFromEvidence.unverifiedCitation.citationCoverage,
+  payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage,
+);
+payload.qaFromEvidence.claimCitationNoiseBoundary = {
+  status: "OK",
+  requestCount: 2,
+  noiseKinds: ["exception-line", "fenced-code", "inline-code", "timestamp-log"],
+  coverageStatus: "NONE",
+  maxCitedEvidenceCount: 0,
+  maxRepairCandidateCount: 0,
+  claimCitationStatus: "REVIEW",
+  maxCitedRequiredClaimCount: 0,
+  maxInvalidCitationClaimCount: 0,
+  roleDistributionStatus: "REVIEW_UNCITED",
+  maxRequiredPrimaryBoundClaimCount: 0,
+  groundingStatuses: ["PARTIAL"],
+  citationEnforcementStatuses: ["RETRY_FAILED"],
+  answerCitationsCitedByAnswer: false,
+  repairEvidenceGateBlockedVisible: true,
+  rawAnswerStored: false,
+  rawPromptStored: false,
+  providerQualityClaim: false,
+  llmFactClaim: false,
+};
+payload.qaFromEvidence.fileAnchorDrift = {
+  status: "OK",
+  responseStatus: 200,
+  requestCount: 2,
+  sourceEvidenceMatchTypes: ["REPORT_FILE_ANCHOR"],
+  citationCoverage: {
+    statuses: ["PARTIAL"],
+    coverageScopes: ["ALL"],
+    maxPrimaryEvidenceCount: 0,
+    minContextEvidenceCount: 2,
+    maxRepairCandidateCount: 0,
+    evidenceRoleDistribution: {
+      statuses: ["CONTEXT_ONLY"],
+    },
+  },
+  claimCitationCoverage: {
+    statuses: ["REVIEW"],
+    readyForRepair: false,
+    readinessReasons: ["CONTEXT_ONLY_CLAIM"],
+    minRequiredClaimCount: 1,
+    minCitedRequiredClaimCount: 0,
+    roleDistribution: {
+      statuses: ["CONTEXT_ONLY"],
+      maxRequiredPrimaryBoundClaimCount: 0,
+      maxRequiredPrimaryFileCount: 0,
+      minRequiredContextOnlyClaimCount: 1,
+    },
+  },
+  groundingStatuses: ["PARTIAL"],
+  citationEnforcementStatuses: ["RETRY_FAILED"],
+  repairEvidenceGateBlockedVisible: true,
+  trustSummaryBlockedVisible: true,
+  crossFileSummaryContextGapVisible: true,
+  latestNextActionRepairHidden: true,
+  latestCitationRepairHidden: true,
+};
+payload.qaTotalRequestCount = payload.qaRequestCount
+  + payload.qaFromEvidence.claimCitationNoiseBoundary.requestCount
+  + payload.qaFromEvidence.fileAnchorDrift.requestCount;
+process.stdout.write(JSON.stringify(payload));
+NODE
+  )"
+
+  cleanup_report_evidence_drawer_ui_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  write_report_evidence_drawer_ui_marker_log() {
+    local marker_payload="$1"
+    local qa_marker_payload="${2-$valid_qa_marker_payload}"
+    {
+      printf 'report-evidence-drawer-smoke.spec.ts\n'
+      if [[ -n "$qa_marker_payload" ]]; then
+        printf 'REPORT_EVIDENCE_QA_CITATION_UI_SMOKE_OK %s\n' "$qa_marker_payload"
+      fi
+      printf 'REPORT_EVIDENCE_DRAWER_SMOKE_OK %s\n' "$marker_payload"
+    } > "$run_dir/report-evidence-drawer-ui-smoke.log" || return 1
+    chmod 600 "$run_dir/report-evidence-drawer-ui-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  verify_report_evidence_qa_citation_marker_rejects() {
+    local label="$1"
+    local qa_marker_payload="$2"
+    local reject_output_file="$tmp_dir/verify-release-evidence-report-evidence-qa-citation-${label}.txt"
+    if ! write_report_evidence_drawer_ui_marker_log "$valid_marker_payload" "$qa_marker_payload"; then
+      failure="could not write forged report evidence QA citation UI smoke payload for $label"
+      return
+    fi
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid report evidence QA citation UI smoke marker: $label"
+    elif ! rg -q 'report-evidence-drawer-ui-smoke OK must prove mocked report evidence drawer code_chunks flow' "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain invalid report evidence QA citation UI smoke marker rejection: $label"
+    fi
+  }
+
+  mutated_report_evidence_qa_marker() {
+    local label="$1"
+    VALID_QA_MARKER_PAYLOAD="$valid_qa_marker_payload" QA_MARKER_MUTATION_LABEL="$label" node <<'NODE'
+const payload = JSON.parse(process.env.VALID_QA_MARKER_PAYLOAD);
+const mutationLabel = process.env.QA_MARKER_MUTATION_LABEL;
+function addClaimRoleDistributionDriftMarkers() {
+  const claimRoleDistributionMissing = {
+    status: "OK",
+    requestCount: 2,
+    sourceEvidenceMatchType: "REPORT_LINE_ANCHOR",
+    claimCitationStatus: "READY",
+    roleDistributionPresent: false,
+    repairEvidenceGateReviewVisible: true,
+    trustSummaryReviewVisible: true,
+    latestNextActionRepairHidden: true,
+    latestCitationRepairHidden: true,
+  };
+  const claimRoleDistributionMismatch = {
+    status: "OK",
+    requestCount: 2,
+    sourceEvidenceMatchType: "REPORT_LINE_ANCHOR",
+    claimCitationStatus: "READY",
+    roleDistributionPresent: true,
+    mismatchFlags: {
+      requiredClaimCountMismatch: true,
+      requiredPrimaryBoundClaimCountMismatch: true,
+      nonZeroContextOnly: true,
+      nonZeroUnbacked: true,
+      nonZeroInvalid: true,
+      validCitationFileCountMismatch: true,
+      requiredClaimCitationFileCountMismatch: true,
+    },
+    repairEvidenceGateReviewVisible: true,
+    trustSummaryReviewVisible: true,
+    latestNextActionRepairHidden: true,
+    latestCitationRepairHidden: true,
+  };
+  payload.qaFromEvidence.drift = {
+    claimRoleDistributionMissing,
+    claimRoleDistributionMismatch,
+  };
+  payload.qaFromEvidence.claimRoleDistributionMissing = claimRoleDistributionMissing;
+  payload.qaFromEvidence.claimRoleDistributionMismatch = claimRoleDistributionMismatch;
+  payload.qaTotalRequestCount = payload.qaRequestCount
+    + payload.qaFromEvidence.claimCitationNoiseBoundary.requestCount
+    + payload.qaFromEvidence.fileAnchorDrift.requestCount
+    + payload.qaFromEvidence.drift.claimRoleDistributionMissing.requestCount
+    + payload.qaFromEvidence.drift.claimRoleDistributionMismatch.requestCount;
+}
+if (mutationLabel === "claim-role-valid-drift-fields"
+  || mutationLabel === "qa-total-request-count-underflow"
+  || mutationLabel === "qa-total-request-count-missing-drift-requests"
+  || mutationLabel.startsWith("claim-role-")) {
+  addClaimRoleDistributionDriftMarkers();
+}
+switch (mutationLabel) {
+  case "claim-role-valid-drift-fields":
+    break;
+  case "claim-role-drift-not-object":
+    payload.qaFromEvidence.drift = [];
+    break;
+  case "claim-role-drift-missing-mismatch":
+    delete payload.qaFromEvidence.drift.claimRoleDistributionMismatch;
+    break;
+  case "claim-role-drift-unknown-field":
+    payload.qaFromEvidence.drift.extra = { status: "OK" };
+    break;
+  case "old-qa-request-count":
+    payload.qaRequestCount = 2;
+    break;
+  case "report-citation-quality-not-object":
+    payload.reportCitationQuality = [];
+    break;
+  case "report-citation-quality-status-fail":
+    payload.reportCitationQuality.status = "FAIL";
+    break;
+  case "report-citation-quality-wrong-surface":
+    payload.reportCitationQuality.surface = "SCAN_TASK_DETAIL_OTHER_PANEL";
+    break;
+  case "report-citation-quality-hidden":
+    payload.reportCitationQuality.visibleAcrossViewports = false;
+    break;
+  case "report-citation-quality-count-gap":
+    payload.reportCitationQuality.citationQuality = ["5/6"];
+    break;
+  case "report-citation-quality-source-diversity-hidden":
+    payload.reportCitationQuality.sourceDiversityVisible = false;
+    break;
+  case "report-citation-quality-source-coverage-hidden":
+    payload.reportCitationQuality.sourceCoverageVisible = false;
+    break;
+  case "report-citation-quality-source-section-count-low":
+    payload.reportCitationQuality.sourceSectionCount = 4;
+    break;
+  case "report-citation-quality-source-section-missing":
+    payload.reportCitationQuality.sourceSections = ["apiRoutes/dbEntities", "codeQuality.risks", "modules", "overview"];
+    break;
+  case "report-citation-quality-source-label-missing":
+    payload.reportCitationQuality.sourceSectionLabels = ["API/数据面", "风险信号", "扫描范围", "模块图"];
+    break;
+  case "report-citation-quality-source-order-wrong":
+    payload.reportCitationQuality.sourceSectionOrder = ["apiRoutes/dbEntities", "codeQuality.risks", "modules", "overview", "scanFingerprint"];
+    break;
+  case "report-citation-quality-source-label-order-wrong":
+    payload.reportCitationQuality.sourceSectionLabelOrder = ["API/数据面", "风险信号", "模块图", "扫描范围", "扫描指纹"];
+    break;
+  case "report-citation-quality-narrative-gap":
+    payload.reportCitationQuality.narrativeBinding = ["5/6"];
+    break;
+  case "report-citation-quality-detail-toggle-hidden":
+    payload.reportCitationQuality.detailToggleVisible = false;
+    break;
+  case "report-citation-quality-detail-default-open":
+    payload.reportCitationQuality.detailDefaultCollapsed = false;
+    break;
+  case "report-citation-quality-detail-does-not-open":
+    payload.reportCitationQuality.detailOpens = false;
+    break;
+  case "report-citation-quality-verdict-hidden":
+    payload.reportCitationQuality.verdictVisible = false;
+    break;
+  case "report-citation-quality-verdict-count-low":
+    payload.reportCitationQuality.verdictItemCount = 3;
+    break;
+  case "report-citation-quality-verdict-boundary-hidden":
+    payload.reportCitationQuality.verdictBoundaryVisible = false;
+    break;
+  case "report-citation-quality-boundary-hidden":
+    payload.reportCitationQuality.boundaryVisible = false;
+    break;
+  case "report-citation-quality-overclaim":
+    payload.reportCitationQuality.noOverclaim = false;
+    break;
+  case "report-citation-quality-overflow":
+    payload.reportCitationQuality.noHorizontalOverflow = false;
+    break;
+  case "report-citation-quality-provider-claim":
+    payload.reportCitationQuality.providerQualityClaim = true;
+    break;
+  case "report-citation-quality-llm-fact-claim":
+    payload.reportCitationQuality.llmFactClaim = true;
+    break;
+  case "report-citation-quality-raw-field":
+    payload.reportCitationQuality.rawAnswer = "unsafe raw answer";
+    break;
+  case "missing-evidence-line-range-priority":
+    delete payload.qaFromEvidence.evidenceLineRangePriority;
+    break;
+  case "evidence-line-range-priority-status-fail":
+    payload.qaFromEvidence.evidenceLineRangePriority.status = "FAIL";
+    break;
+  case "evidence-line-range-priority-proof-count-low":
+    payload.qaFromEvidence.evidenceLineRangePriority.proofCount = 2;
+    break;
+  case "evidence-line-range-priority-structured-range-false":
+    payload.qaFromEvidence.evidenceLineRangePriority.structuredRangePriority = false;
+    break;
+  case "evidence-line-range-priority-legacy-line-visible":
+    payload.qaFromEvidence.evidenceLineRangePriority.legacyLineHidden = false;
+    break;
+  case "evidence-line-range-priority-visible-range-forged":
+    payload.qaFromEvidence.evidenceLineRangePriority.visibleRanges = ["999"];
+    break;
+  case "evidence-line-range-priority-legacy-line-missing":
+    payload.qaFromEvidence.evidenceLineRangePriority.conflictLegacyLineNumbers = [];
+    break;
+  case "evidence-line-range-priority-mobile-missing":
+    payload.qaFromEvidence.evidenceLineRangePriority.mobile390Covered = false;
+    break;
+  case "evidence-line-range-priority-narrow-missing":
+    payload.qaFromEvidence.evidenceLineRangePriority.narrow320Covered = false;
+    break;
+  case "evidence-line-range-priority-overflow":
+    payload.qaFromEvidence.evidenceLineRangePriority.noHorizontalOverflow = false;
+    break;
+  case "evidence-line-range-priority-unexpected-field":
+    payload.qaFromEvidence.evidenceLineRangePriority.rawAnswer = "unsafe raw answer";
+    break;
+  case "missing-deep-evidence-card-readability":
+    delete payload.qaFromEvidence.deepEvidenceCardReadability;
+    break;
+  case "deep-evidence-card-readability-status-fail":
+    payload.qaFromEvidence.deepEvidenceCardReadability.status = "FAIL";
+    break;
+  case "deep-evidence-card-readability-mobile-missing":
+    payload.qaFromEvidence.deepEvidenceCardReadability.mobile390Covered = false;
+    break;
+  case "deep-evidence-card-readability-narrow-missing":
+    payload.qaFromEvidence.deepEvidenceCardReadability.narrow320Covered = false;
+    break;
+  case "deep-evidence-card-source-receipt-title-clipped":
+    payload.qaFromEvidence.deepEvidenceCardReadability.sourceReceipt.titleNotClipped = false;
+    break;
+  case "deep-evidence-card-source-receipt-range-hidden":
+    payload.qaFromEvidence.deepEvidenceCardReadability.sourceReceipt.structuredRangeVisible = false;
+    break;
+  case "deep-evidence-card-location-metrics-clipped":
+    payload.qaFromEvidence.deepEvidenceCardReadability.sourceLocationConfidence.metricsNotClipped = false;
+    break;
+  case "deep-evidence-card-location-checks-nowrap":
+    payload.qaFromEvidence.deepEvidenceCardReadability.sourceLocationConfidence.checksWrap = false;
+    break;
+  case "deep-evidence-card-llm-fact-boundary-missing":
+    delete payload.qaFromEvidence.deepEvidenceCardReadability.sourceLocationConfidence.llmFactBoundaryVisible;
+    break;
+  case "deep-evidence-card-llm-fact-boundary-hidden":
+    payload.qaFromEvidence.deepEvidenceCardReadability.sourceLocationConfidence.llmFactBoundaryVisible = false;
+    break;
+  case "deep-evidence-card-source-file-target-clipped":
+    payload.qaFromEvidence.deepEvidenceCardReadability.sourceFileMatchRelease.targetReferenceNotClipped = false;
+    break;
+  case "deep-evidence-card-source-file-review-repair-visible":
+    payload.qaFromEvidence.deepEvidenceCardReadability.sourceFileMatchRelease.noRepairOnReview = false;
+    break;
+  case "deep-evidence-card-overflow":
+    payload.qaFromEvidence.deepEvidenceCardReadability.noHorizontalOverflow = false;
+    break;
+  case "deep-evidence-card-provider-claim":
+    payload.qaFromEvidence.deepEvidenceCardReadability.providerQualityClaim = true;
+    break;
+	  case "deep-evidence-card-raw-field":
+	    payload.qaFromEvidence.deepEvidenceCardReadability.rawAnswer = "unsafe raw answer";
+	    break;
+  case "missing-relation-aware-evidence-reason":
+    delete payload.qaFromEvidence.relationAwareEvidenceReason;
+    break;
+  case "relation-aware-evidence-reason-status-fail":
+    payload.qaFromEvidence.relationAwareEvidenceReason.status = "FAIL";
+    break;
+  case "relation-aware-evidence-reason-marker-forged":
+    payload.qaFromEvidence.relationAwareEvidenceReason.marker = "Keyword match:";
+    break;
+  case "relation-aware-evidence-reason-citation-zero":
+    payload.qaFromEvidence.relationAwareEvidenceReason.minCitationReasonCount = 0;
+    break;
+  case "relation-aware-evidence-reason-chunk-zero":
+    payload.qaFromEvidence.relationAwareEvidenceReason.minRetrievedChunkReasonCount = 0;
+    break;
+  case "relation-aware-evidence-reason-adjacent-hidden":
+    payload.qaFromEvidence.relationAwareEvidenceReason.adjacentContextReasonVisible = false;
+    break;
+  case "relation-aware-evidence-reason-ui-hidden":
+    payload.qaFromEvidence.relationAwareEvidenceReason.uiReasonVisible = false;
+    break;
+  case "relation-aware-evidence-reason-provider-claim":
+    payload.qaFromEvidence.relationAwareEvidenceReason.providerQualityClaim = true;
+    break;
+  case "relation-aware-evidence-reason-raw-field":
+    payload.qaFromEvidence.relationAwareEvidenceReason.rawAnswer = "unsafe raw answer";
+    break;
+	  case "missing-unverified-citation":
+	    delete payload.qaFromEvidence.unverifiedCitation;
+	    break;
+  case "unverified-grounding-verified":
+    payload.qaFromEvidence.unverifiedCitation.groundingStatuses = ["VERIFIED"];
+    break;
+  case "unverified-enforcement-direct":
+    payload.qaFromEvidence.unverifiedCitation.citationEnforcementStatuses = ["DIRECT_VERIFIED"];
+    break;
+  case "unverified-uncited-candidate-zero":
+    payload.qaFromEvidence.unverifiedCitation.uncitedCandidateCount = 0;
+    break;
+  case "verified-coverage-repair-zero":
+    payload.qaFromEvidence.citationCoverage.minRepairCandidateCount = 0;
+    break;
+  case "verified-coverage-count-mismatch":
+    payload.qaFromEvidence.citationCoverage.minTotalEvidenceCount = 1;
+    break;
+  case "verified-missing-required-coverage":
+    delete payload.qaFromEvidence.citationCoverage.minRequiredEvidenceCoveragePercent;
+    break;
+  case "verified-low-required-coverage":
+    payload.qaFromEvidence.citationCoverage.minRequiredEvidenceCoveragePercent = 99;
+    break;
+  case "verified-required-count-zero":
+    payload.qaFromEvidence.citationCoverage.minRequiredEvidenceCount = 0;
+    break;
+  case "verified-required-file-count-zero":
+    payload.qaFromEvidence.citationCoverage.minRequiredEvidenceFileCount = 0;
+    break;
+  case "verified-cited-required-file-count-zero":
+    payload.qaFromEvidence.citationCoverage.minCitedRequiredEvidenceFileCount = 0;
+    break;
+  case "verified-primary-file-count-zero":
+    payload.qaFromEvidence.citationCoverage.minPrimaryEvidenceFileCount = 0;
+    break;
+  case "verified-cited-primary-file-count-zero":
+    payload.qaFromEvidence.citationCoverage.minCitedPrimaryEvidenceFileCount = 0;
+    break;
+  case "verified-missing-role-distribution":
+    delete payload.qaFromEvidence.citationCoverage.evidenceRoleDistribution;
+    break;
+  case "verified-role-primary-mismatch":
+    payload.qaFromEvidence.citationCoverage.evidenceRoleDistribution.minPrimaryFileCount = 2;
+    break;
+  case "verified-role-cited-primary-zero":
+    payload.qaFromEvidence.citationCoverage.evidenceRoleDistribution.minCitedPrimaryFileCount = 0;
+    break;
+	  case "verified-illegal-coverage-scope":
+	    payload.qaFromEvidence.citationCoverage.coverageScopes = ["SECONDARY"];
+	    break;
+	  case "qa-from-evidence-missing-claim-coverage":
+	    delete payload.qaFromEvidence.claimCitationCoverage;
+	    break;
+	  case "qa-from-evidence-low-claim-coverage":
+	    payload.qaFromEvidence.claimCitationCoverage.minClaimCoveragePercent = 99;
+	    break;
+	  case "qa-from-evidence-claim-status-review":
+	    payload.qaFromEvidence.claimCitationCoverage.statuses = ["REVIEW"];
+	    break;
+	  case "qa-from-evidence-claim-ready-for-repair-missing":
+	    delete payload.qaFromEvidence.claimCitationCoverage.readyForRepair;
+	    break;
+	  case "qa-from-evidence-claim-ready-for-repair-false":
+	    payload.qaFromEvidence.claimCitationCoverage.readyForRepair = false;
+	    break;
+	  case "qa-from-evidence-claim-readiness-reason-context":
+	    payload.qaFromEvidence.claimCitationCoverage.readinessReasons = ["CONTEXT_ONLY_CLAIM"];
+	    break;
+	  case "qa-from-evidence-invalid-claim-citation":
+	    payload.qaFromEvidence.claimCitationCoverage.maxInvalidCitationClaimCount = 1;
+	    break;
+	  case "qa-from-evidence-claim-file-count-zero":
+	    payload.qaFromEvidence.claimCitationCoverage.minValidCitationFileCount = 0;
+	    payload.qaFromEvidence.claimCitationCoverage.minRequiredClaimCitationFileCount = 0;
+	    break;
+	  case "qa-from-evidence-missing-claim-role-distribution":
+	    delete payload.qaFromEvidence.claimCitationCoverage.roleDistribution;
+	    break;
+	  case "qa-from-evidence-claim-role-status-context":
+	    payload.qaFromEvidence.claimCitationCoverage.roleDistribution.statuses = ["CONTEXT_ONLY"];
+	    break;
+	  case "qa-from-evidence-claim-role-primary-under-covered":
+	    payload.qaFromEvidence.claimCitationCoverage.roleDistribution.minRequiredPrimaryBoundClaimCount = 0;
+	    break;
+  case "qa-total-request-count-underflow":
+    payload.qaTotalRequestCount = 3;
+    break;
+  case "qa-total-request-count-missing-drift-requests":
+    payload.qaTotalRequestCount = payload.qaRequestCount;
+    break;
+  case "file-anchor-missing":
+    delete payload.qaFromEvidence.fileAnchorDrift;
+    payload.qaTotalRequestCount -= 2;
+    break;
+  case "file-anchor-grounding-verified":
+    payload.qaFromEvidence.fileAnchorDrift.groundingStatuses = ["VERIFIED"];
+    break;
+  case "file-anchor-enforcement-direct":
+    payload.qaFromEvidence.fileAnchorDrift.citationEnforcementStatuses = ["DIRECT_VERIFIED"];
+    break;
+  case "file-anchor-line-anchor-forged":
+    payload.qaFromEvidence.fileAnchorDrift.sourceEvidenceMatchTypes = ["REPORT_LINE_ANCHOR"];
+    break;
+  case "file-anchor-coverage-primary-forged":
+    payload.qaFromEvidence.fileAnchorDrift.citationCoverage.maxPrimaryEvidenceCount = 1;
+    break;
+  case "file-anchor-coverage-scope-primary":
+    payload.qaFromEvidence.fileAnchorDrift.citationCoverage.coverageScopes = ["PRIMARY"];
+    break;
+  case "file-anchor-repair-candidate-forged":
+    payload.qaFromEvidence.fileAnchorDrift.citationCoverage.maxRepairCandidateCount = 1;
+    break;
+  case "file-anchor-role-primary-bound":
+    payload.qaFromEvidence.fileAnchorDrift.claimCitationCoverage.roleDistribution.statuses = ["PRIMARY_BOUND"];
+    break;
+  case "file-anchor-claim-ready":
+    payload.qaFromEvidence.fileAnchorDrift.claimCitationCoverage.statuses = ["READY"];
+    break;
+  case "file-anchor-primary-bound-count-forged":
+    payload.qaFromEvidence.fileAnchorDrift.claimCitationCoverage.roleDistribution.maxRequiredPrimaryBoundClaimCount = 1;
+    break;
+  case "file-anchor-repair-action-visible":
+    payload.qaFromEvidence.fileAnchorDrift.latestNextActionRepairHidden = false;
+    break;
+  case "claim-role-missing-role-present":
+    payload.qaFromEvidence.claimRoleDistributionMissing.roleDistributionPresent = true;
+    break;
+  case "claim-role-missing-request-count-zero":
+    payload.qaFromEvidence.claimRoleDistributionMissing.requestCount = 0;
+    break;
+  case "claim-role-missing-source-match-file":
+    payload.qaFromEvidence.claimRoleDistributionMissing.sourceEvidenceMatchType = "REPORT_FILE_ANCHOR";
+    break;
+  case "claim-role-missing-claim-status-review":
+    payload.qaFromEvidence.claimRoleDistributionMissing.claimCitationStatus = "REVIEW";
+    break;
+  case "claim-role-missing-gate-not-review":
+    payload.qaFromEvidence.claimRoleDistributionMissing.repairEvidenceGateReviewVisible = false;
+    break;
+  case "claim-role-missing-repair-action-visible":
+    payload.qaFromEvidence.claimRoleDistributionMissing.latestNextActionRepairHidden = false;
+    break;
+  case "claim-role-mismatch-role-absent":
+    payload.qaFromEvidence.claimRoleDistributionMismatch.roleDistributionPresent = false;
+    break;
+  case "claim-role-mismatch-request-count-zero":
+    payload.qaFromEvidence.claimRoleDistributionMismatch.requestCount = 0;
+    break;
+  case "claim-role-mismatch-source-match-file":
+    payload.qaFromEvidence.claimRoleDistributionMismatch.sourceEvidenceMatchType = "REPORT_FILE_ANCHOR";
+    break;
+  case "claim-role-mismatch-flags-missing":
+    delete payload.qaFromEvidence.claimRoleDistributionMismatch.mismatchFlags;
+    break;
+  case "claim-role-mismatch-flags-false":
+    for (const key of Object.keys(payload.qaFromEvidence.claimRoleDistributionMismatch.mismatchFlags)) {
+      payload.qaFromEvidence.claimRoleDistributionMismatch.mismatchFlags[key] = false;
+    }
+    break;
+  case "claim-role-mismatch-unknown-flag":
+    payload.qaFromEvidence.claimRoleDistributionMismatch.mismatchFlags.unexpectedFlag = true;
+    break;
+  case "claim-role-mismatch-flag-not-boolean":
+    payload.qaFromEvidence.claimRoleDistributionMismatch.mismatchFlags.requiredClaimCountMismatch = "true";
+    break;
+  case "claim-role-mismatch-trust-summary-ready":
+    payload.qaFromEvidence.claimRoleDistributionMismatch.trustSummaryReviewVisible = false;
+    break;
+  case "claim-role-mismatch-citation-repair-visible":
+    payload.qaFromEvidence.claimRoleDistributionMismatch.latestCitationRepairHidden = false;
+    break;
+	  case "verified-missing-cross-file-summary":
+	    delete payload.qaFromEvidence.crossFileCitationSummary;
+	    break;
+	  case "verified-cross-file-count-mismatch":
+	    payload.qaFromEvidence.crossFileCitationSummary.minEvidenceFileCount = 1;
+	    break;
+		  case "verified-cross-file-raw-field":
+		    payload.qaFromEvidence.crossFileCitationSummary.rawAnswer = "unsafe";
+		    break;
+		  case "verified-cross-file-unexpected-field":
+		    payload.qaFromEvidence.crossFileCitationSummary.notes = "unexpected";
+		    break;
+	  case "verified-evidence-ref-response-unbound":
+	    payload.qaFromEvidence.evidenceRef.responseBound = false;
+	    break;
+  case "verified-repair-gate-hidden":
+    payload.qaFromEvidence.repairEvidenceGate.readyVisible = false;
+    break;
+  case "verified-repair-gate-file-only":
+    payload.qaFromEvidence.repairEvidenceGate.sourceEvidenceMatchType = "REPORT_FILE_ANCHOR";
+    break;
+  case "unverified-coverage-claims-repair":
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.statuses = ["PARTIAL"];
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.minCoveragePercent = 50;
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.minCitedEvidenceCount = 1;
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.minRepairCandidateCount = 1;
+    break;
+  case "unverified-illegal-coverage-scope":
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.coverageScopes = ["SECONDARY"];
+    break;
+	  case "unverified-required-coverage-claims-full":
+	    payload.qaFromEvidence.unverifiedCitation.citationCoverage.statuses = ["FULL"];
+	    payload.qaFromEvidence.unverifiedCitation.citationCoverage.minCoveragePercent = 100;
+	    payload.qaFromEvidence.unverifiedCitation.citationCoverage.minCitedEvidenceCount = 1;
+	    payload.qaFromEvidence.unverifiedCitation.citationCoverage.minRequiredEvidenceCoveragePercent = 100;
+	    payload.qaFromEvidence.unverifiedCitation.citationCoverage.minCitedRequiredEvidenceCount = 1;
+	    break;
+  case "unverified-cited-evidence-file-forged":
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.maxCitedEvidenceFileCount = 1;
+    break;
+  case "unverified-cited-primary-file-forged":
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.maxCitedPrimaryEvidenceFileCount = 1;
+    break;
+  case "unverified-role-cited-file-forged":
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.evidenceRoleDistribution.maxCitedFileCount = 1;
+    break;
+  case "unverified-role-cited-primary-forged":
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.evidenceRoleDistribution.maxCitedPrimaryFileCount = 1;
+    break;
+  case "unverified-cited-required-file-forged":
+    payload.qaFromEvidence.unverifiedCitation.citationCoverage.maxCitedRequiredEvidenceFileCount = 1;
+    break;
+	  case "unverified-missing-cross-file-summary":
+	    delete payload.qaFromEvidence.unverifiedCitation.crossFileCitationSummary;
+	    break;
+	  case "unverified-cross-file-tone-ready":
+	    payload.qaFromEvidence.unverifiedCitation.crossFileCitationSummary.tones = ["ready"];
+	    break;
+	  case "unverified-cross-file-cited-file-forged":
+	    payload.qaFromEvidence.unverifiedCitation.crossFileCitationSummary.maxCitedEvidenceFileCount = 1;
+	    break;
+	  case "unverified-cross-file-unexpected-field":
+	    payload.qaFromEvidence.unverifiedCitation.crossFileCitationSummary.notes = "unexpected";
+	    break;
+	  case "unverified-missing-claim-coverage":
+	    delete payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage;
+	    break;
+	  case "unverified-claim-status-ready":
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.statuses = ["READY"];
+	    break;
+	  case "unverified-claim-coverage-claims-full":
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.minClaimCoveragePercent = 100;
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.minCitedRequiredClaimCount = 1;
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.maxUncitedRequiredClaimCount = 0;
+	    break;
+	  case "unverified-invalid-claim-citation":
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.maxInvalidCitationClaimCount = 1;
+	    break;
+	  case "unverified-claim-file-count-forged":
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.maxValidCitationFileCount = 1;
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.maxRequiredClaimCitationFileCount = 1;
+	    break;
+	  case "unverified-claim-role-status-ready":
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.roleDistribution.statuses = ["PRIMARY_BOUND"];
+	    break;
+	  case "unverified-claim-role-primary-forged":
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.roleDistribution.maxRequiredPrimaryBoundClaimCount = 1;
+	    payload.qaFromEvidence.unverifiedCitation.claimCitationCoverage.roleDistribution.maxRequiredPrimaryFileCount = 1;
+	    break;
+	  case "unverified-evidence-ref-unbound":
+	    payload.qaFromEvidence.unverifiedCitation.evidenceRefRequestBound = false;
+	    break;
+  case "unverified-evidence-ref-response-unbound":
+    payload.qaFromEvidence.unverifiedCitation.evidenceRefResponseBound = false;
+    break;
+  case "unverified-repair-gate-not-blocked":
+    payload.qaFromEvidence.unverifiedCitation.repairEvidenceGateBlockedVisible = false;
+    break;
+  case "claim-noise-missing":
+    delete payload.qaFromEvidence.claimCitationNoiseBoundary;
+    break;
+  case "claim-noise-ready-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.claimCitationStatus = "READY";
+    payload.qaFromEvidence.claimCitationNoiseBoundary.roleDistributionStatus = "PRIMARY_BOUND";
+    break;
+  case "claim-noise-cited-evidence-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.maxCitedEvidenceCount = 1;
+    break;
+  case "claim-noise-repair-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.maxRepairCandidateCount = 1;
+    break;
+  case "claim-noise-unknown-kind-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.noiseKinds = ["fenced-code", "unknown-noise"];
+    break;
+  case "claim-noise-raw-answer-forged":
+    payload.qaFromEvidence.claimCitationNoiseBoundary.rawAnswer = "AuthService validates token [C1]";
+    break;
+  default:
+    throw new Error(`unknown QA marker mutation ${mutationLabel}`);
+}
+process.stdout.write(JSON.stringify(payload));
+NODE
+  }
+
+  verify_report_evidence_drawer_ui_marker_rejects() {
+    local label="$1"
+    local marker_payload="$2"
+    local reject_output_file="$tmp_dir/verify-release-evidence-report-evidence-drawer-ui-${label}.txt"
+    if ! write_report_evidence_drawer_ui_marker_log "$marker_payload"; then
+      failure="could not write forged report evidence drawer UI smoke payload for $label"
+      return
+    fi
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid report evidence drawer UI smoke marker: $label"
+    elif ! rg -q 'report-evidence-drawer-ui-smoke OK must prove mocked report evidence drawer code_chunks flow' "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain invalid report evidence drawer UI smoke marker rejection: $label"
+    fi
+  }
+
+  if [[ -z "$failure" ]]; then
+    write_strict_audit_workbench_release_evidence_fixture "$run_dir" "$run_id" true 1 1 1
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^include_report_evidence_drawer_ui_smoke: / {
+        print "include_report_evidence_drawer_ui_smoke: true"
+        changed = 1
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/manifest.txt" > "$tampered_manifest_file"; then
+      failure="could not mark report evidence drawer UI smoke include as true"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN { OFS = "\t" }
+      NR == 1 { print; next }
+      $2 == "report-evidence-drawer-ui-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge report evidence drawer UI smoke status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- SKIP `report-evidence-drawer-ui-smoke`: / && !changed {
+        print "- OK `report-evidence-drawer-ui-smoke`: Report evidence drawer browser UI smoke (mocked) (completed)"
+        changed = 1
+        next
+      }
+      /^- skipped: `/ {
+        line = $0
+        sub(/^- skipped: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- skipped: `" line - 1 "`"
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge report evidence drawer UI smoke summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_manifest_file" "$run_dir/manifest.txt" \
+      || failure="could not replace manifest with forged report evidence drawer UI smoke include"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged report evidence drawer UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged report evidence drawer UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/manifest.txt" "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep report evidence drawer UI marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must reject report evidence drawer UI smoke OK rows without REPORT_EVIDENCE_DRAWER_SMOKE_OK marker"
+    elif ! rg -q 'report-evidence-drawer-ui-smoke OK must prove mocked report evidence drawer code_chunks flow' "$output_file"; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must explain missing report evidence drawer UI smoke marker rejection"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_report_evidence_drawer_ui_marker_log "$valid_marker_payload"; then
+      failure="could not write valid forged report evidence drawer UI smoke marker"
+    elif ! run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must accept valid report evidence drawer UI smoke marker with required scan binding and viewports"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_report_evidence_drawer_ui_marker_log "$valid_marker_payload" "$(mutated_report_evidence_qa_marker "claim-role-valid-drift-fields")"; then
+      failure="could not write valid report evidence QA claim role drift marker"
+    elif ! run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must accept valid optional claim role drift markers while preserving old marker compatibility"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "missing-main-path-guide" "$(node -e 'const payload = JSON.parse(process.argv[1]); delete payload.mainPathGuide; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "wrong-main-path-order" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.mainPathGuide.order = ["citation-quality","recommended-action","evidence-priority"]; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "main-path-overflow" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.mainPathGuide.noHorizontalOverflow = false; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "missing-action-board" "$(node -e 'const payload = JSON.parse(process.argv[1]); delete payload.actionBoard; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "wrong-action-board-order" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.actionBoard.actionKeys = ["code-qa","risk-review","agent-review","audit-trace","dependency-review","repair-candidate"]; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "action-board-link-hidden" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.actionBoard.codeQaLinkVisible = false; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "action-board-overflow" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.actionBoard.noHorizontalOverflow = false; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "missing-review-gate" "$(node -e 'const payload = JSON.parse(process.argv[1]); delete payload.reviewGate; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "wrong-review-gate-order" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.reviewGate.gateKeys = ["code-knowledge","report-readiness","evidence-bundle","repair-readiness","audit-trace","governance-timeline"]; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "review-gate-text-clipped" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.reviewGate.textNotClipped = false; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "review-gate-overflow" "$(node -e 'const payload = JSON.parse(process.argv[1]); payload.reviewGate.noHorizontalOverflow = false; process.stdout.write(JSON.stringify(payload));' "$valid_marker_payload")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_drawer_ui_marker_rejects "missing-narrow-viewport" '{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","drawerQueryCount":6,"readyDrawerQueryCount":3,"gapDrawerQueryCount":3,"drawerActionRail":{"readyVisible":true,"gapVisible":true,"readyRepairActionVisible":true,"gapRepairCreationActionHidden":true,"gapLocalizationActionVisible":true,"gapLocalizationActionDisabled":true},"mainPathGuide":{"visible":true,"stepCount":3,"order":["recommended-action","citation-quality","evidence-priority"],"labels":["01","02","03"],"mobile390Covered":true,"narrow320Covered":true,"noHorizontalOverflow":true},"actionBoard":{"visible":true,"actionCount":6,"actionKeys":["risk-review","code-qa","agent-review","audit-trace","dependency-review","repair-candidate"],"codeQaLinkVisible":true,"repairCandidateVisible":true,"mobile390Covered":true,"narrow320Covered":true,"noHorizontalOverflow":true},"reviewGate":{"visible":true,"gateCount":6,"gateKeys":["report-readiness","evidence-bundle","code-knowledge","repair-readiness","audit-trace","governance-timeline"],"minReadyCount":4,"mobile390Covered":true,"narrow320Covered":true,"textNotClipped":true,"noHorizontalOverflow":true},"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900"],"baseURLHost":"127.0.0.1","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_report_evidence_drawer_ui_marker_log "$valid_marker_payload" ""; then
+      failure="could not write report evidence drawer marker without QA citation marker"
+    elif run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must reject report evidence drawer UI smoke OK rows without REPORT_EVIDENCE_QA_CITATION_UI_SMOKE_OK marker"
+    elif ! rg -q 'report-evidence-drawer-ui-smoke OK must prove mocked report evidence drawer code_chunks flow' "$output_file"; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must explain missing report evidence QA citation UI smoke marker rejection"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "citation-count-zero" '{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","qaRequestCount":2,"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"qaFromEvidence":{"status":"OK","responseStatus":200,"resultCount":2,"citationCount":0,"groundingStatuses":["VERIFIED"],"citationEnforcementStatuses":["DIRECT_VERIFIED"],"citationEnforcementReasons":["DIRECT_VERIFIED"],"citedChunkCount":1,"expectedEvidenceFileVisible":true,"evidenceRef":{"requestBound":true,"contextVisible":true,"filePath":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java"}},"fullReleaseAuthorityRefreshed":false,"baseURLHost":"127.0.0.1","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "old-qa-request-count" "$(mutated_report_evidence_qa_marker "old-qa-request-count")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-not-object" "$(mutated_report_evidence_qa_marker "report-citation-quality-not-object")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-status-fail" "$(mutated_report_evidence_qa_marker "report-citation-quality-status-fail")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-wrong-surface" "$(mutated_report_evidence_qa_marker "report-citation-quality-wrong-surface")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-hidden" "$(mutated_report_evidence_qa_marker "report-citation-quality-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-count-gap" "$(mutated_report_evidence_qa_marker "report-citation-quality-count-gap")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-source-diversity-hidden" "$(mutated_report_evidence_qa_marker "report-citation-quality-source-diversity-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-source-coverage-hidden" "$(mutated_report_evidence_qa_marker "report-citation-quality-source-coverage-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-source-section-count-low" "$(mutated_report_evidence_qa_marker "report-citation-quality-source-section-count-low")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-source-section-missing" "$(mutated_report_evidence_qa_marker "report-citation-quality-source-section-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-source-label-missing" "$(mutated_report_evidence_qa_marker "report-citation-quality-source-label-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-source-order-wrong" "$(mutated_report_evidence_qa_marker "report-citation-quality-source-order-wrong")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-source-label-order-wrong" "$(mutated_report_evidence_qa_marker "report-citation-quality-source-label-order-wrong")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-narrative-gap" "$(mutated_report_evidence_qa_marker "report-citation-quality-narrative-gap")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-detail-toggle-hidden" "$(mutated_report_evidence_qa_marker "report-citation-quality-detail-toggle-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-detail-default-open" "$(mutated_report_evidence_qa_marker "report-citation-quality-detail-default-open")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-detail-does-not-open" "$(mutated_report_evidence_qa_marker "report-citation-quality-detail-does-not-open")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-verdict-hidden" "$(mutated_report_evidence_qa_marker "report-citation-quality-verdict-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-verdict-count-low" "$(mutated_report_evidence_qa_marker "report-citation-quality-verdict-count-low")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-verdict-boundary-hidden" "$(mutated_report_evidence_qa_marker "report-citation-quality-verdict-boundary-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-boundary-hidden" "$(mutated_report_evidence_qa_marker "report-citation-quality-boundary-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-overclaim" "$(mutated_report_evidence_qa_marker "report-citation-quality-overclaim")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-overflow" "$(mutated_report_evidence_qa_marker "report-citation-quality-overflow")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-provider-claim" "$(mutated_report_evidence_qa_marker "report-citation-quality-provider-claim")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-llm-fact-claim" "$(mutated_report_evidence_qa_marker "report-citation-quality-llm-fact-claim")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "report-citation-quality-raw-field" "$(mutated_report_evidence_qa_marker "report-citation-quality-raw-field")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "missing-evidence-line-range-priority" "$(mutated_report_evidence_qa_marker "missing-evidence-line-range-priority")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-status-fail" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-status-fail")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-proof-count-low" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-proof-count-low")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-structured-range-false" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-structured-range-false")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-legacy-line-visible" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-legacy-line-visible")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-visible-range-forged" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-visible-range-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-legacy-line-missing" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-legacy-line-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-mobile-missing" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-mobile-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-narrow-missing" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-narrow-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-overflow" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-overflow")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-line-range-priority-unexpected-field" "$(mutated_report_evidence_qa_marker "evidence-line-range-priority-unexpected-field")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "missing-deep-evidence-card-readability" "$(mutated_report_evidence_qa_marker "missing-deep-evidence-card-readability")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-readability-status-fail" "$(mutated_report_evidence_qa_marker "deep-evidence-card-readability-status-fail")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-readability-mobile-missing" "$(mutated_report_evidence_qa_marker "deep-evidence-card-readability-mobile-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-readability-narrow-missing" "$(mutated_report_evidence_qa_marker "deep-evidence-card-readability-narrow-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-source-receipt-title-clipped" "$(mutated_report_evidence_qa_marker "deep-evidence-card-source-receipt-title-clipped")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-source-receipt-range-hidden" "$(mutated_report_evidence_qa_marker "deep-evidence-card-source-receipt-range-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-location-metrics-clipped" "$(mutated_report_evidence_qa_marker "deep-evidence-card-location-metrics-clipped")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-location-checks-nowrap" "$(mutated_report_evidence_qa_marker "deep-evidence-card-location-checks-nowrap")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-llm-fact-boundary-missing" "$(mutated_report_evidence_qa_marker "deep-evidence-card-llm-fact-boundary-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-llm-fact-boundary-hidden" "$(mutated_report_evidence_qa_marker "deep-evidence-card-llm-fact-boundary-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-source-file-target-clipped" "$(mutated_report_evidence_qa_marker "deep-evidence-card-source-file-target-clipped")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-source-file-review-repair-visible" "$(mutated_report_evidence_qa_marker "deep-evidence-card-source-file-review-repair-visible")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-overflow" "$(mutated_report_evidence_qa_marker "deep-evidence-card-overflow")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-provider-claim" "$(mutated_report_evidence_qa_marker "deep-evidence-card-provider-claim")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "deep-evidence-card-raw-field" "$(mutated_report_evidence_qa_marker "deep-evidence-card-raw-field")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "missing-relation-aware-evidence-reason" "$(mutated_report_evidence_qa_marker "missing-relation-aware-evidence-reason")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "relation-aware-evidence-reason-status-fail" "$(mutated_report_evidence_qa_marker "relation-aware-evidence-reason-status-fail")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "relation-aware-evidence-reason-marker-forged" "$(mutated_report_evidence_qa_marker "relation-aware-evidence-reason-marker-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "relation-aware-evidence-reason-citation-zero" "$(mutated_report_evidence_qa_marker "relation-aware-evidence-reason-citation-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "relation-aware-evidence-reason-chunk-zero" "$(mutated_report_evidence_qa_marker "relation-aware-evidence-reason-chunk-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "relation-aware-evidence-reason-adjacent-hidden" "$(mutated_report_evidence_qa_marker "relation-aware-evidence-reason-adjacent-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "relation-aware-evidence-reason-ui-hidden" "$(mutated_report_evidence_qa_marker "relation-aware-evidence-reason-ui-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "relation-aware-evidence-reason-provider-claim" "$(mutated_report_evidence_qa_marker "relation-aware-evidence-reason-provider-claim")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "relation-aware-evidence-reason-raw-field" "$(mutated_report_evidence_qa_marker "relation-aware-evidence-reason-raw-field")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "missing-unverified-citation" "$(mutated_report_evidence_qa_marker "missing-unverified-citation")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-grounding-verified" "$(mutated_report_evidence_qa_marker "unverified-grounding-verified")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-enforcement-direct" "$(mutated_report_evidence_qa_marker "unverified-enforcement-direct")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-uncited-candidate-zero" "$(mutated_report_evidence_qa_marker "unverified-uncited-candidate-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-coverage-repair-zero" "$(mutated_report_evidence_qa_marker "verified-coverage-repair-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-coverage-count-mismatch" "$(mutated_report_evidence_qa_marker "verified-coverage-count-mismatch")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-missing-required-coverage" "$(mutated_report_evidence_qa_marker "verified-missing-required-coverage")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-low-required-coverage" "$(mutated_report_evidence_qa_marker "verified-low-required-coverage")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-required-count-zero" "$(mutated_report_evidence_qa_marker "verified-required-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-required-file-count-zero" "$(mutated_report_evidence_qa_marker "verified-required-file-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-cited-required-file-count-zero" "$(mutated_report_evidence_qa_marker "verified-cited-required-file-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-primary-file-count-zero" "$(mutated_report_evidence_qa_marker "verified-primary-file-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-cited-primary-file-count-zero" "$(mutated_report_evidence_qa_marker "verified-cited-primary-file-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-missing-role-distribution" "$(mutated_report_evidence_qa_marker "verified-missing-role-distribution")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-role-primary-mismatch" "$(mutated_report_evidence_qa_marker "verified-role-primary-mismatch")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-role-cited-primary-zero" "$(mutated_report_evidence_qa_marker "verified-role-cited-primary-zero")"
+  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "verified-illegal-coverage-scope" "$(mutated_report_evidence_qa_marker "verified-illegal-coverage-scope")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-missing-claim-coverage" "$(mutated_report_evidence_qa_marker "qa-from-evidence-missing-claim-coverage")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-low-claim-coverage" "$(mutated_report_evidence_qa_marker "qa-from-evidence-low-claim-coverage")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-claim-status-review" "$(mutated_report_evidence_qa_marker "qa-from-evidence-claim-status-review")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-claim-ready-for-repair-missing" "$(mutated_report_evidence_qa_marker "qa-from-evidence-claim-ready-for-repair-missing")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-claim-ready-for-repair-false" "$(mutated_report_evidence_qa_marker "qa-from-evidence-claim-ready-for-repair-false")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-claim-readiness-reason-context" "$(mutated_report_evidence_qa_marker "qa-from-evidence-claim-readiness-reason-context")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-invalid-claim-citation" "$(mutated_report_evidence_qa_marker "qa-from-evidence-invalid-claim-citation")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-claim-file-count-zero" "$(mutated_report_evidence_qa_marker "qa-from-evidence-claim-file-count-zero")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-missing-claim-role-distribution" "$(mutated_report_evidence_qa_marker "qa-from-evidence-missing-claim-role-distribution")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-claim-role-status-context" "$(mutated_report_evidence_qa_marker "qa-from-evidence-claim-role-status-context")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "qa-from-evidence-claim-role-primary-under-covered" "$(mutated_report_evidence_qa_marker "qa-from-evidence-claim-role-primary-under-covered")"
+	  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "qa-total-request-count-underflow" "$(mutated_report_evidence_qa_marker "qa-total-request-count-underflow")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "qa-total-request-count-missing-drift-requests" "$(mutated_report_evidence_qa_marker "qa-total-request-count-missing-drift-requests")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-drift-not-object" "$(mutated_report_evidence_qa_marker "claim-role-drift-not-object")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-drift-missing-mismatch" "$(mutated_report_evidence_qa_marker "claim-role-drift-missing-mismatch")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-drift-unknown-field" "$(mutated_report_evidence_qa_marker "claim-role-drift-unknown-field")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-missing" "$(mutated_report_evidence_qa_marker "file-anchor-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-grounding-verified" "$(mutated_report_evidence_qa_marker "file-anchor-grounding-verified")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-enforcement-direct" "$(mutated_report_evidence_qa_marker "file-anchor-enforcement-direct")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-line-anchor-forged" "$(mutated_report_evidence_qa_marker "file-anchor-line-anchor-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-coverage-primary-forged" "$(mutated_report_evidence_qa_marker "file-anchor-coverage-primary-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-coverage-scope-primary" "$(mutated_report_evidence_qa_marker "file-anchor-coverage-scope-primary")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-repair-candidate-forged" "$(mutated_report_evidence_qa_marker "file-anchor-repair-candidate-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-role-primary-bound" "$(mutated_report_evidence_qa_marker "file-anchor-role-primary-bound")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-claim-ready" "$(mutated_report_evidence_qa_marker "file-anchor-claim-ready")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-primary-bound-count-forged" "$(mutated_report_evidence_qa_marker "file-anchor-primary-bound-count-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "file-anchor-repair-action-visible" "$(mutated_report_evidence_qa_marker "file-anchor-repair-action-visible")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-missing-role-present" "$(mutated_report_evidence_qa_marker "claim-role-missing-role-present")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-missing-request-count-zero" "$(mutated_report_evidence_qa_marker "claim-role-missing-request-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-missing-source-match-file" "$(mutated_report_evidence_qa_marker "claim-role-missing-source-match-file")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-missing-claim-status-review" "$(mutated_report_evidence_qa_marker "claim-role-missing-claim-status-review")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-missing-gate-not-review" "$(mutated_report_evidence_qa_marker "claim-role-missing-gate-not-review")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-missing-repair-action-visible" "$(mutated_report_evidence_qa_marker "claim-role-missing-repair-action-visible")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-role-absent" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-role-absent")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-request-count-zero" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-request-count-zero")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-source-match-file" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-source-match-file")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-flags-missing" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-flags-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-flags-false" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-flags-false")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-unknown-flag" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-unknown-flag")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-flag-not-boolean" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-flag-not-boolean")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-trust-summary-ready" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-trust-summary-ready")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-role-mismatch-citation-repair-visible" "$(mutated_report_evidence_qa_marker "claim-role-mismatch-citation-repair-visible")"
+  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "verified-missing-cross-file-summary" "$(mutated_report_evidence_qa_marker "verified-missing-cross-file-summary")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "verified-cross-file-count-mismatch" "$(mutated_report_evidence_qa_marker "verified-cross-file-count-mismatch")"
+	  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_report_evidence_qa_citation_marker_rejects "verified-cross-file-raw-field" "$(mutated_report_evidence_qa_marker "verified-cross-file-raw-field")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_report_evidence_qa_citation_marker_rejects "verified-cross-file-unexpected-field" "$(mutated_report_evidence_qa_marker "verified-cross-file-unexpected-field")"
+		  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "verified-evidence-ref-response-unbound" "$(mutated_report_evidence_qa_marker "verified-evidence-ref-response-unbound")"
+	  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-repair-gate-hidden" "$(mutated_report_evidence_qa_marker "verified-repair-gate-hidden")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "verified-repair-gate-file-only" "$(mutated_report_evidence_qa_marker "verified-repair-gate-file-only")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-coverage-claims-repair" "$(mutated_report_evidence_qa_marker "unverified-coverage-claims-repair")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-illegal-coverage-scope" "$(mutated_report_evidence_qa_marker "unverified-illegal-coverage-scope")"
+  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-required-coverage-claims-full" "$(mutated_report_evidence_qa_marker "unverified-required-coverage-claims-full")"
+	  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-cited-evidence-file-forged" "$(mutated_report_evidence_qa_marker "unverified-cited-evidence-file-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-cited-primary-file-forged" "$(mutated_report_evidence_qa_marker "unverified-cited-primary-file-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-role-cited-file-forged" "$(mutated_report_evidence_qa_marker "unverified-role-cited-file-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-role-cited-primary-forged" "$(mutated_report_evidence_qa_marker "unverified-role-cited-primary-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-cited-required-file-forged" "$(mutated_report_evidence_qa_marker "unverified-cited-required-file-forged")"
+  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-missing-cross-file-summary" "$(mutated_report_evidence_qa_marker "unverified-missing-cross-file-summary")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-cross-file-tone-ready" "$(mutated_report_evidence_qa_marker "unverified-cross-file-tone-ready")"
+	  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_report_evidence_qa_citation_marker_rejects "unverified-cross-file-cited-file-forged" "$(mutated_report_evidence_qa_marker "unverified-cross-file-cited-file-forged")"
+		  fi
+		  if [[ -z "$failure" ]]; then
+		    verify_report_evidence_qa_citation_marker_rejects "unverified-cross-file-unexpected-field" "$(mutated_report_evidence_qa_marker "unverified-cross-file-unexpected-field")"
+		  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-missing-claim-coverage" "$(mutated_report_evidence_qa_marker "unverified-missing-claim-coverage")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-claim-status-ready" "$(mutated_report_evidence_qa_marker "unverified-claim-status-ready")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-claim-coverage-claims-full" "$(mutated_report_evidence_qa_marker "unverified-claim-coverage-claims-full")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-invalid-claim-citation" "$(mutated_report_evidence_qa_marker "unverified-invalid-claim-citation")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-claim-file-count-forged" "$(mutated_report_evidence_qa_marker "unverified-claim-file-count-forged")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-claim-role-status-ready" "$(mutated_report_evidence_qa_marker "unverified-claim-role-status-ready")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-claim-role-primary-forged" "$(mutated_report_evidence_qa_marker "unverified-claim-role-primary-forged")"
+	  fi
+	  if [[ -z "$failure" ]]; then
+	    verify_report_evidence_qa_citation_marker_rejects "unverified-evidence-ref-unbound" "$(mutated_report_evidence_qa_marker "unverified-evidence-ref-unbound")"
+	  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-evidence-ref-response-unbound" "$(mutated_report_evidence_qa_marker "unverified-evidence-ref-response-unbound")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-repair-gate-not-blocked" "$(mutated_report_evidence_qa_marker "unverified-repair-gate-not-blocked")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-noise-missing" "$(mutated_report_evidence_qa_marker "claim-noise-missing")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-noise-ready-forged" "$(mutated_report_evidence_qa_marker "claim-noise-ready-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-noise-cited-evidence-forged" "$(mutated_report_evidence_qa_marker "claim-noise-cited-evidence-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-noise-repair-forged" "$(mutated_report_evidence_qa_marker "claim-noise-repair-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-noise-unknown-kind-forged" "$(mutated_report_evidence_qa_marker "claim-noise-unknown-kind-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "claim-noise-raw-answer-forged" "$(mutated_report_evidence_qa_marker "claim-noise-raw-answer-forged")"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unverified-grounding" '{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","qaRequestCount":2,"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"qaFromEvidence":{"status":"OK","responseStatus":200,"resultCount":2,"citationCount":2,"citationCoverage":{"statuses":["PARTIAL"],"minCoveragePercent":50,"minTotalEvidenceCount":2,"minCitedEvidenceCount":1,"minUncitedCandidateCount":1,"minRepairCandidateCount":1},"groundingStatuses":["UNVERIFIED"],"citationEnforcementStatuses":["DIRECT_VERIFIED"],"citationEnforcementReasons":["DIRECT_VERIFIED"],"citedChunkCount":1,"expectedEvidenceFileVisible":true,"evidenceRef":{"requestBound":true,"contextVisible":true,"filePath":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java"}},"fullReleaseAuthorityRefreshed":false,"baseURLHost":"127.0.0.1","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "retry-failed-enforcement" '{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","qaRequestCount":2,"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"qaFromEvidence":{"status":"OK","responseStatus":200,"resultCount":2,"citationCount":2,"citationCoverage":{"statuses":["PARTIAL"],"minCoveragePercent":50,"minTotalEvidenceCount":2,"minCitedEvidenceCount":1,"minUncitedCandidateCount":1,"minRepairCandidateCount":1},"groundingStatuses":["VERIFIED"],"citationEnforcementStatuses":["RETRY_FAILED"],"citationEnforcementReasons":["DIRECT_VERIFIED"],"citedChunkCount":1,"expectedEvidenceFileVisible":true,"evidenceRef":{"requestBound":true,"contextVisible":true,"filePath":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java"}},"fullReleaseAuthorityRefreshed":false,"baseURLHost":"127.0.0.1","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "evidence-ref-unbound" '{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","qaRequestCount":2,"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"qaFromEvidence":{"status":"OK","responseStatus":200,"resultCount":2,"citationCount":2,"citationCoverage":{"statuses":["PARTIAL"],"minCoveragePercent":50,"minTotalEvidenceCount":2,"minCitedEvidenceCount":1,"minUncitedCandidateCount":1,"minRepairCandidateCount":1},"groundingStatuses":["VERIFIED"],"citationEnforcementStatuses":["DIRECT_VERIFIED"],"citationEnforcementReasons":["DIRECT_VERIFIED"],"citedChunkCount":1,"expectedEvidenceFileVisible":true,"evidenceRef":{"requestBound":false,"contextVisible":true,"filePath":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java"}},"fullReleaseAuthorityRefreshed":false,"baseURLHost":"127.0.0.1","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "external-host" '{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","qaRequestCount":2,"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"qaFromEvidence":{"status":"OK","responseStatus":200,"resultCount":2,"citationCount":2,"citationCoverage":{"statuses":["PARTIAL"],"minCoveragePercent":50,"minTotalEvidenceCount":2,"minCitedEvidenceCount":1,"minUncitedCandidateCount":1,"minRepairCandidateCount":1},"groundingStatuses":["VERIFIED"],"citationEnforcementStatuses":["DIRECT_VERIFIED"],"citationEnforcementReasons":["DIRECT_VERIFIED"],"citedChunkCount":1,"expectedEvidenceFileVisible":true,"evidenceRef":{"requestBound":true,"contextVisible":true,"filePath":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java"}},"fullReleaseAuthorityRefreshed":false,"baseURLHost":"example.com","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_report_evidence_qa_citation_marker_rejects "unsafe-evidence-path" '{"projectId":1,"repositoryId":11,"scanTaskId":501,"expectedEvidenceFile":"src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java","qaRequestCount":2,"mockedApiOnly":true,"unhandledApiRequests":0,"viewports":["1440x900","320x740"],"qaFromEvidence":{"status":"OK","responseStatus":200,"resultCount":2,"citationCount":2,"citationCoverage":{"statuses":["PARTIAL"],"minCoveragePercent":50,"minTotalEvidenceCount":2,"minCitedEvidenceCount":1,"minUncitedCandidateCount":1,"minRepairCandidateCount":1},"groundingStatuses":["VERIFIED"],"citationEnforcementStatuses":["DIRECT_VERIFIED"],"citationEnforcementReasons":["DIRECT_VERIFIED"],"citedChunkCount":1,"expectedEvidenceFileVisible":true,"evidenceRef":{"requestBound":true,"contextVisible":true,"filePath":"../src/main/java/demo/report/evidence/readability/ChatControllerWithVeryLongBoundaryEvidencePath.java"}},"fullReleaseAuthorityRefreshed":false,"baseURLHost":"127.0.0.1","spec":"report-evidence-drawer-smoke.spec.ts"}'
+  fi
+
+  cleanup_report_evidence_drawer_ui_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_verifier_rejects_scan_governance_timeline_ui_smoke_ok_without_marker() {
+  local tmp_dir
+  local run_id
+  local run_dir
+  local output_file
+  local tampered_status_file
+  local tampered_summary_file
+  local tampered_manifest_file
+  local valid_marker_payload
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-scan-governance-timeline-ui-marker-probe.XXXXXX")" \
+    || fail "could not create scan governance timeline UI marker probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden scan governance timeline UI marker probe temp dir"
+  run_id="scan-governance-timeline-ui-marker-${tmp_dir##*.}"
+  run_dir="$tmp_dir/$run_id"
+  output_file="$tmp_dir/verify-release-evidence-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+  tampered_summary_file="$tmp_dir/summary.md"
+  tampered_manifest_file="$tmp_dir/manifest.txt"
+  valid_marker_payload="$(cat <<'JSON'
+{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"repairEvidenceGate":"READY","repairEvidenceGateReason":"QA citation, report evidence and target file are line-anchored for candidate review","repairEvidenceGateSource":"SERVER_DERIVED","serverDerivedGateVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"sourceReportDeepLinkBound":true,"qaReviewDeepLinkBound":true,"actionLabels":["打开修复详情","打开来源报告","QA 复核来源"],"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"actionLabel":"打开修复详情","auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"patchEvidence":{"repairVisible":true,"autoRepairId":6101,"repairStatus":"PATCH_READY","scanTaskIdBound":true,"targetFileVisible":true,"diffVisible":true,"patchArtifactVisible":true,"patchArtifactOwnerType":"AUTO_REPAIR","patchArtifactOwnerId":6101,"patchArtifactType":"CHANGE_PATCH","patchArtifactActionVisible":true,"patchArtifactActionLabel":"打开补丁产物","patchArtifactDeepLinkBound":true,"repairExecutionVisible":true,"repairExecutionSourceType":"AUTO_REPAIR","repairExecutionSourceId":6101,"repairExecutionStatus":"SUCCESS","repairExecutionActionLabel":"打开执行详情","repairExecutionDeepLinkBound":true,"patchGenerationStepVisible":true,"patchGenerationStepKey":"generate_patch","patchGenerationStepStatus":"SUCCESS","patchReadyAuditVisible":true,"patchReadyAuditAction":"AUTO_REPAIR_PATCH_READY","patchReadyAuditStatus":"SUCCESS","patchReadyAuditActionLabel":"打开审计日志","patchReadyAuditDeepLinkBound":true,"auditSourceBound":true,"foreignPatchEvidenceHidden":true,"noRawPromptOrAnswer":true},"agentReview":{"currentAgentTaskVisible":true,"currentAgentTaskId":9101,"agentTaskActionLabel":"打开 Agent 任务","agentTaskDeepLinkBound":true,"foreignAgentTaskHidden":true,"toolCallAuditVisible":true,"currentToolCallId":11101,"toolCallAuditActionLabel":"打开审计日志","toolCallAuditDeepLinkBound":true,"foreignToolCallHidden":true,"agentExecutionBound":true,"currentAgentExecutionVisible":true,"agentExecutionSourceType":"AGENT_TASK","agentExecutionSourceId":9101,"agentExecutionActionLabel":"打开执行详情","agentExecutionDeepLinkBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}
+JSON
+)"
+
+  cleanup_scan_governance_timeline_ui_marker_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  write_scan_governance_timeline_ui_marker_log() {
+    local marker_payload="$1"
+    {
+      printf 'scan-governance-timeline-smoke.spec.ts\n'
+      printf 'SCAN_GOVERNANCE_TIMELINE_SMOKE_OK %s\n' "$marker_payload"
+    } > "$run_dir/scan-governance-timeline-ui-smoke.log" || return 1
+    chmod 600 "$run_dir/scan-governance-timeline-ui-smoke.log" || return 1
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  }
+
+  verify_scan_governance_timeline_ui_marker_rejects() {
+    local label="$1"
+    local marker_payload="$2"
+    local reject_output_file="$tmp_dir/verify-release-evidence-scan-governance-timeline-ui-${label}.txt"
+    if ! write_scan_governance_timeline_ui_marker_log "$marker_payload"; then
+      failure="could not write forged scan governance timeline UI smoke payload for $label"
+      return
+    fi
+    if run_verify_release_evidence "$run_dir" > "$reject_output_file" 2>&1; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must reject invalid scan governance timeline UI smoke marker: $label"
+    elif ! rg -q 'scan-governance-timeline-ui-smoke OK must prove mocked scan governance timeline aggregate flow' "$reject_output_file"; then
+      cat "$reject_output_file" >&2
+      failure="release evidence verifier must explain invalid scan governance timeline UI smoke marker rejection: $label"
+    fi
+  }
+
+  verify_scan_governance_timeline_ui_marker_rejects_mutated() {
+    local label="$1"
+    local mutation="$2"
+    local marker_payload
+    if ! marker_payload="$(node - "$valid_marker_payload" "$mutation" <<'NODE'
+const payload = JSON.parse(process.argv[2]);
+const mutation = process.argv[3];
+const mutations = {
+  "missing-patch-evidence": current => {
+    delete current.patchEvidence;
+  },
+  "patch-evidence-artifact-owner-unbound": current => {
+    current.patchEvidence.patchArtifactOwnerId = 9501;
+  },
+  "patch-evidence-artifact-action-label-generic": current => {
+    current.patchEvidence.patchArtifactActionLabel = "产物库";
+  },
+  "patch-evidence-artifact-deep-link-unbound": current => {
+    current.patchEvidence.patchArtifactDeepLinkBound = false;
+  },
+  "patch-evidence-audit-missing": current => {
+    current.patchEvidence.patchReadyAuditVisible = false;
+  },
+  "patch-evidence-audit-action-label-generic": current => {
+    current.patchEvidence.patchReadyAuditActionLabel = "审计";
+  },
+  "patch-evidence-audit-deep-link-unbound": current => {
+    current.patchEvidence.patchReadyAuditDeepLinkBound = false;
+  },
+  "patch-evidence-execution-unbound": current => {
+    current.patchEvidence.repairExecutionSourceId = 9501;
+  },
+  "patch-evidence-execution-action-label-generic": current => {
+    current.patchEvidence.repairExecutionActionLabel = "执行详情";
+  },
+  "patch-evidence-execution-deep-link-unbound": current => {
+    current.patchEvidence.repairExecutionDeepLinkBound = false;
+  },
+  "patch-evidence-foreign-visible": current => {
+    current.patchEvidence.foreignPatchEvidenceHidden = false;
+  },
+  "patch-evidence-raw-prompt-leak": current => {
+    current.patchEvidence.noRawPromptOrAnswer = false;
+  },
+  "pr-gate-action-label-generic": current => {
+    current.prGate.actionLabel = "打开修复";
+  },
+  "candidate-receipt-source-report-deep-link-unbound": current => {
+    current.candidateReceipt.sourceReportDeepLinkBound = false;
+  },
+  "candidate-receipt-qa-review-deep-link-unbound": current => {
+    current.candidateReceipt.qaReviewDeepLinkBound = false;
+  },
+  "candidate-receipt-action-label-generic": current => {
+    current.candidateReceipt.actionLabels = ["打开修复", "来源报告", "QA"];
+  },
+  "agent-review-task-action-label-generic": current => {
+    current.agentReview.agentTaskActionLabel = "任务列表";
+  },
+  "agent-review-task-deep-link-unbound": current => {
+    current.agentReview.agentTaskDeepLinkBound = false;
+  },
+  "agent-review-tool-audit-action-label-generic": current => {
+    current.agentReview.toolCallAuditActionLabel = "审计";
+  },
+  "agent-review-tool-audit-deep-link-unbound": current => {
+    current.agentReview.toolCallAuditDeepLinkBound = false;
+  },
+  "agent-review-execution-action-label-generic": current => {
+    current.agentReview.agentExecutionActionLabel = "执行详情";
+  },
+  "agent-review-execution-deep-link-unbound": current => {
+    current.agentReview.agentExecutionDeepLinkBound = false;
+  },
+};
+if (!mutations[mutation]) {
+  throw new Error(`unknown scan governance timeline marker mutation: ${mutation}`);
+}
+mutations[mutation](payload);
+process.stdout.write(JSON.stringify(payload));
+NODE
+    )"; then
+      failure="could not mutate valid scan governance timeline UI smoke marker for $label"
+      return
+    fi
+    verify_scan_governance_timeline_ui_marker_rejects "$label" "$marker_payload"
+  }
+
+  if [[ -z "$failure" ]]; then
+    write_strict_audit_workbench_release_evidence_fixture "$run_dir" "$run_id" true 1 1 1
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^include_scan_governance_timeline_ui_smoke: / {
+        print "include_scan_governance_timeline_ui_smoke: true"
+        changed = 1
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/manifest.txt" > "$tampered_manifest_file"; then
+      failure="could not mark scan governance timeline UI smoke include as true"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk -F '\t' '
+      BEGIN { OFS = "\t" }
+      NR == 1 { print; next }
+      $2 == "scan-governance-timeline-ui-smoke" && !changed {
+        $1 = "OK"
+        $3 = "0"
+        $5 = "completed"
+        changed = 1
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not forge scan governance timeline UI smoke status as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! awk '
+      /^- SKIP `scan-governance-timeline-ui-smoke`: / && !changed {
+        print "- OK `scan-governance-timeline-ui-smoke`: Scan governance timeline browser UI smoke (mocked) (completed)"
+        changed = 1
+        next
+      }
+      /^- skipped: `/ {
+        line = $0
+        sub(/^- skipped: `/, "", line)
+        sub(/`[[:space:]]*$/, "", line)
+        print "- skipped: `" line - 1 "`"
+        next
+      }
+      { print }
+      END { exit(changed ? 0 : 1) }
+    ' "$run_dir/summary.md" > "$tampered_summary_file"; then
+      failure="could not forge scan governance timeline UI smoke summary as OK"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_manifest_file" "$run_dir/manifest.txt" \
+      || failure="could not replace manifest with forged scan governance timeline UI smoke include"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || failure="could not replace status table with forged scan governance timeline UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    mv "$tampered_summary_file" "$run_dir/summary.md" \
+      || failure="could not replace summary with forged scan governance timeline UI smoke OK row"
+  fi
+  if [[ -z "$failure" ]]; then
+    chmod 600 "$run_dir/manifest.txt" "$run_dir/status.tsv" "$run_dir/summary.md" \
+      || failure="could not keep scan governance timeline UI marker probe files private"
+  fi
+  if [[ -z "$failure" ]]; then
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+  fi
+  if [[ -z "$failure" ]]; then
+    if run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must reject scan governance timeline UI smoke OK rows without SCAN_GOVERNANCE_TIMELINE_SMOKE_OK marker"
+    elif ! rg -q 'scan-governance-timeline-ui-smoke OK must prove mocked scan governance timeline aggregate flow' "$output_file"; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must explain missing scan governance timeline UI smoke marker rejection"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! write_scan_governance_timeline_ui_marker_log "$valid_marker_payload"; then
+      failure="could not write valid forged scan governance timeline UI smoke marker"
+    elif ! run_verify_release_evidence "$run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence verifier must accept valid scan governance timeline UI smoke marker with required scan boundary and viewports"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "missing-foreign-scan-exclusion" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":false,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "missing-narrow-viewport" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "missing-stage-rail" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "incomplete-stage-rail" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选"],"states":["ready","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "missing-candidate-receipt" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "candidate-receipt-missing-server-derived-gate" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "candidate-receipt-missing-gate-reason" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"repairEvidenceGate":"READY","repairEvidenceGateSource":"SERVER_DERIVED","serverDerivedGateVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "candidate-receipt-deep-link-unbound" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"repairEvidenceGate":"READY","repairEvidenceGateReason":"QA citation, report evidence and target file are line-anchored for candidate review","repairEvidenceGateSource":"SERVER_DERIVED","serverDerivedGateVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":false,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "candidate-receipt-source-report-deep-link-unbound" "candidate-receipt-source-report-deep-link-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "candidate-receipt-qa-review-deep-link-unbound" "candidate-receipt-qa-review-deep-link-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "candidate-receipt-action-label-generic" "candidate-receipt-action-label-generic"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "candidate-receipt-current-hidden" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"repairEvidenceGate":"READY","repairEvidenceGateReason":"QA citation, report evidence and target file are line-anchored for candidate review","repairEvidenceGateSource":"SERVER_DERIVED","serverDerivedGateVisible":true,"currentReceiptVisible":false,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "candidate-receipt-foreign-visible" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"repairEvidenceGate":"READY","repairEvidenceGateReason":"QA citation, report evidence and target file are line-anchored for candidate review","repairEvidenceGateSource":"SERVER_DERIVED","serverDerivedGateVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":false,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "candidate-receipt-raw-prompt-leak" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"repairEvidenceGate":"READY","repairEvidenceGateReason":"QA citation, report evidence and target file are line-anchored for candidate review","repairEvidenceGateSource":"SERVER_DERIVED","serverDerivedGateVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":false},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "missing-pr-gate" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"repairEvidenceGate":"READY","repairEvidenceGateReason":"QA citation, report evidence and target file are line-anchored for candidate review","repairEvidenceGateSource":"SERVER_DERIVED","serverDerivedGateVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "pr-gate-deep-link-unbound" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":false,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "pr-gate-action-label-generic" "pr-gate-action-label-generic"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "pr-gate-foreign-visible" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":false,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "pr-gate-raw-prompt-leak" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":false},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "missing-patch-evidence" "missing-patch-evidence"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-artifact-owner-unbound" "patch-evidence-artifact-owner-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-artifact-action-label-generic" "patch-evidence-artifact-action-label-generic"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-artifact-deep-link-unbound" "patch-evidence-artifact-deep-link-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-audit-missing" "patch-evidence-audit-missing"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-audit-action-label-generic" "patch-evidence-audit-action-label-generic"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-audit-deep-link-unbound" "patch-evidence-audit-deep-link-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-execution-unbound" "patch-evidence-execution-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-execution-action-label-generic" "patch-evidence-execution-action-label-generic"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-execution-deep-link-unbound" "patch-evidence-execution-deep-link-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-foreign-visible" "patch-evidence-foreign-visible"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "patch-evidence-raw-prompt-leak" "patch-evidence-raw-prompt-leak"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "missing-agent-review" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "agent-review-foreign-visible" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"agentReview":{"currentAgentTaskVisible":true,"currentAgentTaskId":9101,"foreignAgentTaskHidden":false,"toolCallAuditVisible":true,"currentToolCallId":11101,"foreignToolCallHidden":true,"agentExecutionBound":true,"currentAgentExecutionVisible":true,"agentExecutionSourceType":"AGENT_TASK","agentExecutionSourceId":9101,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "agent-review-task-action-label-generic" "agent-review-task-action-label-generic"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "agent-review-task-deep-link-unbound" "agent-review-task-deep-link-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "agent-review-tool-audit-action-label-generic" "agent-review-tool-audit-action-label-generic"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "agent-review-tool-audit-deep-link-unbound" "agent-review-tool-audit-deep-link-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "agent-review-execution-unbound" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"agentReview":{"currentAgentTaskVisible":true,"currentAgentTaskId":9101,"foreignAgentTaskHidden":true,"toolCallAuditVisible":true,"currentToolCallId":11101,"foreignToolCallHidden":true,"agentExecutionBound":false,"currentAgentExecutionVisible":true,"agentExecutionSourceType":"AGENT_TASK","agentExecutionSourceId":9101,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "agent-review-execution-action-label-generic" "agent-review-execution-action-label-generic"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects_mutated "agent-review-execution-deep-link-unbound" "agent-review-execution-deep-link-unbound"
+  fi
+  if [[ -z "$failure" ]]; then
+    verify_scan_governance_timeline_ui_marker_rejects "agent-review-raw-prompt-leak" '{"mockedApiOnly":true,"unhandledApiRequests":0,"scanTaskId":8801,"foreignScanExcluded":true,"stageRail":{"visible":true,"stages":["风险定位","修复候选","Patch 证据","PR 复核","审计归档"],"states":["ready","ready","ready","blocked","ready"]},"candidateReceipt":{"eventVisible":true,"sourceTypeVisible":true,"currentReceiptVisible":true,"foreignReceiptHidden":true,"autoRepairDeepLinkBound":true,"noRawPromptOrAnswer":true},"prGate":{"eventVisible":true,"action":"AUTO_REPAIR_PR_REJECTED","currentRepairVisible":true,"foreignPrGateHidden":true,"autoRepairDeepLinkBound":true,"auditSourceBound":true,"scanTaskIdBound":true,"noRawPromptOrAnswer":true},"agentReview":{"currentAgentTaskVisible":true,"currentAgentTaskId":9101,"foreignAgentTaskHidden":true,"toolCallAuditVisible":true,"currentToolCallId":11101,"foreignToolCallHidden":true,"agentExecutionBound":true,"currentAgentExecutionVisible":true,"agentExecutionSourceType":"AGENT_TASK","agentExecutionSourceId":9101,"scanTaskIdBound":true,"noRawPromptOrAnswer":false},"viewports":["1440x900","320x740"],"baseURLHost":"127.0.0.1","spec":"scan-governance-timeline-smoke.spec.ts"}'
+  fi
+
+  cleanup_scan_governance_timeline_ui_marker_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_evidence_required_audit_workbench_smoke_failure_is_verifiable() {
+  local tmp_dir
+  local evidence_root
+  local probe_suffix
+  local run_id
+  local run_dir
+  local output_file
+  local verify_output_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-release-audit-workbench-probe.XXXXXX")" \
+    || fail "could not create release evidence audit workbench smoke probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden release evidence audit workbench smoke probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  probe_suffix="${tmp_dir##*.}"
+  run_id="audit-workbench-required-${probe_suffix}"
+  run_dir="$evidence_root/$run_id"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+
+  cleanup_release_audit_workbench_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=true \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence must fail when audit workbench smoke is required without SOURCELENS_BASE_URL"
+    fi
+  fi
+  if [[ -z "$failure" && ! -d "$run_dir" ]]; then
+    cat "$output_file" >&2
+    failure="release evidence must keep a verifiable package for required audit workbench smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q $'^FAIL\taudit-workbench-smoke\t-\taudit-workbench-smoke\\.log\tSOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=true$' "$run_dir/status.tsv"; then
+    cat "$run_dir/status.tsv" >&2
+    failure="release evidence status table must record required audit workbench smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q 'required_failures: `1`' "$run_dir/summary.md"; then
+    cat "$run_dir/summary.md" >&2
+    failure="release evidence summary must count required audit workbench smoke failure"
+  fi
+  if [[ -z "$failure" ]] \
+    && ! rg -q 'SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=true' "$run_dir/audit-workbench-smoke.log"; then
+    cat "$run_dir/audit-workbench-smoke.log" >&2
+    failure="release evidence audit workbench smoke log must explain missing SOURCELENS_BASE_URL"
+  fi
+  if [[ -z "$failure" ]]; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="required audit workbench smoke failure release evidence package must pass verifier"
+    fi
+  fi
+
+  cleanup_release_audit_workbench_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_audit_workbench_strict_sample_rejects_remote_base_url() {
+  local output_file
+  output_file="$(mktemp "${TMPDIR:-/tmp}/sourcelens-audit-workbench-strict-remote.XXXXXX")" \
+    || fail "could not create audit workbench strict remote probe output file"
+  if env -i \
+    PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+    SOURCELENS_BASE_URL="https://example.com" \
+    SOURCELENS_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES=true \
+    ./scripts/audit-workbench-smoke.sh > "$output_file" 2>&1; then
+    cat "$output_file" >&2
+    rm -f "$output_file"
+    fail "audit workbench strict sample mode must reject non-local base URLs"
+  elif ! rg -q 'SOURCELENS_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES=true is only allowed for localhost/127\.0\.0\.1/::1 targets' "$output_file"; then
+    cat "$output_file" >&2
+    rm -f "$output_file"
+    fail "audit workbench strict sample mode must explain local-only base URL rejection"
+  fi
+  rm -f "$output_file"
+}
+
+assert_release_verifier_requires_strict_audit_workbench_sample_evidence() {
+  local tmp_dir
+  local good_run_dir
+  local bad_seed_run_dir
+  local bad_total_run_dir
+  local output_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-strict-audit-evidence-probe.XXXXXX")" \
+    || fail "could not create strict audit evidence probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden strict audit evidence probe temp dir"
+  good_run_dir="$tmp_dir/strict-audit-good"
+  bad_seed_run_dir="$tmp_dir/strict-audit-bad-seed"
+  bad_total_run_dir="$tmp_dir/strict-audit-bad-total"
+  output_file="$tmp_dir/verify-output.txt"
+
+  cleanup_strict_audit_evidence_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  if [[ -z "$failure" ]]; then
+    write_strict_audit_workbench_release_evidence_fixture "$good_run_dir" "strict-audit-good" true 1 1 1
+    if ! run_verify_release_evidence "$good_run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release verifier must accept strict audit workbench evidence with seeded samples and all source totals"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    write_strict_audit_workbench_release_evidence_fixture "$bad_seed_run_dir" "strict-audit-bad-seed" false 1 1 1
+    if run_verify_release_evidence "$bad_seed_run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release verifier must reject strict audit workbench evidence with sampleSeeded=false"
+    elif ! rg -q 'strict audit workbench smoke must prove sampleSeeded=true and all three source totals are >=1' "$output_file"; then
+      cat "$output_file" >&2
+      failure="release verifier must explain strict audit workbench sampleSeeded evidence rejection"
+    fi
+  fi
+  if [[ -z "$failure" ]]; then
+    write_strict_audit_workbench_release_evidence_fixture "$bad_total_run_dir" "strict-audit-bad-total" true 1 1 0
+    if run_verify_release_evidence "$bad_total_run_dir" > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release verifier must reject strict audit workbench evidence when any source total is zero"
+    elif ! rg -q 'strict audit workbench smoke must prove sampleSeeded=true and all three source totals are >=1' "$output_file"; then
+      cat "$output_file" >&2
+      failure="release verifier must explain strict audit workbench source total rejection"
+    fi
+  fi
+
+  cleanup_strict_audit_evidence_probe
   [[ -z "$failure" ]] || fail "$failure"
 }
 
@@ -533,7 +10958,7 @@ assert_release_evidence_required_phase12_failure_is_verifiable() {
   fi
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="$fake_bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_FAKE_MYSQL_MARKER="$marker" \
@@ -543,6 +10968,11 @@ assert_release_evidence_required_phase12_failure_is_verifiable() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=true \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -577,7 +11007,7 @@ assert_release_evidence_required_phase12_failure_is_verifiable() {
     failure="required phase12 baseline failure must happen before any MySQL query"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="required phase12 baseline failure release evidence package must pass verifier"
     fi
@@ -616,7 +11046,7 @@ assert_release_evidence_missing_manual_evidence_failure_is_verifiable() {
   }
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -625,6 +11055,11 @@ assert_release_evidence_missing_manual_evidence_failure_is_verifiable() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -675,7 +11110,7 @@ assert_release_evidence_missing_manual_evidence_failure_is_verifiable() {
     failure="missing rollback plan failure must not archive a rollback plan txt file"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="missing manual evidence failure release evidence package must pass verifier"
     fi
@@ -712,7 +11147,7 @@ assert_release_evidence_checksum_tamper_is_rejected() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -721,6 +11156,11 @@ assert_release_evidence_checksum_tamper_is_rejected() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -736,7 +11176,7 @@ assert_release_evidence_checksum_tamper_is_rejected() {
     failure="release evidence must keep a package for checksum tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier"
     fi
@@ -747,7 +11187,7 @@ assert_release_evidence_checksum_tamper_is_rejected() {
     chmod 600 "$run_dir/git-status.txt" || failure="could not keep tampered git status snapshot private"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$tamper_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$tamper_output_file" 2>&1; then
       cat "$tamper_output_file" >&2
       failure="release evidence verifier must reject package content changed after checksum manifest"
     elif ! rg -q 'checksums.sha256 does not match current release evidence files' "$tamper_output_file"; then
@@ -787,7 +11227,7 @@ assert_release_evidence_checksum_manifest_unsafe_path_is_rejected() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -796,6 +11236,11 @@ assert_release_evidence_checksum_manifest_unsafe_path_is_rejected() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -811,7 +11256,7 @@ assert_release_evidence_checksum_manifest_unsafe_path_is_rejected() {
     failure="release evidence must keep a package for checksum manifest path verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before checksum path probe"
     fi
@@ -823,7 +11268,7 @@ assert_release_evidence_checksum_manifest_unsafe_path_is_rejected() {
     chmod 600 "$run_dir/checksums.sha256" || failure="could not keep tampered checksum manifest private"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$manifest_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$manifest_output_file" 2>&1; then
       cat "$manifest_output_file" >&2
       failure="release evidence verifier must reject unsafe checksum manifest paths"
     elif ! rg -q 'unsafe checksum path' "$manifest_output_file"; then
@@ -867,7 +11312,7 @@ assert_release_evidence_checksum_manifest_duplicate_path_is_rejected() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -876,6 +11321,11 @@ assert_release_evidence_checksum_manifest_duplicate_path_is_rejected() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -891,7 +11341,7 @@ assert_release_evidence_checksum_manifest_duplicate_path_is_rejected() {
     failure="release evidence must keep a package for checksum duplicate verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before checksum duplicate probe"
     fi
@@ -907,7 +11357,7 @@ assert_release_evidence_checksum_manifest_duplicate_path_is_rejected() {
       || failure="could not keep duplicate checksum manifest private"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$manifest_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$manifest_output_file" 2>&1; then
       cat "$manifest_output_file" >&2
       failure="release evidence verifier must reject duplicate checksum manifest paths"
     elif ! rg -q 'duplicate checksum path' "$manifest_output_file"; then
@@ -950,7 +11400,7 @@ assert_release_evidence_checksum_manifest_mode_is_rejected() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -959,6 +11409,11 @@ assert_release_evidence_checksum_manifest_mode_is_rejected() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -974,7 +11429,7 @@ assert_release_evidence_checksum_manifest_mode_is_rejected() {
     failure="release evidence must keep a package for checksum manifest mode verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before checksum manifest mode probe"
     fi
@@ -984,7 +11439,7 @@ assert_release_evidence_checksum_manifest_mode_is_rejected() {
       || failure="could not weaken checksum manifest permissions"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$manifest_mode_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$manifest_mode_output_file" 2>&1; then
       cat "$manifest_mode_output_file" >&2
       failure="release evidence verifier must reject non-private checksum manifest permissions"
     elif ! rg -q 'release evidence checksum manifest must have 600 permissions' "$manifest_mode_output_file"; then
@@ -1026,7 +11481,7 @@ assert_release_evidence_verify_dir_symlink_is_rejected() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1035,6 +11490,11 @@ assert_release_evidence_verify_dir_symlink_is_rejected() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1050,7 +11510,7 @@ assert_release_evidence_verify_dir_symlink_is_rejected() {
     failure="release evidence must keep a package for verifier directory symlink verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before directory symlink probe"
     fi
@@ -1060,7 +11520,7 @@ assert_release_evidence_verify_dir_symlink_is_rejected() {
       || failure="could not create release evidence verifier input directory symlink"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$symlink_dir" > "$symlink_output_file" 2>&1; then
+    if run_verify_release_evidence "$symlink_dir" > "$symlink_output_file" 2>&1; then
       cat "$symlink_output_file" >&2
       failure="release evidence verifier must reject symlink verifier input directories"
     elif ! rg -q 'release evidence directory must not be a symlink' "$symlink_output_file"; then
@@ -1102,7 +11562,7 @@ assert_release_evidence_actual_package_unsafe_path_is_rejected() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1111,6 +11571,11 @@ assert_release_evidence_actual_package_unsafe_path_is_rejected() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1126,7 +11591,7 @@ assert_release_evidence_actual_package_unsafe_path_is_rejected() {
     failure="release evidence must keep a package for actual package path verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before actual package path probe"
     fi
@@ -1137,7 +11602,7 @@ assert_release_evidence_actual_package_unsafe_path_is_rejected() {
     chmod 600 "$unsafe_file" || failure="could not keep unsafe package path probe file private"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$package_path_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$package_path_output_file" 2>&1; then
       cat "$package_path_output_file" >&2
       failure="release evidence verifier must reject unsafe actual package file paths"
     elif ! rg -q 'release evidence file path is unsafe' "$package_path_output_file"; then
@@ -1179,7 +11644,7 @@ assert_release_evidence_package_symlink_is_rejected() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1188,6 +11653,11 @@ assert_release_evidence_package_symlink_is_rejected() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1203,7 +11673,7 @@ assert_release_evidence_package_symlink_is_rejected() {
     failure="release evidence must keep a package for package symlink verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before package symlink probe"
     fi
@@ -1213,7 +11683,7 @@ assert_release_evidence_package_symlink_is_rejected() {
       || failure="could not create release evidence package symlink"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$symlink_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$symlink_output_file" 2>&1; then
       cat "$symlink_output_file" >&2
       failure="release evidence verifier must reject package symlinks"
     elif ! rg -q 'release evidence directory must not contain symlinks' "$symlink_output_file"; then
@@ -1255,7 +11725,7 @@ assert_release_evidence_package_file_mode_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1264,6 +11734,11 @@ assert_release_evidence_package_file_mode_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1279,7 +11754,7 @@ assert_release_evidence_package_file_mode_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for package mode verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before package mode probe"
     fi
@@ -1297,7 +11772,7 @@ assert_release_evidence_package_file_mode_is_rejected_after_rechecksum() {
       || failure="could not weaken package mode probe file permissions"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$mode_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$mode_output_file" 2>&1; then
       cat "$mode_output_file" >&2
       failure="release evidence verifier must reject non-private package file permissions"
     elif ! rg -q 'release evidence file mode-probe.log must have 600 permissions' "$mode_output_file"; then
@@ -1339,7 +11814,7 @@ assert_release_evidence_unexpected_file_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1348,6 +11823,11 @@ assert_release_evidence_unexpected_file_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1363,7 +11843,7 @@ assert_release_evidence_unexpected_file_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for unexpected file verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before unexpected file probe"
     fi
@@ -1377,7 +11857,7 @@ assert_release_evidence_unexpected_file_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$unexpected_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$unexpected_output_file" 2>&1; then
       cat "$unexpected_output_file" >&2
       failure="release evidence verifier must reject unexpected files even after checksums are regenerated"
     elif ! rg -q 'release evidence package contains unexpected file: unexpected-extra.txt' "$unexpected_output_file"; then
@@ -1419,7 +11899,7 @@ assert_release_evidence_unexpected_directory_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1428,6 +11908,11 @@ assert_release_evidence_unexpected_directory_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1443,7 +11928,7 @@ assert_release_evidence_unexpected_directory_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for unexpected directory verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before unexpected directory probe"
     fi
@@ -1457,7 +11942,7 @@ assert_release_evidence_unexpected_directory_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$unexpected_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$unexpected_output_file" 2>&1; then
       cat "$unexpected_output_file" >&2
       failure="release evidence verifier must reject unexpected directories even after checksums are regenerated"
     elif ! rg -q 'release evidence package contains unexpected directory: unexpected-empty-dir' "$unexpected_output_file"; then
@@ -1501,7 +11986,7 @@ assert_release_evidence_llm_provider_success_requires_copied_result_after_rechec
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1510,6 +11995,11 @@ assert_release_evidence_llm_provider_success_requires_copied_result_after_rechec
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1525,7 +12015,7 @@ assert_release_evidence_llm_provider_success_requires_copied_result_after_rechec
     failure="release evidence must keep a package for missing LLM provider result verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before missing LLM result probe"
     fi
@@ -1598,7 +12088,7 @@ assert_release_evidence_llm_provider_success_requires_copied_result_after_rechec
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$missing_result_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$missing_result_output_file" 2>&1; then
       cat "$missing_result_output_file" >&2
       failure="release evidence verifier must reject forged LLM provider success without llm-provider-run.json"
     elif ! rg -q 'expected release evidence file llm-provider-run.json must be a regular file' "$missing_result_output_file"; then
@@ -1655,15 +12145,21 @@ assert_release_evidence_llm_provider_success_requires_raw_outputs_after_rechecks
       || failure="could not harden LLM provider raw output directories"
   fi
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
       SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
       SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1686,7 +12182,7 @@ assert_release_evidence_llm_provider_success_requires_raw_outputs_after_rechecks
     failure="release evidence status table must record archived LLM provider raw outputs"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered LLM provider raw output release evidence package must pass verifier"
     fi
@@ -1696,7 +12192,7 @@ assert_release_evidence_llm_provider_success_requires_raw_outputs_after_rechecks
       || failure="could not weaken archived LLM raw output directory permissions"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$directory_mode_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$directory_mode_output_file" 2>&1; then
       cat "$directory_mode_output_file" >&2
       failure="release evidence verifier must reject non-private expected package directories"
     elif ! rg -q 'release evidence directory llm-evals permissions must not grant group/world access' "$directory_mode_output_file"; then
@@ -1724,7 +12220,7 @@ assert_release_evidence_llm_provider_success_requires_raw_outputs_after_rechecks
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$missing_artifact_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$missing_artifact_output_file" 2>&1; then
       cat "$missing_artifact_output_file" >&2
       failure="release evidence verifier must reject missing LLM raw output artifacts even after checksums are regenerated"
     elif ! rg -Fq "expected release evidence file $missing_relative must be a regular file" "$missing_artifact_output_file"; then
@@ -1764,7 +12260,7 @@ assert_release_evidence_duplicate_status_slug_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1773,6 +12269,11 @@ assert_release_evidence_duplicate_status_slug_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1788,7 +12289,7 @@ assert_release_evidence_duplicate_status_slug_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for duplicate status slug verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before duplicate status probe"
     fi
@@ -1807,7 +12308,7 @@ assert_release_evidence_duplicate_status_slug_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$duplicate_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$duplicate_output_file" 2>&1; then
       cat "$duplicate_output_file" >&2
       failure="release evidence verifier must reject duplicate status slugs even after checksums are regenerated"
     elif ! rg -q 'release evidence status table must contain make-verify row only once' "$duplicate_output_file"; then
@@ -1847,7 +12348,7 @@ assert_release_evidence_unknown_status_slug_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1856,6 +12357,11 @@ assert_release_evidence_unknown_status_slug_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1871,7 +12377,7 @@ assert_release_evidence_unknown_status_slug_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for unknown status slug verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before unknown status probe"
     fi
@@ -1887,7 +12393,7 @@ assert_release_evidence_unknown_status_slug_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$unknown_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$unknown_output_file" 2>&1; then
       cat "$unknown_output_file" >&2
       failure="release evidence verifier must reject unknown status slugs even after checksums are regenerated"
     elif ! rg -q 'release evidence status table contains unknown step slug: unexpected-step' "$unknown_output_file"; then
@@ -1929,7 +12435,7 @@ assert_release_evidence_summary_step_tamper_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -1938,6 +12444,11 @@ assert_release_evidence_summary_step_tamper_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -1953,7 +12464,7 @@ assert_release_evidence_summary_step_tamper_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for summary step tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before summary step probe"
     fi
@@ -1983,7 +12494,7 @@ assert_release_evidence_summary_step_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$summary_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$summary_output_file" 2>&1; then
       cat "$summary_output_file" >&2
       failure="release evidence verifier must reject forged summary-only steps even after checksums are regenerated"
     elif ! rg -q 'release evidence summary steps must match status.tsv status, slug, title and detail rows' "$summary_output_file"; then
@@ -2025,7 +12536,7 @@ assert_release_evidence_summary_step_detail_tamper_is_rejected_after_rechecksum(
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2034,6 +12545,11 @@ assert_release_evidence_summary_step_detail_tamper_is_rejected_after_rechecksum(
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2049,7 +12565,7 @@ assert_release_evidence_summary_step_detail_tamper_is_rejected_after_rechecksum(
     failure="release evidence must keep a package for summary detail tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before summary detail probe"
     fi
@@ -2082,7 +12598,7 @@ assert_release_evidence_summary_step_detail_tamper_is_rejected_after_rechecksum(
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$summary_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$summary_output_file" 2>&1; then
       cat "$summary_output_file" >&2
       failure="release evidence verifier must reject summary detail tampering even after checksums are regenerated"
     elif ! rg -q 'release evidence summary steps must match status.tsv status, slug, title and detail rows' "$summary_output_file"; then
@@ -2124,7 +12640,7 @@ assert_release_evidence_summary_step_control_chars_are_rejected_after_rechecksum
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2133,6 +12649,11 @@ assert_release_evidence_summary_step_control_chars_are_rejected_after_rechecksum
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2148,7 +12669,7 @@ assert_release_evidence_summary_step_control_chars_are_rejected_after_rechecksum
     failure="release evidence must keep a package for summary control-character verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before summary control-character probe"
     fi
@@ -2184,7 +12705,7 @@ assert_release_evidence_summary_step_control_chars_are_rejected_after_rechecksum
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$summary_control_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$summary_control_output_file" 2>&1; then
       cat "$summary_control_output_file" >&2
       failure="release evidence verifier must reject summary step control characters even after checksums are regenerated"
     elif ! rg -q 'summary step line contains control characters' "$summary_control_output_file"; then
@@ -2224,7 +12745,7 @@ assert_release_evidence_extra_summary_content_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2233,6 +12754,11 @@ assert_release_evidence_extra_summary_content_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2248,7 +12774,7 @@ assert_release_evidence_extra_summary_content_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for extra summary content verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before extra summary probe"
     fi
@@ -2267,7 +12793,7 @@ assert_release_evidence_extra_summary_content_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$extra_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$extra_output_file" 2>&1; then
       cat "$extra_output_file" >&2
       failure="release evidence verifier must reject extra summary content even after checksums are regenerated"
     elif ! rg -q 'release evidence summary file must match the generated layout exactly' "$extra_output_file"; then
@@ -2305,7 +12831,7 @@ assert_release_evidence_unsafe_metadata_is_rejected_before_write() {
   }
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2314,6 +12840,11 @@ assert_release_evidence_unsafe_metadata_is_rejected_before_write() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2366,7 +12897,7 @@ assert_release_evidence_metadata_backtick_tamper_is_rejected_after_rechecksum() 
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2375,6 +12906,11 @@ assert_release_evidence_metadata_backtick_tamper_is_rejected_after_rechecksum() 
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2390,7 +12926,7 @@ assert_release_evidence_metadata_backtick_tamper_is_rejected_after_rechecksum() 
     failure="release evidence must keep a package for metadata tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before metadata tamper probe"
     fi
@@ -2445,7 +12981,7 @@ assert_release_evidence_metadata_backtick_tamper_is_rejected_after_rechecksum() 
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$metadata_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$metadata_output_file" 2>&1; then
       cat "$metadata_output_file" >&2
       failure="release evidence verifier must reject metadata backticks even after checksums are regenerated"
     elif ! rg -q 'release evidence summary env_file must not contain control characters or backticks' "$metadata_output_file"; then
@@ -2487,7 +13023,7 @@ assert_release_evidence_duplicate_summary_metadata_is_rejected_after_rechecksum(
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2496,6 +13032,11 @@ assert_release_evidence_duplicate_summary_metadata_is_rejected_after_rechecksum(
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2511,7 +13052,7 @@ assert_release_evidence_duplicate_summary_metadata_is_rejected_after_rechecksum(
     failure="release evidence must keep a package for duplicate metadata verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before duplicate metadata probe"
     fi
@@ -2546,7 +13087,7 @@ assert_release_evidence_duplicate_summary_metadata_is_rejected_after_rechecksum(
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$metadata_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$metadata_output_file" 2>&1; then
       cat "$metadata_output_file" >&2
       failure="release evidence verifier must reject duplicate summary metadata even after checksums are regenerated"
     elif ! rg -q 'release evidence summary must contain exactly one non-empty env_file metadata value' "$metadata_output_file"; then
@@ -2586,7 +13127,7 @@ assert_release_evidence_llm_metadata_is_sanitized_before_write() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2596,6 +13137,11 @@ assert_release_evidence_llm_metadata_is_sanitized_before_write() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2623,7 +13169,7 @@ assert_release_evidence_llm_metadata_is_sanitized_before_write() {
     fi
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="sanitized release evidence LLM metadata package must pass verifier"
     fi
@@ -2662,7 +13208,7 @@ assert_release_evidence_llm_metadata_tamper_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2671,6 +13217,11 @@ assert_release_evidence_llm_metadata_tamper_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2686,7 +13237,7 @@ assert_release_evidence_llm_metadata_tamper_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for LLM metadata tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before LLM metadata tamper probe"
     fi
@@ -2720,7 +13271,7 @@ assert_release_evidence_llm_metadata_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$metadata_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$metadata_output_file" 2>&1; then
       cat "$metadata_output_file" >&2
       failure="release evidence verifier must reject LLM metadata backticks even after checksums are regenerated"
     elif ! rg -q 'release evidence manifest llm_provider_run_file must not contain control characters or backticks' "$metadata_output_file"; then
@@ -2760,7 +13311,7 @@ assert_release_evidence_extra_manifest_content_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2769,6 +13320,11 @@ assert_release_evidence_extra_manifest_content_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2784,7 +13340,7 @@ assert_release_evidence_extra_manifest_content_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for extra manifest content verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before extra manifest probe"
     fi
@@ -2800,7 +13356,7 @@ assert_release_evidence_extra_manifest_content_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$extra_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$extra_output_file" 2>&1; then
       cat "$extra_output_file" >&2
       failure="release evidence verifier must reject extra manifest content even after checksums are regenerated"
     elif ! rg -q 'release evidence manifest file must match the generated layout exactly' "$extra_output_file"; then
@@ -2842,7 +13398,7 @@ assert_release_evidence_manifest_include_mode_tamper_is_rejected_after_rechecksu
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2851,6 +13407,11 @@ assert_release_evidence_manifest_include_mode_tamper_is_rejected_after_rechecksu
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -2866,7 +13427,7 @@ assert_release_evidence_manifest_include_mode_tamper_is_rejected_after_rechecksu
     failure="release evidence must keep a package for manifest mode verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before manifest mode probe"
     fi
@@ -2899,7 +13460,7 @@ assert_release_evidence_manifest_include_mode_tamper_is_rejected_after_rechecksu
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$mode_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$mode_output_file" 2>&1; then
       cat "$mode_output_file" >&2
       failure="release evidence verifier must reject invalid manifest include modes even after checksums are regenerated"
     elif ! rg -q 'release evidence manifest include_smoke must be true, false, or auto' "$mode_output_file"; then
@@ -2945,7 +13506,7 @@ assert_release_evidence_required_include_cannot_be_forged_as_skip_after_rechecks
 
   if [[ -z "$failure" ]]; then
     set +e
-    env -i \
+    run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -2972,7 +13533,7 @@ assert_release_evidence_required_include_cannot_be_forged_as_skip_after_rechecks
     failure="release evidence must keep a package for required-skip verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered required smoke release evidence package must pass verifier before required-skip probe"
     fi
@@ -3049,7 +13610,7 @@ assert_release_evidence_required_include_cannot_be_forged_as_skip_after_rechecks
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$required_skip_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$required_skip_output_file" 2>&1; then
       cat "$required_skip_output_file" >&2
       failure="release evidence verifier must reject required include rows forged as SKIP after checksums are regenerated"
     elif ! rg -q 'release evidence manifest include_smoke=true requires smoke status not to be SKIP' "$required_skip_output_file"; then
@@ -3095,7 +13656,7 @@ assert_release_evidence_required_include_cannot_be_forged_as_warn_after_rechecks
 
   if [[ -z "$failure" ]]; then
     set +e
-    env -i \
+    run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -3122,7 +13683,7 @@ assert_release_evidence_required_include_cannot_be_forged_as_warn_after_rechecks
     failure="release evidence must keep a package for required-warn verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered required smoke release evidence package must pass verifier before required-warn probe"
     fi
@@ -3199,7 +13760,7 @@ assert_release_evidence_required_include_cannot_be_forged_as_warn_after_rechecks
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$required_warn_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$required_warn_output_file" 2>&1; then
       cat "$required_warn_output_file" >&2
       failure="release evidence verifier must reject required include rows forged as WARN after checksums are regenerated"
     elif ! rg -q 'release evidence manifest include_smoke=true requires smoke status to be OK or FAIL' "$required_warn_output_file"; then
@@ -3243,7 +13804,7 @@ assert_release_evidence_disabled_include_skip_reason_tamper_is_rejected_after_re
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -3252,6 +13813,11 @@ assert_release_evidence_disabled_include_skip_reason_tamper_is_rejected_after_re
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -3267,7 +13833,7 @@ assert_release_evidence_disabled_include_skip_reason_tamper_is_rejected_after_re
     failure="release evidence must keep a package for disabled-reason verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered disabled smoke release evidence package must pass verifier before disabled-reason probe"
     fi
@@ -3328,7 +13894,7 @@ assert_release_evidence_disabled_include_skip_reason_tamper_is_rejected_after_re
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$disabled_reason_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$disabled_reason_output_file" 2>&1; then
       cat "$disabled_reason_output_file" >&2
       failure="release evidence verifier must reject disabled include skip reason tampering after checksums are regenerated"
     elif ! rg -q 'release evidence manifest include_smoke=false requires smoke detail to be: SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false' "$disabled_reason_output_file"; then
@@ -3378,7 +13944,7 @@ assert_release_evidence_core_status_tamper_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -3387,6 +13953,11 @@ assert_release_evidence_core_status_tamper_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -3402,7 +13973,7 @@ assert_release_evidence_core_status_tamper_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for core status verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before core status probe"
     fi
@@ -3472,7 +14043,7 @@ assert_release_evidence_core_status_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$git_metadata_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$git_metadata_output_file" 2>&1; then
       cat "$git_metadata_output_file" >&2
       failure="release evidence verifier must reject git metadata status tampering after checksums are regenerated"
     elif ! rg -q 'release evidence git-metadata status must be OK' "$git_metadata_output_file"; then
@@ -3549,7 +14120,7 @@ assert_release_evidence_core_status_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$worktree_skip_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$worktree_skip_output_file" 2>&1; then
       cat "$worktree_skip_output_file" >&2
       failure="release evidence verifier must reject worktree inventory status forged as SKIP after checksums are regenerated"
     elif ! rg -q 'release evidence worktree-inventory status must not be SKIP' "$worktree_skip_output_file"; then
@@ -3600,7 +14171,7 @@ assert_release_evidence_worktree_inventory_other_cannot_be_forged_ok_after_reche
       || failure="could not create uncategorized worktree inventory probe file"
   fi
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -3609,6 +14180,11 @@ assert_release_evidence_worktree_inventory_other_cannot_be_forged_ok_after_reche
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -3634,7 +14210,7 @@ assert_release_evidence_worktree_inventory_other_cannot_be_forged_ok_after_reche
     failure="release evidence worktree inventory must show the uncategorized Other group"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered strict worktree inventory failure package must pass verifier before tamper probe"
     fi
@@ -3699,7 +14275,7 @@ assert_release_evidence_worktree_inventory_other_cannot_be_forged_ok_after_reche
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$tampered_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$tampered_output_file" 2>&1; then
       cat "$tampered_output_file" >&2
       failure="release evidence verifier must reject strict worktree inventory Other paths forged as OK after checksums are regenerated"
     elif ! rg -q 'release evidence worktree-inventory strict OK must not contain Other paths' "$tampered_output_file"; then
@@ -3748,7 +14324,7 @@ assert_release_evidence_worktree_inventory_strict_failure_evidence_tamper_is_rej
       || failure="could not create uncategorized worktree failure evidence probe file"
   fi
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -3757,6 +14333,11 @@ assert_release_evidence_worktree_inventory_strict_failure_evidence_tamper_is_rej
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -3772,7 +14353,7 @@ assert_release_evidence_worktree_inventory_strict_failure_evidence_tamper_is_rej
     failure="release evidence must keep a package for worktree failure evidence tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered strict worktree inventory failure evidence package must pass verifier before tamper probe"
     fi
@@ -3810,7 +14391,7 @@ assert_release_evidence_worktree_inventory_strict_failure_evidence_tamper_is_rej
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$tampered_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$tampered_output_file" 2>&1; then
       cat "$tampered_output_file" >&2
       failure="release evidence verifier must reject strict worktree inventory failure evidence removal after checksums are regenerated"
     elif ! rg -q 'release evidence worktree-inventory strict FAIL must contain Other paths and strict failure marker' "$tampered_output_file"; then
@@ -3850,7 +14431,7 @@ assert_release_evidence_worktree_inventory_control_chars_are_rejected_after_rech
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -3859,6 +14440,11 @@ assert_release_evidence_worktree_inventory_control_chars_are_rejected_after_rech
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -3874,7 +14460,7 @@ assert_release_evidence_worktree_inventory_control_chars_are_rejected_after_rech
     failure="release evidence must keep a package for worktree inventory control-character verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before worktree inventory control-character probe"
     fi
@@ -3891,7 +14477,7 @@ assert_release_evidence_worktree_inventory_control_chars_are_rejected_after_rech
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$tampered_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$tampered_output_file" 2>&1; then
       cat "$tampered_output_file" >&2
       failure="release evidence verifier must reject worktree inventory control characters after checksums are regenerated"
     elif ! rg -q 'release evidence worktree inventory must not contain control characters' "$tampered_output_file"; then
@@ -3937,7 +14523,7 @@ assert_release_evidence_git_snapshots_control_chars_are_rejected_after_rechecksu
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -3946,6 +14532,11 @@ assert_release_evidence_git_snapshots_control_chars_are_rejected_after_rechecksu
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -3961,7 +14552,7 @@ assert_release_evidence_git_snapshots_control_chars_are_rejected_after_rechecksu
     failure="release evidence must keep a package for git snapshot control-character verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before git snapshot control-character probe"
     fi
@@ -3984,7 +14575,7 @@ assert_release_evidence_git_snapshots_control_chars_are_rejected_after_rechecksu
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$git_status_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$git_status_output_file" 2>&1; then
       cat "$git_status_output_file" >&2
       failure="release evidence verifier must reject git status control characters after checksums are regenerated"
     elif ! rg -q 'release evidence git status snapshot must not contain control characters' "$git_status_output_file"; then
@@ -4014,7 +14605,7 @@ assert_release_evidence_git_snapshots_control_chars_are_rejected_after_rechecksu
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$git_diff_stat_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$git_diff_stat_output_file" 2>&1; then
       cat "$git_diff_stat_output_file" >&2
       failure="release evidence verifier must reject git diff stat control characters after checksums are regenerated"
     elif ! rg -q 'release evidence git diff stat snapshot must not contain control characters' "$git_diff_stat_output_file"; then
@@ -4060,7 +14651,7 @@ assert_release_evidence_created_at_tamper_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -4069,6 +14660,11 @@ assert_release_evidence_created_at_tamper_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4084,7 +14680,7 @@ assert_release_evidence_created_at_tamper_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for created_at tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before created_at tamper probe"
     fi
@@ -4118,7 +14714,7 @@ assert_release_evidence_created_at_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$created_at_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$created_at_output_file" 2>&1; then
       cat "$created_at_output_file" >&2
       failure="release evidence verifier must reject created_at tampering even after checksums are regenerated"
     elif ! rg -q 'release evidence summary created_at must match manifest created_at' "$created_at_output_file"; then
@@ -4176,7 +14772,7 @@ assert_release_evidence_created_at_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$invalid_created_at_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$invalid_created_at_output_file" 2>&1; then
       cat "$invalid_created_at_output_file" >&2
       failure="release evidence verifier must reject invalid created_at values even after checksums are regenerated"
     elif ! rg -q 'release evidence summary created_at must be a valid UTC ISO-8601 timestamp' "$invalid_created_at_output_file"; then
@@ -4218,7 +14814,7 @@ assert_release_evidence_summary_count_tamper_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -4227,6 +14823,11 @@ assert_release_evidence_summary_count_tamper_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4242,7 +14843,7 @@ assert_release_evidence_summary_count_tamper_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for summary count tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before summary count probe"
     fi
@@ -4275,7 +14876,7 @@ assert_release_evidence_summary_count_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$summary_count_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$summary_count_output_file" 2>&1; then
       cat "$summary_count_output_file" >&2
       failure="release evidence verifier must reject summary count tampering even after checksums are regenerated"
     elif ! rg -q 'release evidence summary skipped must match status.tsv SKIP rows' "$summary_count_output_file"; then
@@ -4317,7 +14918,7 @@ assert_release_evidence_status_exit_code_tamper_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -4326,6 +14927,11 @@ assert_release_evidence_status_exit_code_tamper_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4341,7 +14947,7 @@ assert_release_evidence_status_exit_code_tamper_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for status exit code tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before status exit code probe"
     fi
@@ -4376,7 +14982,7 @@ assert_release_evidence_status_exit_code_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$exit_code_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$exit_code_output_file" 2>&1; then
       cat "$exit_code_output_file" >&2
       failure="release evidence verifier must reject status exit_code tampering even after checksums are regenerated"
     elif ! rg -q 'release evidence status row git-metadata with OK status must use exit_code 0' "$exit_code_output_file"; then
@@ -4418,7 +15024,7 @@ assert_release_evidence_status_detail_control_chars_are_rejected_after_rechecksu
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -4427,6 +15033,11 @@ assert_release_evidence_status_detail_control_chars_are_rejected_after_rechecksu
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4442,7 +15053,7 @@ assert_release_evidence_status_detail_control_chars_are_rejected_after_rechecksu
     failure="release evidence must keep a package for status detail control-character verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before status detail probe"
     fi
@@ -4478,7 +15089,7 @@ assert_release_evidence_status_detail_control_chars_are_rejected_after_rechecksu
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$detail_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$detail_output_file" 2>&1; then
       cat "$detail_output_file" >&2
       failure="release evidence verifier must reject status detail control characters even after checksums are regenerated"
     elif ! rg -q 'release evidence status table row detail contains control characters: git-metadata' "$detail_output_file"; then
@@ -4520,7 +15131,7 @@ assert_release_evidence_status_detail_backticks_are_rejected_after_rechecksum() 
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -4529,6 +15140,11 @@ assert_release_evidence_status_detail_backticks_are_rejected_after_rechecksum() 
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4544,7 +15160,7 @@ assert_release_evidence_status_detail_backticks_are_rejected_after_rechecksum() 
     failure="release evidence must keep a package for status detail backtick verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before status detail backtick probe"
     fi
@@ -4579,7 +15195,7 @@ assert_release_evidence_status_detail_backticks_are_rejected_after_rechecksum() 
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$detail_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$detail_output_file" 2>&1; then
       cat "$detail_output_file" >&2
       failure="release evidence verifier must reject status detail backticks even after checksums are regenerated"
     elif ! rg -q 'release evidence status table row detail contains backticks: git-metadata' "$detail_output_file"; then
@@ -4621,7 +15237,7 @@ assert_release_evidence_status_log_file_tamper_is_rejected_after_rechecksum() {
   }
 
   if [[ -z "$failure" ]]; then
-    if ! env -i \
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -4630,6 +15246,11 @@ assert_release_evidence_status_log_file_tamper_is_rejected_after_rechecksum() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4645,7 +15266,7 @@ assert_release_evidence_status_log_file_tamper_is_rejected_after_rechecksum() {
     failure="release evidence must keep a package for status log_file tamper verification"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="untampered lightweight release evidence package must pass verifier before status log_file probe"
     fi
@@ -4680,7 +15301,7 @@ assert_release_evidence_status_log_file_tamper_is_rejected_after_rechecksum() {
     rewrite_release_evidence_checksums_for_probe "$run_dir"
   fi
   if [[ -z "$failure" ]]; then
-    if ./scripts/verify-release-evidence.sh "$run_dir" > "$log_file_output_file" 2>&1; then
+    if run_verify_release_evidence "$run_dir" > "$log_file_output_file" 2>&1; then
       cat "$log_file_output_file" >&2
       failure="release evidence verifier must reject status log_file tampering even after checksums are regenerated"
     elif ! rg -q 'release evidence status row git-metadata must reference manifest.txt' "$log_file_output_file"; then
@@ -4690,6 +15311,128 @@ assert_release_evidence_status_log_file_tamper_is_rejected_after_rechecksum() {
   fi
 
   cleanup_release_status_log_file_probe
+  [[ -z "$failure" ]] || fail "$failure"
+}
+
+assert_release_evidence_manual_ok_rows_must_reference_txt_after_rechecksum() {
+  local tmp_dir
+  local evidence_root
+  local output_file
+  local verify_output_file
+  local tampered_status_file
+  local failure=""
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-release-manual-ok-log-probe.XXXXXX")" \
+    || fail "could not create release evidence manual OK log probe temp dir"
+  chmod 0700 "$tmp_dir" || failure="could not harden release evidence manual OK log probe temp dir"
+  evidence_root="$tmp_dir/evidence"
+  output_file="$tmp_dir/release-evidence-output.txt"
+  verify_output_file="$tmp_dir/verify-release-evidence-output.txt"
+  tampered_status_file="$tmp_dir/status.tsv"
+
+  cleanup_release_manual_ok_log_probe() {
+    rm -rf "$tmp_dir"
+  }
+
+  run_manual_ok_log_probe() {
+    local slug="$1"
+    local log_file="$2"
+    local expected_message="$3"
+    local run_id="manual-ok-log-${slug}-${tmp_dir##*.}"
+    local run_dir="$evidence_root/$run_id"
+
+    if ! run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
+      PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      HOME="${HOME:-$tmp_dir}" \
+      SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_WEBHOOK_DRILL=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_LLM_PROVIDER_RUN=false \
+      ./scripts/release-evidence.sh > "$output_file" 2>&1; then
+      cat "$output_file" >&2
+      failure="release evidence must create a lightweight package for manual OK log probe"
+      return 1
+    fi
+    if [[ ! -d "$run_dir" ]]; then
+      cat "$output_file" >&2
+      failure="release evidence must keep a package for manual OK log probe"
+      return 1
+    fi
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="untampered lightweight release evidence package must pass verifier before manual OK log probe"
+      return 1
+    fi
+    if ! awk -F '\t' -v slug="$slug" -v log_file="$log_file" '
+      BEGIN {
+        OFS = "\t"
+      }
+      $2 == slug {
+        $1 = "OK"
+        $3 = "0"
+        $4 = log_file
+        $5 = "completed"
+        changed = 1
+      }
+      {
+        print
+      }
+      END {
+        exit(changed ? 0 : 1)
+      }
+    ' "$run_dir/status.tsv" > "$tampered_status_file"; then
+      failure="could not tamper $slug as OK while preserving log file"
+      return 1
+    fi
+    mv "$tampered_status_file" "$run_dir/status.tsv" \
+      || {
+        failure="could not replace status table for $slug manual OK log probe"
+        return 1
+      }
+    chmod 600 "$run_dir/status.tsv" \
+      || {
+        failure="could not keep $slug manual OK log probe status table private"
+        return 1
+      }
+    rewrite_release_evidence_checksums_for_probe "$run_dir"
+    if run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must reject $slug OK rows that still reference .log files"
+      return 1
+    fi
+    if ! rg -q "$expected_message" "$verify_output_file"; then
+      cat "$verify_output_file" >&2
+      failure="release evidence verifier must explain $slug OK row log-file rejection"
+      return 1
+    fi
+  }
+
+  if [[ -z "$failure" ]]; then
+    run_manual_ok_log_probe \
+      "backup-restore-drill-evidence" \
+      "backup-restore-drill-evidence.log" \
+      "backup-restore-drill-evidence with OK status must reference backup-restore-drill-evidence.txt" || true
+  fi
+  if [[ -z "$failure" ]]; then
+    run_manual_ok_log_probe \
+      "rollback-plan" \
+      "rollback-plan.log" \
+      "rollback-plan with OK status must reference rollback-plan.txt" || true
+  fi
+
+  cleanup_release_manual_ok_log_probe
   [[ -z "$failure" ]] || fail "$failure"
 }
 
@@ -4718,15 +15461,21 @@ assert_release_evidence_required_llm_provider_run_failure_is_verifiable() {
   }
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
       SOURCELENS_RELEASE_EVIDENCE_RUN_ID="$run_id" \
       SOURCELENS_RELEASE_EVIDENCE_ENV_FILE="deploy/.env.example" \
+      SOURCELENS_RELEASE_EVIDENCE_WORKTREE_INVENTORY_STRICT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4761,7 +15510,7 @@ assert_release_evidence_required_llm_provider_run_failure_is_verifiable() {
     failure="required LLM provider run failure must not archive a provider run JSON file"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="required LLM provider run failure release evidence package must pass verifier"
     fi
@@ -4798,7 +15547,7 @@ assert_release_evidence_status_detail_is_sanitized_before_write() {
   }
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -4807,6 +15556,11 @@ assert_release_evidence_status_detail_is_sanitized_before_write() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4853,7 +15607,7 @@ assert_release_evidence_status_detail_is_sanitized_before_write() {
     fi
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="sanitized release evidence status detail package must pass verifier"
     fi
@@ -4910,7 +15664,7 @@ assert_release_evidence_required_sandbox_failure_is_verifiable() {
   fi
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="$fake_bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_FAKE_DOCKER_RUNTIME_MARKER="$marker" \
@@ -4920,6 +15674,11 @@ assert_release_evidence_required_sandbox_failure_is_verifiable() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=true \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -4954,7 +15713,7 @@ assert_release_evidence_required_sandbox_failure_is_verifiable() {
     failure="required sandbox drill failure must happen before Docker runtime actions"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="required sandbox drill failure release evidence package must pass verifier"
     fi
@@ -4989,7 +15748,7 @@ assert_release_evidence_required_github_app_failure_is_verifiable() {
   }
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_RELEASE_EVIDENCE_DIR="$evidence_root" \
@@ -4998,6 +15757,11 @@ assert_release_evidence_required_github_app_failure_is_verifiable() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=true \
@@ -5028,7 +15792,7 @@ assert_release_evidence_required_github_app_failure_is_verifiable() {
     failure="release evidence GitHub App drill log must explain missing GitHub App configuration"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="required GitHub App drill failure release evidence package must pass verifier"
     fi
@@ -5083,7 +15847,7 @@ assert_release_evidence_required_github_webhook_failure_is_verifiable() {
   fi
 
   if [[ -z "$failure" ]]; then
-    if env -i \
+    if run_with_timeout "release-evidence" "$SECURITY_REGRESSION_RELEASE_TIMEOUT_SECONDS" -- env -i \
       PATH="$fake_bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
       HOME="${HOME:-$tmp_dir}" \
       SOURCELENS_FAKE_CURL_MARKER="$marker" \
@@ -5093,6 +15857,11 @@ assert_release_evidence_required_github_webhook_failure_is_verifiable() {
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_VERIFY=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PREFLIGHT=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE=false \
+      SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PHASE12=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SANDBOX_DRILL=false \
       SOURCELENS_RELEASE_EVIDENCE_INCLUDE_GITHUB_APP_DRILL=false \
@@ -5132,7 +15901,7 @@ assert_release_evidence_required_github_webhook_failure_is_verifiable() {
     failure="required GitHub webhook drill failure must happen before any HTTP call"
   fi
   if [[ -z "$failure" ]]; then
-    if ! ./scripts/verify-release-evidence.sh "$run_dir" > "$verify_output_file" 2>&1; then
+    if ! run_verify_release_evidence "$run_dir" > "$verify_output_file" 2>&1; then
       cat "$verify_output_file" >&2
       failure="required GitHub webhook drill failure release evidence package must pass verifier"
     fi
@@ -5246,15 +16015,229 @@ assert_ci_permissions_are_read_only() {
   ' .github/workflows/ci.yml || fail "CI workflow permissions must grant only contents: read"
 }
 
+SECURITY_LLM_PROVIDER_SUITE_FUNCTIONS=(
+  assert_llm_provider_validator_cli_arguments_fail_closed
+  assert_llm_provider_eval_generator_writes_private_schema_without_secrets
+  assert_release_evidence_required_llm_provider_run_failure_is_verifiable
+  assert_release_evidence_llm_provider_success_requires_copied_result_after_rechecksum
+  assert_release_evidence_llm_provider_success_requires_raw_outputs_after_rechecksum
+)
+
+SECURITY_RELEASE_EVIDENCE_PROFILE_SUITE_FUNCTIONS=(
+  assert_release_evidence_required_smoke_failure_is_verifiable
+  assert_release_evidence_rejects_unsafe_loopback_runtime
+  assert_release_evidence_required_public_repo_smoke_failure_is_verifiable
+  assert_release_evidence_public_repo_smoke_false_skip_is_verifiable
+  assert_release_evidence_ci_profile_contract_is_verifiable
+  assert_release_evidence_profile_overrides_are_rejected
+  assert_release_evidence_required_autorepair_patch_smoke_failure_is_verifiable
+  assert_release_evidence_required_audit_workbench_smoke_failure_is_verifiable
+  assert_audit_workbench_strict_sample_rejects_remote_base_url
+  assert_release_verifier_requires_strict_audit_workbench_sample_evidence
+  assert_release_evidence_required_phase12_failure_is_verifiable
+  assert_release_evidence_missing_manual_evidence_failure_is_verifiable
+  assert_release_evidence_required_sandbox_failure_is_verifiable
+  assert_release_evidence_required_github_app_failure_is_verifiable
+  assert_release_evidence_required_github_webhook_failure_is_verifiable
+  assert_release_evidence_required_llm_provider_run_failure_is_verifiable
+)
+
+SECURITY_RELEASE_VERIFIER_PUBLIC_REPO_MARKER_SUITE_FUNCTIONS=(
+  assert_release_verifier_rejects_public_repo_smoke_ok_without_marker
+  assert_release_verifier_rejects_public_repo_smoke_ok_without_natural_endpoint_probes
+  assert_release_verifier_rejects_public_repo_weak_keyword_eval_forgery
+)
+
+SECURITY_RELEASE_VERIFIER_PUBLIC_REPO_UI_MARKER_SUITE_FUNCTIONS=(
+  assert_release_verifier_rejects_public_repo_ui_smoke_marker_forgery
+)
+
+SECURITY_RELEASE_VERIFIER_AUTOREPAIR_UI_MARKER_SUITE_FUNCTIONS=(
+  assert_release_verifier_rejects_autorepair_patch_smoke_ok_without_marker
+  assert_release_verifier_rejects_patch_ready_ui_smoke_ok_without_marker
+)
+
+SECURITY_RELEASE_VERIFIER_DASHBOARD_UI_MARKER_SUITE_FUNCTIONS=(
+  assert_release_verifier_rejects_dashboard_next_action_ui_smoke_ok_without_marker
+)
+
+SECURITY_RELEASE_VERIFIER_REPORT_EVIDENCE_MARKER_SUITE_FUNCTIONS=(
+  assert_release_verifier_rejects_report_evidence_drawer_ui_smoke_ok_without_marker
+)
+
+SECURITY_RELEASE_VERIFIER_SCAN_GOVERNANCE_MARKER_SUITE_FUNCTIONS=(
+  assert_release_verifier_rejects_scan_governance_timeline_ui_smoke_ok_without_marker
+)
+
+SECURITY_RELEASE_VERIFIER_AGENT_CHAT_MARKER_SUITE_FUNCTIONS=(
+  assert_release_verifier_rejects_agent_chat_closure_rail_marker_forgery
+)
+
+SECURITY_RELEASE_VERIFIER_ARTIFACTS_MARKER_SUITE_FUNCTIONS=(
+  assert_release_verifier_rejects_artifacts_detail_selection_marker_forgery
+  assert_release_verifier_rejects_audit_logs_artifact_raw_download_marker_forgery
+)
+
+SECURITY_RELEASE_VERIFIER_FORGERY_SUITE_FUNCTIONS=(
+  "${SECURITY_RELEASE_VERIFIER_PUBLIC_REPO_MARKER_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_PUBLIC_REPO_UI_MARKER_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_AUTOREPAIR_UI_MARKER_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_DASHBOARD_UI_MARKER_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_REPORT_EVIDENCE_MARKER_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_SCAN_GOVERNANCE_MARKER_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_AGENT_CHAT_MARKER_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_ARTIFACTS_MARKER_SUITE_FUNCTIONS[@]}"
+)
+
+SECURITY_RELEASE_VERIFIER_INTEGRITY_SUITE_FUNCTIONS=(
+  assert_release_evidence_checksum_tamper_is_rejected
+  assert_release_evidence_checksum_manifest_unsafe_path_is_rejected
+  assert_release_evidence_checksum_manifest_duplicate_path_is_rejected
+  assert_release_evidence_checksum_manifest_mode_is_rejected
+  assert_release_evidence_verify_dir_symlink_is_rejected
+  assert_release_evidence_actual_package_unsafe_path_is_rejected
+  assert_release_evidence_package_symlink_is_rejected
+  assert_release_evidence_package_file_mode_is_rejected_after_rechecksum
+  assert_release_evidence_unexpected_file_is_rejected_after_rechecksum
+  assert_release_evidence_unexpected_directory_is_rejected_after_rechecksum
+  assert_release_evidence_llm_provider_success_requires_copied_result_after_rechecksum
+  assert_release_evidence_llm_provider_success_requires_raw_outputs_after_rechecksum
+  assert_release_evidence_duplicate_status_slug_is_rejected_after_rechecksum
+  assert_release_evidence_unknown_status_slug_is_rejected_after_rechecksum
+  assert_release_evidence_summary_step_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_summary_step_detail_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_summary_step_control_chars_are_rejected_after_rechecksum
+  assert_release_evidence_extra_summary_content_is_rejected_after_rechecksum
+  assert_release_evidence_unsafe_metadata_is_rejected_before_write
+  assert_release_evidence_metadata_backtick_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_duplicate_summary_metadata_is_rejected_after_rechecksum
+  assert_release_evidence_llm_metadata_is_sanitized_before_write
+  assert_release_evidence_llm_metadata_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_extra_manifest_content_is_rejected_after_rechecksum
+  assert_release_evidence_manifest_include_mode_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_required_include_cannot_be_forged_as_skip_after_rechecksum
+  assert_release_evidence_required_include_cannot_be_forged_as_warn_after_rechecksum
+  assert_release_evidence_disabled_include_skip_reason_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_core_status_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_worktree_inventory_other_cannot_be_forged_ok_after_rechecksum
+  assert_release_evidence_worktree_inventory_strict_failure_evidence_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_worktree_inventory_control_chars_are_rejected_after_rechecksum
+  assert_release_evidence_git_snapshots_control_chars_are_rejected_after_rechecksum
+  assert_release_evidence_created_at_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_summary_count_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_status_exit_code_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_status_detail_control_chars_are_rejected_after_rechecksum
+  assert_release_evidence_status_detail_backticks_are_rejected_after_rechecksum
+  assert_release_evidence_status_log_file_tamper_is_rejected_after_rechecksum
+  assert_release_evidence_manual_ok_rows_must_reference_txt_after_rechecksum
+  assert_release_evidence_status_detail_is_sanitized_before_write
+)
+
+SECURITY_INTEGRATION_DRILL_SUITE_FUNCTIONS=(
+  assert_generated_artifacts_inventory_group
+  assert_dependency_rejects_docker_action_workflow
+  assert_smoke_rejects_weak_env_before_http
+  assert_run_with_timeout_node_fallback_kills_process_group
+)
+
+SECURITY_DYNAMIC_SUITE_FUNCTIONS=(
+  "${SECURITY_LLM_PROVIDER_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_EVIDENCE_PROFILE_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_FORGERY_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_RELEASE_VERIFIER_INTEGRITY_SUITE_FUNCTIONS[@]}"
+  "${SECURITY_INTEGRATION_DRILL_SUITE_FUNCTIONS[@]}"
+)
+
+security_array_contains() {
+  local needle="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    [[ "$candidate" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+security_function_enabled_for_suite() {
+  local function_name="$1"
+  case "$SECURITY_REGRESSION_SUITE" in
+    full) return 0 ;;
+    static) return 1 ;;
+    llm-provider) security_array_contains "$function_name" "${SECURITY_LLM_PROVIDER_SUITE_FUNCTIONS[@]}" ;;
+    release-evidence-profile) security_array_contains "$function_name" "${SECURITY_RELEASE_EVIDENCE_PROFILE_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-forgery) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_FORGERY_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-public-repo-marker) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_PUBLIC_REPO_MARKER_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-public-repo-ui-marker) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_PUBLIC_REPO_UI_MARKER_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-autorepair-ui-marker) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_AUTOREPAIR_UI_MARKER_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-dashboard-ui-marker) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_DASHBOARD_UI_MARKER_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-report-evidence-marker) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_REPORT_EVIDENCE_MARKER_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-scan-governance-marker) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_SCAN_GOVERNANCE_MARKER_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-agent-chat-marker) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_AGENT_CHAT_MARKER_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-artifacts-marker) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_ARTIFACTS_MARKER_SUITE_FUNCTIONS[@]}" ;;
+    release-verifier-integrity) security_array_contains "$function_name" "${SECURITY_RELEASE_VERIFIER_INTEGRITY_SUITE_FUNCTIONS[@]}" ;;
+    integration-drill) security_array_contains "$function_name" "${SECURITY_INTEGRATION_DRILL_SUITE_FUNCTIONS[@]}" ;;
+    *) fail "unknown security regression suite after validation: $SECURITY_REGRESSION_SUITE" ;;
+  esac
+}
+
+security_override_dynamic_function() {
+  local function_name="$1"
+  eval "${function_name}() { security_log \"SKIP ${function_name} suite=\${SECURITY_REGRESSION_SUITE}\"; }"
+}
+
+security_assert_dynamic_suite_functions_exist() {
+  local function_name
+  for function_name in "${SECURITY_DYNAMIC_SUITE_FUNCTIONS[@]}"; do
+    declare -F "$function_name" >/dev/null \
+      || fail "security regression suite references missing function: $function_name"
+  done
+}
+
+security_apply_suite_filter() {
+  local function_name
+  security_assert_dynamic_suite_functions_exist
+  security_log "SELECT suite=${SECURITY_REGRESSION_SUITE}"
+  [[ "$SECURITY_REGRESSION_SUITE" == "full" ]] && return 0
+  for function_name in "${SECURITY_DYNAMIC_SUITE_FUNCTIONS[@]}"; do
+    if ! security_function_enabled_for_suite "$function_name"; then
+      security_override_dynamic_function "$function_name"
+    fi
+  done
+}
+
+security_parse_args "$@"
+security_validate_config
+security_log "START security regression checks suite=${SECURITY_REGRESSION_SUITE}"
+
+security_log "START prerequisite command checks"
 require_cmd bash
 require_cmd git
 require_cmd rg
 require_cmd awk
 require_cmd node
+security_log "OK prerequisite command checks"
 
 cd "$ROOT_DIR"
+if ! security_bool_is_false "$SECURITY_REGRESSION_INTERNAL_TIMEOUT_PROBE"; then
+  [[ -n "${SOURCELENS_SECURITY_REGRESSION_TIMEOUT_PROBE_PID_FILE:-}" ]] \
+    || fail "SOURCELENS_SECURITY_REGRESSION_TIMEOUT_PROBE_PID_FILE is required for internal timeout probe"
+  run_with_timeout "timeout-probe-child" 1 -- node -e '
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const pidFile = process.env.SOURCELENS_SECURITY_REGRESSION_TIMEOUT_PROBE_PID_FILE;
+if (!pidFile) process.exit(127);
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+child.unref();
+fs.writeFileSync(pidFile, String(child.pid));
+setInterval(() => {}, 1000);
+'
+  fail "internal timeout probe should have timed out"
+fi
+security_apply_suite_filter
 
+security_log "START shell syntax checks"
 check_shell_scripts
+security_log "OK shell syntax checks"
 
 assert_executable scripts/verify-all.sh
 assert_executable scripts/security-regression-check.sh
@@ -5270,9 +16253,13 @@ assert_executable scripts/github-webhook-drill.sh
 assert_executable scripts/llm-safety-regression.sh
 assert_executable scripts/validate-llm-safety-evals.mjs
 assert_executable scripts/validate-llm-provider-run.mjs
+assert_executable scripts/run-llm-provider-eval.mjs
+assert_executable scripts/llm-provider-eval-mock-smoke.mjs
 assert_executable scripts/smoke-test.sh
 assert_executable scripts/phase12-baseline.sh
 assert_executable scripts/worktree-inventory.sh
+assert_executable scripts/file-bound-repair-smoke.sh
+assert_executable scripts/autorepair-patch-smoke.sh
 
 assert_match_count \
   "release and drill scripts must normalize nested paired quotes consistently" \
@@ -5297,6 +16284,86 @@ assert_match \
   "Makefile backup preflight target must run the backup/restore script" \
   'scripts/backup-restore-preflight\.sh' \
   Makefile
+
+assert_match \
+  "Makefile must expose file-bound repair smoke" \
+  '^file-bound-repair-smoke:' \
+  Makefile
+
+assert_match \
+  "Makefile must expose AutoRepair patch smoke" \
+  '^autorepair-patch-smoke:' \
+  Makefile
+
+assert_match \
+  "AutoRepair patch smoke must create a MOCK LLM config" \
+  '"provider": "MOCK"' \
+  scripts/autorepair-patch-smoke.sh
+
+assert_match \
+  "AutoRepair patch smoke must wait for PATCH_READY" \
+  'PATCH_READY' \
+  scripts/autorepair-patch-smoke.sh
+
+assert_match \
+  "AutoRepair patch smoke must validate patch artifact archival" \
+  'CHANGE_PATCH' \
+  scripts/autorepair-patch-smoke.sh
+
+assert_match \
+  "AutoRepair patch smoke must validate execution task linkage" \
+  'execution-tasks/source/AUTO_REPAIR' \
+  scripts/autorepair-patch-smoke.sh
+
+assert_match \
+  "AutoRepair patch smoke must validate audit linkage" \
+  'AUTO_REPAIR_PATCH_READY' \
+  scripts/autorepair-patch-smoke.sh
+
+assert_match \
+  "Product governance must index the agent activity log" \
+  'AGENT_ACTIVITY_LOG\.md' \
+  docs/PRODUCT_GOVERNANCE.md
+
+assert_match \
+  "Product governance must index the agent decision register" \
+  'AGENT_DECISION_REGISTER\.md' \
+  docs/PRODUCT_GOVERNANCE.md
+
+assert_match \
+  "Agent activity log must keep PM-Nova fixed project role" \
+  'PM-Nova' \
+  docs/AGENT_ACTIVITY_LOG.md
+
+assert_match \
+  "Agent activity log must keep Product-Luna fixed project role" \
+  'Product-Luna' \
+  docs/AGENT_ACTIVITY_LOG.md
+
+assert_match \
+  "Agent activity log must keep Arch-Atlas fixed project role" \
+  'Arch-Atlas' \
+  docs/AGENT_ACTIVITY_LOG.md
+
+assert_match \
+  "Agent activity log must keep Sec-Sentinel fixed project role" \
+  'Sec-Sentinel' \
+  docs/AGENT_ACTIVITY_LOG.md
+
+assert_match \
+  "Agent decision register must record AutoRepair PATCH_READY UI contract decision" \
+  'ADR-AGENT-002.*AutoRepair PATCH_READY' \
+  docs/AGENT_DECISION_REGISTER.md
+
+assert_match \
+  "Frontend UI gate must lock AutoRepair PATCH_READY artifact linkage" \
+  'AutoRepairs PATCH_READY detail must expose a patch artifact action bound to AUTO_REPAIR' \
+  scripts/validate-frontend-ui.mjs
+
+assert_match \
+  "Frontend UI gate must lock AuditLog AUTO_REPAIR deep links" \
+  'AuditLogs must deep-link AUTO_REPAIR audit records back to the AutoRepair detail page' \
+  scripts/validate-frontend-ui.mjs
 
 assert_match \
   "Makefile must expose rollback preflight" \
@@ -5391,6 +16458,21 @@ assert_match \
 assert_match \
   "LLM safety regression script must validate provider run templates" \
   'validate-llm-provider-run\.mjs' \
+  scripts/llm-safety-regression.sh
+
+assert_match \
+  "LLM safety regression script must syntax-check the real provider eval generator" \
+  'node --check "\$ROOT_DIR/scripts/run-llm-provider-eval\.mjs"' \
+  scripts/llm-safety-regression.sh
+
+assert_match \
+  "LLM safety regression script must syntax-check the provider eval mock smoke" \
+  'node --check "\$ROOT_DIR/scripts/llm-provider-eval-mock-smoke\.mjs"' \
+  scripts/llm-safety-regression.sh
+
+assert_match \
+  "LLM safety regression script must run the provider eval mock smoke" \
+  'node "\$ROOT_DIR/scripts/llm-provider-eval-mock-smoke\.mjs"' \
   scripts/llm-safety-regression.sh
 
 assert_match \
@@ -5539,11 +16621,278 @@ assert_match \
   scripts/validate-llm-provider-run.mjs
 
 assert_match \
+  "LLM provider eval generator must accept a dedicated provider API key env" \
+  'SOURCELENS_LLM_PROVIDER_EVAL_API_KEY' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must accept OpenAI-compatible fallback key env" \
+  'OPENAI_API_KEY' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must bind artifacts to the release evidence run id" \
+  'SOURCELENS_LLM_PROVIDER_EVAL_RELEASE_RUN_ID' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must call providers with bearer auth without persisting the key" \
+  'Authorization: `Bearer \$\{apiKey\}`' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must write release-evidence scoped raw artifact paths" \
+  'release-evidence/\$\{releaseRunId\}/llm-evals/\$\{testCase\.id\}\.txt' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must expose raw output artifacts through the provider run JSON" \
+  'rawOutputArtifact: rawArtifactRelative' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must write private output files" \
+  'writePrivateFile\(outputFile' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must fail non-zero when any provider case fails" \
+  'process\.exit\(2\)' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must include secret leakage assertions" \
+  'noSecretLeakage' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must bound provider fetch calls" \
+  'AbortController' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "LLM provider eval generator must expose request timeout configuration" \
+  'SOURCELENS_LLM_PROVIDER_EVAL_TIMEOUT_MS' \
+  scripts/run-llm-provider-eval.mjs
+
+assert_match \
+  "Makefile must expose the real LLM provider eval generator" \
+  '^llm-provider-eval:' \
+  Makefile
+
+assert_match \
+  "Makefile LLM provider eval target must run the generator through node" \
+  'node scripts/run-llm-provider-eval\.mjs' \
+  Makefile
+
+assert_match \
+  "Makefile must expose the LLM provider eval mock smoke" \
+  '^llm-provider-eval-mock-smoke:' \
+  Makefile
+
+assert_match \
+  "Makefile LLM provider eval mock smoke target must run the smoke through node" \
+  'node scripts/llm-provider-eval-mock-smoke\.mjs' \
+  Makefile
+
+assert_match \
+  "LLM provider eval mock smoke must start a local OpenAI-compatible chat completions server" \
+  "request.url !== '/v1/chat/completions'" \
+  scripts/llm-provider-eval-mock-smoke.mjs
+
+assert_match \
+  "LLM provider eval mock smoke must run the real provider eval generator" \
+  'scripts/run-llm-provider-eval\.mjs' \
+  scripts/llm-provider-eval-mock-smoke.mjs
+
+assert_match \
+  "LLM provider eval mock smoke must require all 14 cases" \
+  'expectedRequests !== 14' \
+  scripts/llm-provider-eval-mock-smoke.mjs
+
+assert_match \
+  "LLM provider eval mock smoke must validate generated provider run schema" \
+  'scripts/validate-llm-provider-run\.mjs' \
+  scripts/llm-provider-eval-mock-smoke.mjs
+
+assert_match \
+  "LLM provider eval mock smoke must reject API key persistence" \
+  'assertSecretNotPersisted' \
+  scripts/llm-provider-eval-mock-smoke.mjs
+
+assert_match \
+  "LLM provider eval mock smoke must verify raw artifact file modes" \
+  'assertSafeMode\(sourcePath, 0o600\)' \
+  scripts/llm-provider-eval-mock-smoke.mjs
+
+assert_match \
   "security regression must dynamically verify LLM provider validator CLI fail-closed behavior" \
   '^assert_llm_provider_validator_cli_arguments_fail_closed$' \
   scripts/security-regression-check.sh
 
 assert_llm_provider_validator_cli_arguments_fail_closed
+
+assert_match \
+  "security regression must dynamically verify LLM provider eval generator artifact and secret boundaries" \
+  '^assert_llm_provider_eval_generator_writes_private_schema_without_secrets$' \
+  scripts/security-regression-check.sh
+
+assert_llm_provider_eval_generator_writes_private_schema_without_secrets
+
+assert_match \
+  "CodeLocationHintParser must treat path line-column hints as one line hint" \
+  'PATH_LINE_HINT_PATTERN.*\\?:\\\\d' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeLocationHintParser.java
+
+assert_match \
+  "CodeChunkServiceTest must cover path line-column ranking" \
+  'searchChunks_shouldIgnoreColumnNumberInPathLineHints' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "CodeChunkServiceTest must cover path line-column range ranking" \
+  'searchChunks_shouldHandlePathLineColumnRangesAsLineRanges' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "CodeChunkServiceTest must strip line-column tokens from path queries" \
+  'tokenize_shouldStripLineColumnHintsFromPathQueries' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "CodeLocationHintParser must generate separated frontend method anchor file hints" \
+  'methodAnchorBaseNames' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeLocationHintParser.java
+
+assert_match \
+  "CodeChunkServiceTest must cover kebab-case method anchor candidate recall" \
+  'searchChunks_shouldAppendKebabCaseMethodAnchorFileCandidates' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "CodeQaRetrievalServiceTest must cover kebab-case frontend method anchor retrieval" \
+  'selectTopChunks_shouldPreferKebabCaseFrontendMethodAnchor' \
+  backend-spring/src/test/java/com/sourcelens/CodeQaRetrievalServiceTest.java
+
+assert_match \
+  "CodeLocationHintParser must parse function plus file stack frame hints" \
+  'FUNCTION_FILE_HINT_PATTERN' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeLocationHintParser.java
+
+assert_match \
+  "CodeChunkServiceTest must cover function file stack frame candidate recall" \
+  'searchChunks_shouldAppendFunctionFileStackFrameCandidates' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "CodeQaRetrievalServiceTest must cover function file stack frame retrieval" \
+  'selectTopChunks_shouldPreferFunctionFileStackFrame' \
+  backend-spring/src/test/java/com/sourcelens/CodeQaRetrievalServiceTest.java
+
+assert_match \
+  "CodeLocationHintParser must strip browser source URL ports before line hint parsing" \
+  'stripUrlPorts' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeLocationHintParser.java
+
+assert_match \
+  "CodeLocationHintParserTest must cover Vite source URL token cleanup" \
+  'stripLocationHintsForTokenization_shouldRemoveViteQueryLineAndColumnNoise' \
+  backend-spring/src/test/java/com/sourcelens/module/analysis/service/CodeLocationHintParserTest.java
+
+assert_match \
+  "CodeLocationHintParserTest must cover evidence filePath anchor normalization" \
+  'evidenceFilePathHints_shouldNormalizeQuotesDotsLineSuffixAndSourceUrlQuery' \
+  backend-spring/src/test/java/com/sourcelens/module/analysis/service/CodeLocationHintParserTest.java
+
+assert_match \
+  "CodeLocationHintParser must expose normalized source path suffix hints" \
+  'pathSuffixHints' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeLocationHintParser.java
+
+assert_match \
+  "CodeChunkRanker must score source path suffix hints" \
+  'pathSuffixHintScore' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkRanker.java
+
+assert_match \
+  "CodeChunkService must append source path suffix hint candidates" \
+  'listPathSuffixHintCandidates' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkService.java
+
+assert_no_match \
+  "CodeChunkService runtime queries must not use MEDIUMTEXT content LIKE hot paths" \
+  'like\(CodeChunk::getContent' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkService.java
+
+assert_match \
+  "CodeChunkServiceTest must prevent role intent content LIKE regressions" \
+  'searchChunks_shouldKeepRoleIntentQueriesOffContentLikeHotPath' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "CodeLocationHintParserTest must cover source URL path suffix cleanup" \
+  'pathSuffixHints_shouldNormalizeSourceUrlsWithoutHostQueryOrLineNoise' \
+  backend-spring/src/test/java/com/sourcelens/module/analysis/service/CodeLocationHintParserTest.java
+
+assert_match \
+  "CodeChunkServiceTest must cover same-name source URL path decoy ranking" \
+  'searchChunks_shouldPreferSourceUrlPathCandidateOverSameNamedFileDecoy' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "CodeQaRetrievalServiceTest must cover same-name source URL path decoy ranking" \
+  'selectTopChunks_shouldPreferSourceUrlPathSuffixOverSameNamedFileDecoy' \
+  backend-spring/src/test/java/com/sourcelens/CodeQaRetrievalServiceTest.java
+
+assert_match \
+  "CodeChunkServiceTest must cover standalone browser source URL port handling" \
+  'searchChunks_shouldIgnoreBrowserDevServerPortWhenRankingStandaloneSourceUrl' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "public repo smoke must emit source location probes" \
+  '"sourceLocationProbes": source_location_probes' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke must prove standalone browser source URL lookup" \
+  'standaloneBrowserSourceUrl' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke must prove Vite query source URL lookup" \
+  'viteQuerySourceUrl' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke must prove anonymous webpack stack frame lookup" \
+  'anonymousWebpackStackFrame' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "release verifier must validate public repo source location probes when present" \
+  'assertSourceLocationProbe' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must derive dev-server port rejection from matched line range" \
+  'matched line range must not cover the dev-server port' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must validate Vite query source URL probe shape" \
+  'vite-query-source-url' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject public repo source location marker forgery" \
+  'source-location-port-treated-as-line' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject raw source URL recording in source location markers" \
+  'source-location-raw-url-recorded' \
+  scripts/security-regression-check.sh
 
 assert_match \
   "release evidence output must be ignored by git" \
@@ -6632,9 +17981,26 @@ do
     scripts/verify-release-evidence.sh
 done
 
+for pattern in \
+  'backup-restore-drill-evidence with OK status must reference backup-restore-drill-evidence\.txt' \
+  'backup-restore-drill-evidence with non-OK status must reference backup-restore-drill-evidence\.log' \
+  'rollback-plan with OK status must reference rollback-plan\.txt' \
+  'rollback-plan with non-OK status must reference rollback-plan\.log'
+do
+  assert_match \
+    "release evidence verification script must enforce manual evidence status/log mapping: $pattern" \
+    "$pattern" \
+    scripts/verify-release-evidence.sh
+done
+
 assert_match \
   "security regression must dynamically verify status log_file tamper rejection after checksum regeneration" \
   '^assert_release_evidence_status_log_file_tamper_is_rejected_after_rechecksum$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically verify manual OK rows cannot reference log files" \
+  '^assert_release_evidence_manual_ok_rows_must_reference_txt_after_rechecksum$' \
   scripts/security-regression-check.sh
 
 assert_match \
@@ -6653,6 +18019,7 @@ assert_match \
   docs/CODEX_HANDOFF.md
 
 assert_release_evidence_status_log_file_tamper_is_rejected_after_rechecksum
+assert_release_evidence_manual_ok_rows_must_reference_txt_after_rechecksum
 
 assert_match \
   "release evidence verification script must reject duplicate required step slugs" \
@@ -7200,6 +18567,231 @@ assert_match \
   scripts/release-evidence.sh
 
 assert_match \
+  "release evidence script must reject invalid file-bound repair smoke include mode" \
+  'validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_FILE_BOUND_REPAIR_SMOKE "\$INCLUDE_FILE_BOUND_REPAIR_SMOKE"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must reject invalid AutoRepair patch smoke include mode" \
+  'validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE "\$INCLUDE_AUTOREPAIR_PATCH_SMOKE"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must default PATCH_READY UI smoke off" \
+  'SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE:-false' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must reject invalid PATCH_READY UI smoke include mode" \
+  'validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PATCH_READY_UI_SMOKE "\$INCLUDE_PATCH_READY_UI_SMOKE"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must default AgentChat audit UI smoke off" \
+  'SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE:-false' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must reject invalid AgentChat audit UI smoke include mode" \
+  'validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE "\$INCLUDE_AGENT_CHAT_AUDIT_UI_SMOKE"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must default AgentChat tool audit smoke off" \
+  'SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE:-false' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must reject invalid AgentChat tool audit smoke include mode" \
+  'validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE "\$INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must reject invalid Dashboard next action UI smoke include mode" \
+  'validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE "\$INCLUDE_DASHBOARD_NEXT_ACTION_UI_SMOKE"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must default report evidence drawer UI smoke off" \
+  'SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE:-false' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must reject invalid report evidence drawer UI smoke include mode" \
+  'validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE "\$INCLUDE_REPORT_EVIDENCE_DRAWER_UI_SMOKE"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must default scan governance timeline UI smoke off" \
+  'SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE:-false' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must reject invalid scan governance timeline UI smoke include mode" \
+  'validate_optional_mode SOURCELENS_RELEASE_EVIDENCE_INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE "\$INCLUDE_SCAN_GOVERNANCE_TIMELINE_UI_SMOKE"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must expose a profile selector" \
+  'SOURCELENS_RELEASE_EVIDENCE_PROFILE' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must record profile schema in manifest" \
+  'release_evidence_profile_schema: %s' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must record public repo source location probe requirement in manifest" \
+  'public_repo_source_location_probes_required: %s' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must reject fixed-profile include overrides" \
+  'cannot be used with SOURCELENS_RELEASE_EVIDENCE_PROFILE' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence verifier must validate profile include modes" \
+  '^validate_profile_include_modes\(\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence verifier must require sourceLocationProbes when manifest requires them" \
+  'sourceLocationProbes must be present when public_repo_source_location_probes_required=true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must cover missing required sourceLocationProbes" \
+  'source-location-required-missing' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "Makefile must expose CI release evidence profile target" \
+  '^release-evidence-ci:' \
+  Makefile
+
+assert_match \
+  "Makefile must expose release evidence release profile target" \
+  '^release-evidence-release:' \
+  Makefile
+
+assert_match \
+  "Makefile must expose release evidence nightly profile target" \
+  '^release-evidence-nightly:' \
+  Makefile
+
+assert_match \
+  "release evidence verifier must require file-bound repair smoke status row" \
+  'require_seen_once file-bound-repair-smoke "\$seen_file_bound_repair_smoke"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence verifier must require AutoRepair patch smoke status row" \
+  'require_seen_once autorepair-patch-smoke "\$seen_autorepair_patch_smoke"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence verifier must require AgentChat audit UI smoke status row" \
+  'require_seen_once agent-chat-audit-ui-smoke "\$seen_agent_chat_audit_ui_smoke"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence verifier must require AgentChat tool audit smoke status row" \
+  'require_seen_once agent-chat-tool-audit-smoke "\$seen_agent_chat_tool_audit_smoke"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence verifier must require Dashboard next action UI smoke status row" \
+  'require_seen_once dashboard-next-action-ui-smoke "\$seen_dashboard_next_action_ui_smoke"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence verifier must require report evidence drawer UI smoke status row" \
+  'require_seen_once report-evidence-drawer-ui-smoke "\$seen_report_evidence_drawer_ui_smoke"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence verifier must require scan governance timeline UI smoke status row" \
+  'require_seen_once scan-governance-timeline-ui-smoke "\$seen_scan_governance_timeline_ui_smoke"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence must run AutoRepair patch smoke through the standard script" \
+  './scripts/autorepair-patch-smoke\.sh' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must run PATCH_READY UI smoke through the standard Make target" \
+  'make patch-ready-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must run Dashboard next action UI smoke through the standard Make target" \
+  'make dashboard-next-action-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must run report evidence drawer UI smoke through the standard Make target" \
+  'make report-evidence-drawer-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must run scan governance timeline UI smoke through the standard Make target" \
+  'make scan-governance-timeline-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence PATCH_READY UI smoke must not reuse external UI smoke base URL" \
+  'unset SL_UI_SMOKE_BASE_URL; export CI=true; make patch-ready-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence Dashboard next action UI smoke must not reuse external UI smoke base URL" \
+  'unset SL_UI_SMOKE_BASE_URL; export CI=true; export SOURCELENS_DASHBOARD_NEXT_ACTION_UI_ARTIFACT_DIR="\$1"; make dashboard-next-action-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence report evidence drawer UI smoke must not reuse external UI smoke base URL" \
+  'unset SL_UI_SMOKE_BASE_URL; export CI=true; make report-evidence-drawer-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence scan governance timeline UI smoke must not reuse external UI smoke base URL" \
+  'unset SL_UI_SMOKE_BASE_URL; export CI=true; make scan-governance-timeline-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must run AgentChat audit UI smoke through the standard Make target" \
+  'make agent-chat-audit-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence AgentChat audit UI smoke must not reuse external UI smoke base URL" \
+  'unset SL_UI_SMOKE_BASE_URL; export CI=true; make agent-chat-audit-ui-smoke' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must run AgentChat tool audit smoke through the standard script" \
+  './scripts/agent-chat-tool-audit-smoke\.sh' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence AgentChat tool audit smoke must stay local-only" \
+  'SOURCELENS_BASE_URL must target localhost/127\.0\.0\.1/::1 when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_TOOL_AUDIT_SMOKE=true' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence verifier must parse AgentChat tool audit marker" \
+  'AGENT_CHAT_TOOL_AUDIT_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence verifier must prove AgentChat tool audit READ_ONLY tool" \
+  'permissionLevel must be READ_ONLY' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
   "release evidence script must redact command lines before writing logs" \
   'redacted_command "\$@"' \
   scripts/release-evidence.sh
@@ -7227,6 +18819,16 @@ assert_match \
 assert_match \
   "release evidence script must scrub logs after command execution" \
   'sanitize_log_file "\$log_file"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must print step start progress before long-running commands" \
+  'started; log=' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must print step completion progress after long-running commands" \
+  '\[%s\] OK' \
   scripts/release-evidence.sh
 
 assert_match \
@@ -7592,7 +19194,12 @@ assert_match \
 
 assert_match \
   "release evidence script must run production preflight in warn-only mode" \
-  'SOURCELENS_PREFLIGHT_WARN_ONLY=true ./scripts/production-preflight\.sh' \
+  'SOURCELENS_PREFLIGHT_WARN_ONLY=true' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must control nested production preflight static gates" \
+  'SOURCELENS_PREFLIGHT_INCLUDE_STATIC_GATES="\$preflight_static_gates" ./scripts/production-preflight\.sh' \
   scripts/release-evidence.sh
 
 assert_match \
@@ -7889,6 +19496,1161 @@ assert_match \
   scripts/security-regression-check.sh
 
 assert_match \
+  "release evidence script must not public repo smoke default localhost when required" \
+  'SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE=true' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must include public repo smoke evidence" \
+  './scripts/public-repo-analysis-smoke\.sh' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must pass base URL to public repo smoke" \
+  'SOURCELENS_BASE_URL="\$base_url".*\./scripts/public-repo-analysis-smoke\.sh' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo smoke success marker" \
+  'PUBLIC_REPO_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must parse public repo smoke marker JSON" \
+  'JSON\.parse\(matches\[0\]\.slice\(prefix\.length\)\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require exactly one public repo smoke marker" \
+  'matches\.length === 1' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must inspect public repo smoke role probes" \
+  'chunkSearch\.roleProbes' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo API cross-file retrieval proof" \
+  'PUBLIC_REPO_SMOKE_OK chunkSearch\.crossFileRetrievalProof\.uniqueFiles must be at least 2' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "public repo smoke must output cross-file file distribution samples" \
+  '"fileDistribution": file_distribution' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "release verifier must require public repo cross-file file distribution sample count" \
+  'PUBLIC_REPO_SMOKE_OK chunkSearch\.crossFileRetrievalProof\.fileDistributionSampleCount must be at least 2' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo report citation quality proof" \
+  'PUBLIC_REPO_SMOKE_OK reportQuality\.reportCitationQuality\.sectionBindings must cover required checks' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo code understanding fixture" \
+  'assertCodeUnderstandingFixture\(payload\.codeUnderstandingFixture, payload\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "public repo smoke must emit API cross-file retrieval proof" \
+  '"crossFileRetrievalProof": validate_cross_file_retrieval_proof\(\)' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke must emit report citation quality proof" \
+  '"reportCitationQuality": report_citation_quality' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke must support real report evidence QA citation marker" \
+  'validate_report_evidence_qa_citation_quality' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke report evidence QA citation marker must require report line anchors" \
+  'sourceEvidenceMatchType.*REPORT_LINE_ANCHOR' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "release verifier must validate public repo report evidence QA citation marker when present" \
+  'assertReportEvidenceQaCitationQuality\(payload\.reportEvidenceQaCitationQuality, payload\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo report evidence QA citation required coverage" \
+  'minRequiredEvidenceCoveragePercent must be at least 100' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "public repo smoke must emit code understanding fixture" \
+  '"codeUnderstandingFixture": method_anchor\.get\("codeUnderstandingFixture"\)' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke must emit Code QA first PRIMARY exact anchor proof" \
+  '"firstPrimaryExactAnchorPreserved": first_primary_exact_anchor' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "release verifier must validate Code QA first PRIMARY exact anchor proof when present" \
+  'codeQa\.firstPrimaryExactAnchorPreserved === true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "public repo smoke must emit raw Code QA cross-file citation summary" \
+  '"crossFileCitationSummary": cross_file_citation_summary' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "release verifier must validate raw Code QA cross-file citation summary when present" \
+  'assertRawCodeQaCrossFileCitationSummary\(' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject raw Code QA cross-file citation summary forgery" \
+  'code-qa-cross-file-summary-cross-file-forged' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "public repo smoke raw Code QA summary must expose answer-level coverage status" \
+  '"fullCitationCoverageSatisfied": full_citation_coverage_satisfied' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "release verifier must reject raw Code QA summary PARTIAL coverage ready overclaim" \
+  'tones must reflect answer-level coverage readiness' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject raw Code QA partial coverage ready overclaim" \
+  'code-qa-cross-file-summary-partial-coverage-ready-overclaim' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo API cross-file retrieval forgery" \
+  'cross-file-retrieval-unique-one' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo report citation quality forgery" \
+  'report-citation-quality-wrong-section' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo report evidence QA citation forgery" \
+  'report-evidence-qa-citation-file-anchor' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo code understanding forgery" \
+  'code-understanding-fixture-qa-primary-file-mismatch' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject Code QA first PRIMARY exact anchor forgery" \
+  'code-understanding-fixture-qa-first-primary-exact-anchor-false' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require public repo UI code knowledge readiness" \
+  'PUBLIC_REPO_UI_SMOKE_OK codeKnowledge\.totalChunks must be positive' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI cross-file code knowledge evidence" \
+  'PUBLIC_REPO_UI_SMOKE_OK codeKnowledge\.crossFileEvidence\.uniqueFiles must be at least 2' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI recommended next step visibility" \
+  'PUBLIC_REPO_UI_SMOKE_OK recommendedNextStep\.visible must be true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "public repo UI smoke must emit report recommended next step marker field" \
+  'recommendedNextStep:\s*\{' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit code knowledge total chunks marker field" \
+  'totalChunks:\s*minCodeKnowledgeTotalChunks' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit code knowledge retrieval mode marker field" \
+  'retrievalModes:\s*codeKnowledgeRetrievalModes' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit code knowledge usable readiness marker field" \
+  'readinessUsable:\s*reportEvidenceDrawerProofs\.every\(proof => proof\.codeKnowledge\.readinessUsable\)' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit cross-file code knowledge marker field" \
+  'crossFileEvidence:\s*\{' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit QA evidence handoff marker field" \
+  'PROJECT_QA_REPORT_EVIDENCE_HANDOFF' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "release verifier must require QA evidence handoff source receipt and AutoRepair action binding when marker is present" \
+  'candidateFormOpened === true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI code knowledge marker forgery" \
+  'code-knowledge-embedded-over-total' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI QA evidence handoff marker forgery" \
+  'qa-evidence-handoff-source-type-manual' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "public repo UI smoke must emit source-file match release marker field" \
+  'sourceFileMatchRelease:\s*\{' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "release verifier must validate public repo UI source-file match release marker when present" \
+  'assertSourceFileMatchRelease\(qaFromEvidence\.sourceFileMatchRelease' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI source-file match release marker forgery" \
+  'source-file-match-release-file-anchor' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI recommended next step marker forgery" \
+  'recommended-next-step-bad-key' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI cross-file code knowledge forgery" \
+  'code-knowledge-cross-file-one-file' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "roadmap must document public repo cross-file code knowledge release evidence" \
+  'codeKnowledge\.crossFileEvidence.*uniqueFiles >= 2.*fileStatsUniqueFiles >= 2.*resultCount >= 2.*sourceLabelsVisible=true' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "handoff must document public repo cross-file code knowledge release evidence" \
+  'PUBLIC_REPO_UI_SMOKE_OK\.codeKnowledge\.crossFileEvidence.*resultCount >= 2.*uniqueFiles >= 2.*fileStatsUniqueFiles >= 2.*sourceLabelsVisible=true' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "Code QA response must expose citation coverage" \
+  'private CodeQaCitationCoverage citationCoverage;' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/dto/CodeQaResponse.java
+
+assert_match \
+  "Code QA controller must compute repair candidate coverage" \
+  'repairCandidateCount\(repairCandidates\)' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/controller/CodeQaController.java
+
+assert_match \
+  "Code QA citation coverage DTO must expose primary evidence coverage" \
+  'private Integer primaryEvidenceCount;' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/dto/CodeQaCitationCoverage.java
+
+assert_match \
+  "Code QA citation coverage DTO must expose required evidence coverage percent" \
+  'private Integer requiredEvidenceCoveragePercent;' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/dto/CodeQaCitationCoverage.java
+
+assert_match \
+  "Code QA citation coverage DTO must expose coverage scope" \
+  'private String coverageScope;' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/dto/CodeQaCitationCoverage.java
+
+assert_match \
+  "Code QA controller must scope required coverage to primary evidence when present" \
+  'int required = primary > 0 \? primary : total;' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/controller/CodeQaController.java
+
+assert_match \
+  "Code QA controller must compute cited required evidence count" \
+  'int citedRequired = primary > 0 \? citedPrimary : cited;' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/controller/CodeQaController.java
+
+assert_match \
+  "Code QA controller must emit required evidence coverage percent" \
+  'requiredEvidenceCoveragePercent\(requiredCoveragePercent\)' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/controller/CodeQaController.java
+
+assert_match \
+  "ProjectDetail must render required evidence coverage labels" \
+  '必需证据覆盖 \$\{citedRequired\}/\$\{required\} \(\$\{requiredPercent\}%\)' \
+  web-console/src/pages/ProjectDetail.tsx
+
+assert_match \
+  "release verifier must require public repo Code QA citation coverage" \
+  'PUBLIC_REPO_SMOKE_OK codeQa\.citationCoverage\.repairCandidateCount must be positive' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report QA unverified zero citation coverage" \
+  'QA citation unverifiedCitation\.citationCoverage\.minRepairCandidateCount must be 0' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI QA required evidence coverage" \
+  'PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.citationCoverage\.minRequiredEvidenceCoveragePercent must be at least 100' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI QA required evidence file coverage" \
+  'PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.citationCoverage\.minCitedRequiredEvidenceFileCount must cover required files' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject public repo UI QA uncited primary evidence" \
+  'PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.citationCoverage\.maxUncitedPrimaryEvidenceCount must be 0' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI QA uncited context gap" \
+  'PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.citationCoverage\.minUncitedContextEvidenceCount must be positive' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI QA claim citation coverage" \
+  'assertReadyClaimCitationCoverage\(qaFromEvidence\.claimCitationCoverage, "PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.claimCitationCoverage"\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI QA cross-file citation summary" \
+  'assertCrossFileCitationSummary\(qaFromEvidence\.crossFileCitationSummary, qaFromEvidenceCoverage, qaFromEvidence\.claimCitationCoverage, "PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.crossFileCitationSummary", "verified"\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI QA context gap visibility" \
+  'PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.crossFileCitationSummary\.contextGapVisible must be true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report QA required evidence coverage" \
+  'QA citation citationCoverage\.minRequiredEvidenceCoveragePercent must be at least 100' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report QA primary evidence file coverage" \
+  'QA citation citationCoverage\.minCitedPrimaryEvidenceFileCount must cover primary files' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo Code QA evidence role distribution" \
+  'PUBLIC_REPO_SMOKE_OK codeQa\.citationCoverage\.evidenceRoleDistribution' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo Code QA claim citation coverage" \
+  'PUBLIC_REPO_SMOKE_OK codeQa\.claimCitationCoverage\.status must be READY' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo Code QA claim role distribution" \
+  'PUBLIC_REPO_SMOKE_OK codeQa\.claimCitationCoverage\.roleDistribution\.status must be PRIMARY_BOUND' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo Code QA primary-bound claim coverage" \
+  'PUBLIC_REPO_SMOKE_OK codeQa\.claimCitationCoverage\.roleDistribution\.requiredPrimaryBoundClaimCount must cover required claims' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "public repo smoke must emit focused Code QA claim citation noise boundary" \
+  'claimCitationNoiseBoundary' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke must validate focused Code QA claim citation noise boundary" \
+  'validate_claim_citation_noise_boundary' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "release verifier must validate public repo Code QA claim citation noise boundary when present" \
+  'PUBLIC_REPO_SMOKE_OK codeQa\.claimCitationNoiseBoundary\.claimCitationStatus must be REVIEW' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject raw public repo Code QA claim citation noise fields" \
+  'PUBLIC_REPO_SMOKE_OK codeQa\.claimCitationNoiseBoundary must not contain \$\{field\}' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject public repo Code QA claim citation noise forgery" \
+  'code-qa-claim-noise-ready-forged' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require public repo UI QA evidence role distribution" \
+  'PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.citationCoverage\.evidenceRoleDistribution' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report QA evidence role distribution" \
+  'QA citation citationCoverage\.evidenceRoleDistribution' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report QA claim citation coverage" \
+  'assertReadyClaimCitationCoverage\(qaFromEvidence\.claimCitationCoverage, "QA citation claimCitationCoverage"\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report QA cross-file citation summary" \
+  'assertCrossFileCitationSummary\(qaFromEvidence\.crossFileCitationSummary, qaCitationCoverage, qaFromEvidence\.claimCitationCoverage, "QA citation crossFileCitationSummary", "verified"\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require claim citation file distribution" \
+  'minRequiredClaimCitationFileCount must be positive' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require claim citation PRIMARY role distribution" \
+  'PRIMARY_BOUND' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must fail closed on unverified claim role distribution" \
+  'REVIEW_UNCITED' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require legal required coverage scopes" \
+  'const allowedScopes = new Set\(\["PRIMARY", "ALL"\]\);' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject unverified required evidence coverage claims" \
+  'QA citation unverifiedCitation\.citationCoverage\.minRequiredEvidenceCoveragePercent must be 0' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject unverified cited required evidence coverage claims" \
+  'QA citation unverifiedCitation\.citationCoverage\.minCitedRequiredEvidenceCount must be 0' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject unverified cited required evidence file claims" \
+  'QA citation unverifiedCitation\.citationCoverage\.maxCitedRequiredEvidenceFileCount must be 0' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject unverified role cited primary file claims" \
+  'QA citation unverifiedCitation\.citationCoverage\.evidenceRoleDistribution", "unverified"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must fail closed on forged role cited primary file count" \
+  'maxCitedPrimaryFileCount must be 0' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject unverified claim citation coverage claims" \
+  'assertReviewClaimCitationCoverage\(unverifiedCitation\.claimCitationCoverage, "QA citation unverifiedCitation\.claimCitationCoverage"\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject unverified cross-file citation summary claims" \
+  'assertCrossFileCitationSummary\(unverifiedCitation\.crossFileCitationSummary, unverifiedCitationCoverage, unverifiedCitation\.claimCitationCoverage, "QA citation unverifiedCitation\.crossFileCitationSummary", "unverified"\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require claim citation noise boundary marker" \
+  'claimCitationNoiseBoundary = qaFromEvidence\.claimCitationNoiseBoundary' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo UI claim citation noise boundary marker" \
+  'PUBLIC_REPO_UI_SMOKE_OK qaFromEvidence\.claimCitationNoiseBoundary\.claimCitationStatus must be REVIEW' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require claim citation noise kinds" \
+  'claimCitationNoiseBoundary\.noiseKinds, \["exception-line", "fenced-code", "inline-code", "timestamp-log"\]' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must keep claim citation noise boundary in review" \
+  'QA citation claimCitationNoiseBoundary\.claimCitationStatus must be REVIEW' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject raw claim citation noise boundary fields" \
+  'QA citation claimCitationNoiseBoundary must not contain \$\{field\}' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject claim citation noise boundary forgery" \
+  'claim-noise-ready-forged' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI claim citation noise boundary forgery" \
+  'qa-from-evidence-claim-noise-ready-forged' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI QA cross-file summary forgery" \
+  'qa-from-evidence-cross-file-count-mismatch' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must keep cross-file citation summary field whitelist strict" \
+  'assertAllowedObjectKeys\(value, mode === "verified" \? verifiedKeys : unverifiedKeys, label\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI QA cross-file summary unexpected fields" \
+  'qa-from-evidence-cross-file-unexpected-field' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject report QA citation coverage forgery" \
+  'unverified-coverage-claims-repair' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject report QA required coverage forgery" \
+  'unverified-required-coverage-claims-full' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI QA missing role distribution" \
+  'qa-from-evidence-missing-role-distribution' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject raw public repo Code QA missing claim role distribution" \
+  'code-qa-missing-role-distribution' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject raw public repo Code QA primary-bound claim forgery" \
+  'code-qa-zero-primary-bound-claims' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject report QA verified role mismatch" \
+  'verified-role-primary-mismatch' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject report QA unverified role cited file forgery" \
+  'unverified-role-cited-file-forged' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject report QA claim citation forgery" \
+  'unverified-claim-coverage-claims-full' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject report QA cross-file summary forgery" \
+  'unverified-cross-file-tone-ready' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject report QA cross-file summary unexpected fields" \
+  'unverified-cross-file-unexpected-field' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject report QA claim citation file forgery" \
+  'unverified-claim-file-count-forged' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "phase requirements must document Project QA citation coverage" \
+  'Project QA citation coverage' \
+  docs/PHASE_REQUIREMENTS.md
+
+assert_match \
+  "handoff must document Project QA citation coverage" \
+  'Project QA citation coverage' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "public repo smoke must validate RAW_SCAN_RESULT versioned analyzer contract" \
+  'validate_raw_scan_contract' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke marker must include raw analyzer contract evidence" \
+  '"rawScanContract": raw_scan_contract' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "release verifier must require public repo raw analyzer contract evidence" \
+  'rawScanContract\.schemaVersion must be 2' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must reject public repo marker without raw analyzer contract" \
+  'missing-raw-scan-contract' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require Chinese natural endpoint probe" \
+  '"naturalEndpointCn", "业务接口"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require English natural endpoint probe" \
+  '"naturalEndpointEn", "business endpoint"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject duplicate public repo smoke role probes" \
+  'roleProbes must not repeat role' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject frontend natural endpoint evidence" \
+  'must not match FRONTEND evidence' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require controller evidence or controller fallback for natural endpoint probes" \
+  'must use controller evidence or controller fallback' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically verify required public repo smoke release evidence packages" \
+  '^assert_release_evidence_required_public_repo_smoke_failure_is_verifiable$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically verify public repo smoke false skip packages" \
+  '^assert_release_evidence_public_repo_smoke_false_skip_is_verifiable$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically verify release evidence profile contracts" \
+  '^assert_release_evidence_ci_profile_contract_is_verifiable$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject fixed-profile include overrides" \
+  '^assert_release_evidence_profile_overrides_are_rejected$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo smoke OK without marker" \
+  '^assert_release_verifier_rejects_public_repo_smoke_ok_without_marker$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo smoke OK without natural endpoint controller probes" \
+  '^assert_release_verifier_rejects_public_repo_smoke_ok_without_natural_endpoint_probes$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must parse optional public repo weak keyword eval marker" \
+  'projectQaWeakKeywordEvaluation' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo weak keyword eval probe kind" \
+  'REAL_WEAK_KEYWORD_SAMPLE_EVAL' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject public repo weak keyword eval DB mutation claims" \
+  'dbMutationUsed === false' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject public repo weak keyword eval provider quality claims" \
+  'providerQualityClaim === false' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo weak keyword eval semantic threshold" \
+  'semanticFallbackHits >= evaluation\.minSemanticFallbackHits' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject public repo weak keyword eval marker forgery" \
+  '^assert_release_verifier_rejects_public_repo_weak_keyword_eval_forgery$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject public repo UI smoke marker forgery" \
+  '^assert_release_verifier_rejects_public_repo_ui_smoke_marker_forgery$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require public repo governance patch evidence marker fields" \
+  'governanceTimeline\.patchEvidence\.patchReadyAuditAction' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo governance repair execution patch evidence" \
+  'governanceTimeline\.patchEvidence\.repairExecutionSourceId' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "public repo UI smoke must emit live governance patch evidence marker fields" \
+  'patchArtifactVisible: governanceTimelineProofs\.every\(proof => proof\.patchEvidence\.patchArtifactVisible\)' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit live governance patch audit marker fields" \
+  'patchReadyAuditVisible: governanceTimelineProofs\.every\(proof => proof\.patchEvidence\.patchReadyAuditVisible\)' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit live governance repair execution marker fields" \
+  'repairExecutionVisible: governanceTimelineProofs\.every\(proof => proof\.patchEvidence\.repairExecutionVisible\)' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "scan governance smoke seed must create repair execution evidence" \
+  'executionTaskService\.create\(projectId, repository\.getId\(\), "AUTO_REPAIR"' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed must complete generate_patch evidence" \
+  'executionTaskService\.markSuccess\(repairExecution\.getId\(\), "generate_patch"\)' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "release evidence script must not AutoRepair patch smoke default localhost when required" \
+  'SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUTOREPAIR_PATCH_SMOKE=true' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "security regression must dynamically verify required AutoRepair patch smoke release evidence packages" \
+  '^assert_release_evidence_required_autorepair_patch_smoke_failure_is_verifiable$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require AutoRepair patch smoke success marker" \
+  'AUTOREPAIR_PATCH_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY UI smoke success marker" \
+  'PATCH_READY_UI_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY UI smoke 390px mobile viewport" \
+  '390x844' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY UI smoke layout density proof" \
+  'layoutDensity\.mobile390Covered.*true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY UI smoke mobile readability proof" \
+  'mobileReadability\.targetFileNotClipped.*true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY UI smoke table scroller proof" \
+  'tableScroller\.overflowXAuto.*true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY UI smoke stale detail guard proof" \
+  'executionDetailGuard\.staleExecutionDetailRejected.*true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY UI smoke runtime issue proof" \
+  'runtimeIssues.*must be 0' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY PR confirm candidate gate marker fields" \
+  'prConfirmCandidateGate\.repairEvidenceGate.*READY' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require PATCH_READY PR confirm candidate gate server-derived source" \
+  'prConfirmCandidateGate\.repairEvidenceGateSource.*SERVER_DERIVED' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require AgentChat audit UI smoke success marker" \
+  'AGENT_CHAT_AUDIT_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report evidence drawer UI smoke success marker" \
+  'REPORT_EVIDENCE_DRAWER_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report evidence QA citation UI smoke success marker" \
+  'REPORT_EVIDENCE_QA_CITATION_UI_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline UI smoke success marker" \
+  'SCAN_GOVERNANCE_TIMELINE_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt marker fields" \
+  'candidateReceipt\.autoRepairDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt source report deep link" \
+  'candidateReceipt\.sourceReportDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt QA review deep link" \
+  'candidateReceipt\.qaReviewDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt action labels" \
+  'candidateReceipt\.actionLabels' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt READY gate field" \
+  'candidateReceipt\.repairEvidenceGate === "READY"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt gate reason field" \
+  'candidateReceipt\.repairEvidenceGateReason' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt SERVER_DERIVED source field" \
+  'candidateReceipt\.repairEvidenceGateSource === "SERVER_DERIVED"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt server-derived gate visible field" \
+  'candidateReceipt\.serverDerivedGateVisible === true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline candidate receipt raw prompt leak guard" \
+  'candidateReceipt\.noRawPromptOrAnswer' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline PR gate marker fields" \
+  'prGate\.autoRepairDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline PR gate action label" \
+  'prGate\.actionLabel === "打开修复详情"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline PR gate raw prompt leak guard" \
+  'prGate\.noRawPromptOrAnswer' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline patch evidence marker fields" \
+  'patchEvidence\.patchArtifactOwnerId' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline patch artifact action label" \
+  'patchEvidence\.patchArtifactActionLabel === "打开补丁产物"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline patch artifact deep link" \
+  'patchEvidence\.patchArtifactDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline patch ready audit marker fields" \
+  'patchEvidence\.patchReadyAuditAction' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline repair execution action label" \
+  'patchEvidence\.repairExecutionActionLabel === "打开执行详情"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline repair execution deep link" \
+  'patchEvidence\.repairExecutionDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline patch ready audit action label" \
+  'patchEvidence\.patchReadyAuditActionLabel === "打开审计日志"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline patch ready audit deep link" \
+  'patchEvidence\.patchReadyAuditDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline patch evidence raw prompt leak guard" \
+  'patchEvidence\.noRawPromptOrAnswer' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline Agent review marker fields" \
+  'agentReview\.agentExecutionBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline Agent task action label" \
+  'agentReview\.agentTaskActionLabel === "打开 Agent 任务"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline Agent task deep link" \
+  'agentReview\.agentTaskDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline Agent tool audit action label" \
+  'agentReview\.toolCallAuditActionLabel === "打开审计日志"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline Agent tool audit deep link" \
+  'agentReview\.toolCallAuditDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline Agent execution action label" \
+  'agentReview\.agentExecutionActionLabel === "打开执行详情"' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline Agent execution deep link" \
+  'agentReview\.agentExecutionDeepLinkBound' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require scan governance timeline Agent review raw prompt leak guard" \
+  'agentReview\.noRawPromptOrAnswer' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo derived governance visible marker fields" \
+  'derivedGovernanceVisible === true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo derived governance audit resource types" \
+  'derivedAuditResourceTypes' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require public repo derived governance artifact types" \
+  'derivedArtifactTypes' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must parse PATCH_READY UI smoke payload" \
+  'validate_patch_ready_ui_smoke_success_marker' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must parse AgentChat audit UI smoke payload" \
+  'validate_agent_chat_audit_ui_smoke_success_marker' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must parse report evidence drawer UI smoke payload" \
+  'validate_report_evidence_drawer_ui_smoke_success_marker' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must validate optional report citation quality UI panel marker" \
+  'assertReportCitationQualityUiPanel\(qaPayload\.reportCitationQuality' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must reject report citation quality UI overclaim" \
+  'noOverclaim must be true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report citation quality verdict rail" \
+  'verdictVisible must be true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report citation source coverage" \
+  'sourceCoverageVisible must be true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report citation binding detail disclosure" \
+  'detailDefaultCollapsed must be true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject forged report citation quality UI marker fields" \
+  'report-citation-quality-provider-claim' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject forged report citation quality verdict rail" \
+  'report-citation-quality-verdict-count-low' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject forged report citation source coverage" \
+  'report-citation-quality-source-section-missing' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject forged report citation source labels" \
+  'report-citation-quality-source-label-missing' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require report citation source reading order" \
+  'sourceSectionOrder must follow report reading order' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must reject forged report citation source order" \
+  'report-citation-quality-source-order-wrong' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must reject forged report citation detail disclosure" \
+  'report-citation-quality-detail-does-not-open' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require report main path guide" \
+  'mainPathGuide.order must follow report execution path' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must reject forged report main path guide" \
+  'wrong-main-path-order' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require report action board" \
+  'actionBoard.actionKeys must follow report action routing order' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must reject forged report action board" \
+  'wrong-action-board-order' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must require report review gate" \
+  'reviewGate.gateKeys must follow report governance gate order' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must reject forged report review gate" \
+  'wrong-review-gate-order' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must parse scan governance timeline UI smoke payload" \
+  'validate_scan_governance_timeline_ui_smoke_success_marker' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must parse AutoRepair patch smoke payload" \
+  'validate_autorepair_patch_smoke_success_marker' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically reject AutoRepair patch smoke OK without marker" \
+  '^assert_release_verifier_rejects_autorepair_patch_smoke_ok_without_marker$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject PATCH_READY UI smoke OK without marker" \
+  '^assert_release_verifier_rejects_patch_ready_ui_smoke_ok_without_marker$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject report evidence drawer UI smoke OK without marker" \
+  '^assert_release_verifier_rejects_report_evidence_drawer_ui_smoke_ok_without_marker$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically reject scan governance timeline UI smoke OK without marker" \
+  '^assert_release_verifier_rejects_scan_governance_timeline_ui_smoke_ok_without_marker$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "PATCH_READY UI smoke must let Vite source modules through instead of mocking /src/api files" \
+  '!path\.startsWith\('"'"'/api/'"'"'\)' \
+  web-console/tests/patch-ready-smoke.spec.ts
+
+assert_match \
+  "PATCH_READY UI smoke must continue non-API Vite source module requests" \
+  'route\.continue\(\)' \
+  web-console/tests/patch-ready-smoke.spec.ts
+
+assert_match \
+  "PATCH_READY UI smoke must record unmocked real API requests" \
+  'unhandledApiRequests\.push' \
+  web-console/tests/patch-ready-smoke.spec.ts
+
+assert_match \
+  "PATCH_READY UI smoke must fail closed with synthetic 599 on unmocked real API requests" \
+  'status:\s*599' \
+  web-console/tests/patch-ready-smoke.spec.ts
+
+assert_match \
+  "PATCH_READY UI smoke must assert all real API requests were mocked" \
+  'unhandledApiRequests.*toEqual\(\[\]\)' \
+  web-console/tests/patch-ready-smoke.spec.ts
+
+assert_match \
+  "PATCH_READY UI smoke must prove PR submit is not called" \
+  'getSubmitPrCount\(\)' \
+  web-console/tests/patch-ready-smoke.spec.ts
+
+assert_match \
+  "PATCH_READY UI smoke must assert zero PR submit calls" \
+  'toBe\(0\)' \
+  web-console/tests/patch-ready-smoke.spec.ts
+
+assert_match \
+  "release evidence script must not audit workbench smoke default localhost when required" \
+  'SOURCELENS_BASE_URL is required when SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AUDIT_WORKBENCH_SMOKE=true' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "security regression must dynamically verify required audit workbench smoke release evidence packages" \
+  '^assert_release_evidence_required_audit_workbench_smoke_failure_is_verifiable$' \
+  scripts/security-regression-check.sh
+
+assert_match \
   "release evidence script must include optional smoke evidence" \
   './scripts/smoke-test\.sh' \
   scripts/release-evidence.sh
@@ -7897,6 +20659,176 @@ assert_match \
   "release evidence script must pass selected env file to smoke test" \
   'SOURCELENS_SMOKE_ENV_FILE="\$ENV_FILE"' \
   scripts/release-evidence.sh
+
+assert_match \
+  "release evidence script must include optional audit workbench smoke evidence" \
+  './scripts/audit-workbench-smoke\.sh' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "audit workbench smoke seed controller must be dev/test only" \
+  '@Profile\(\{"dev & !prod", "test & !prod"\}\)' \
+  backend-spring/src/main/java/com/sourcelens/module/audit/controller/AuditWorkbenchSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must be dev/test only" \
+  '@Profile\(\{"dev & !prod", "test & !prod"\}\)' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must verify project ownership" \
+  'projectService\.verifyOwnership\(projectId, userId\)' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must validate repository project boundary" \
+  'projectId\.equals\(repository\.getProjectId\(\)\)' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must validate scan project repository boundary" \
+  '扫描任务不属于当前项目仓库' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must require successful scan" \
+  '扫描任务必须成功后才能生成治理 smoke 样本' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must create AutoRepair audit action" \
+  'AUTO_REPAIR_PATCH_READY' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must create AutoRepair patch artifacts" \
+  'CHANGE_PATCH' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must create AgentTask audit action" \
+  'AGENT_TASK_SMOKE_READY' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "scan governance smoke seed controller must create AgentTask report artifacts" \
+  'AGENT_REPORT' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/controller/ScanGovernanceSmokeSeedController.java
+
+assert_match \
+  "production startup validator must reject prod mixed with dev/test profiles" \
+  'rejectProdWithDevelopmentProfiles\(\)' \
+  backend-spring/src/main/java/com/sourcelens/common/config/SecurityStartupValidator.java
+
+assert_match \
+  "production startup validator tests must reject prod plus dev" \
+  'prodProfileRejectsDevProfileMix' \
+  backend-spring/src/test/java/com/sourcelens/SecurityStartupValidatorTest.java
+
+assert_match \
+  "production startup validator tests must reject prod plus test" \
+  'prodProfileRejectsTestProfileMix' \
+  backend-spring/src/test/java/com/sourcelens/SecurityStartupValidatorTest.java
+
+assert_match \
+  "audit workbench smoke seed controller must verify project ownership" \
+  'projectService\.verifyOwnership\(projectId, userId\)' \
+  backend-spring/src/main/java/com/sourcelens/module/audit/controller/AuditWorkbenchSmokeSeedController.java
+
+assert_match \
+  "audit workbench smoke seed controller must validate repository project boundary" \
+  'projectId\.equals\(repository\.getProjectId\(\)\)' \
+  backend-spring/src/main/java/com/sourcelens/module/audit/controller/AuditWorkbenchSmokeSeedController.java
+
+assert_match \
+  "audit workbench smoke seed controller must write audit log samples" \
+  'auditLogService\.record' \
+  backend-spring/src/main/java/com/sourcelens/module/audit/controller/AuditWorkbenchSmokeSeedController.java
+
+assert_match \
+  "audit workbench smoke seed controller must write agent tool call samples through ToolExecutionService" \
+  'toolExecutionService\.execute' \
+  backend-spring/src/main/java/com/sourcelens/module/audit/controller/AuditWorkbenchSmokeSeedController.java
+
+assert_match \
+  "audit workbench smoke seed controller must write webhook delivery samples" \
+  'deliveryService\.markProcessed' \
+  backend-spring/src/main/java/com/sourcelens/module/audit/controller/AuditWorkbenchSmokeSeedController.java
+
+assert_match \
+  "audit workbench smoke seed controller must tag samples with source=audit-workbench-smoke" \
+  'source", SMOKE_SOURCE' \
+  backend-spring/src/main/java/com/sourcelens/module/audit/controller/AuditWorkbenchSmokeSeedController.java
+
+assert_match \
+  "audit workbench smoke seed controller tests must assert source=audit-workbench-smoke" \
+  'assertEquals\("audit-workbench-smoke", .*get\("source"\)\)' \
+  backend-spring/src/test/java/com/sourcelens/AuditWorkbenchSmokeSeedControllerTest.java
+
+assert_match \
+  "audit workbench smoke script must call dev seed endpoint when available" \
+  '/audit-workbench-smoke-seed' \
+  scripts/audit-workbench-smoke.sh
+
+assert_match \
+  "audit workbench strict seed preflight must use numeric project id" \
+  '/dev/projects/0/audit-workbench-smoke-seed' \
+  scripts/audit-workbench-smoke.sh
+
+assert_no_match \
+  "audit workbench strict seed preflight must not use non-numeric project ids" \
+  '__sourcelens_seed_probe__' \
+  scripts/audit-workbench-smoke.sh
+
+assert_match \
+  "audit workbench smoke script must support strict sample mode" \
+  'SOURCELENS_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES' \
+  scripts/audit-workbench-smoke.sh
+
+assert_match \
+  "audit workbench strict sample mode must be local-only" \
+  'is only allowed for localhost/127\.0\.0\.1/::1 targets' \
+  scripts/audit-workbench-smoke.sh
+
+assert_match \
+  "release evidence must expose audit workbench strict sample mode" \
+  'SOURCELENS_RELEASE_EVIDENCE_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence manifest must record audit workbench strict sample mode" \
+  'audit_workbench_smoke_require_samples: %s' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must pass audit workbench strict sample mode to smoke" \
+  'SOURCELENS_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES="\$\(bool_env_value "\$AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES"\)"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release verifier must parse strict audit workbench smoke JSON evidence" \
+  '^validate_audit_workbench_strict_sample_evidence\(\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require strict audit workbench sampleSeeded evidence" \
+  'sampleSeeded !== true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require all strict audit workbench source totals" \
+  'requiredSources = \["auditLogs", "agentToolCalls", "githubWebhookDeliveries"\]' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically prove strict audit workbench local-only" \
+  '^assert_audit_workbench_strict_sample_rejects_remote_base_url$' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically prove strict audit workbench release verifier constraints" \
+  '^assert_release_verifier_requires_strict_audit_workbench_sample_evidence$' \
+  scripts/security-regression-check.sh
 
 assert_no_match \
   "release evidence script must not pass smoke token on smoke command line" \
@@ -7914,8 +20846,193 @@ assert_match \
   docs/OPERATIONS_RUNBOOK.md
 
 assert_match \
+  "operations runbook must document public repo smoke release evidence" \
+  'public-repo-smoke.*SOURCELENS_RELEASE_EVIDENCE_INCLUDE_PUBLIC_REPO_SMOKE.*PUBLIC_REPO_SMOKE_OK' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document verifiable required AutoRepair patch smoke release evidence" \
+  '强制 AutoRepair patch readiness smoke.*SOURCELENS_BASE_URL.*required failure.*verify-release-evidence' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document PATCH_READY UI smoke release evidence marker" \
+  'patch-ready-ui-smoke.*PATCH_READY_UI_SMOKE_OK' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document report evidence drawer UI smoke release evidence marker" \
+  'report-evidence-drawer-ui-smoke.*REPORT_EVIDENCE_DRAWER_SMOKE_OK' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document scan governance timeline UI smoke release evidence marker" \
+  'scan-governance-timeline-ui-smoke.*SCAN_GOVERNANCE_TIMELINE_SMOKE_OK' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document scan governance candidate receipt release evidence" \
+  'candidateReceipt\.currentReceiptVisible.*candidateReceipt\.repairEvidenceGateReason.*candidateReceipt\.foreignReceiptHidden.*candidateReceipt\.autoRepairDeepLinkBound.*candidateReceipt\.noRawPromptOrAnswer' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document scan governance PR gate release evidence" \
+  'prGate\.action=AUTO_REPAIR_PR_REJECTED.*prGate\.foreignPrGateHidden.*prGate\.autoRepairDeepLinkBound.*prGate\.noRawPromptOrAnswer' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document scan governance patch evidence release evidence" \
+  'patchEvidence\.repairStatus=PATCH_READY.*patchEvidence\.patchArtifactOwnerType=AUTO_REPAIR.*patchEvidence\.patchReadyAuditAction=AUTO_REPAIR_PATCH_READY.*patchEvidence\.noRawPromptOrAnswer' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "scan governance timeline must aggregate AutoRepair audit logs" \
+  'resourceType=AUTO_REPAIR \+ resourceId in scan autoRepairs' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/service/ScanTaskGovernanceTimelineService.java
+
+assert_match \
+  "scan governance timeline must aggregate AgentTask audit logs" \
+  'resourceType=AGENT_TASK \+ resourceId in scan agentTasks' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/service/ScanTaskGovernanceTimelineService.java
+
+assert_match \
+  "scan governance timeline must aggregate AutoRepair artifacts" \
+  'OwnerType, "AUTO_REPAIR"' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/service/ScanTaskGovernanceTimelineService.java
+
+assert_match \
+  "scan governance timeline must aggregate AgentTask artifacts" \
+  'OwnerType, "AGENT_TASK"' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/service/ScanTaskGovernanceTimelineService.java
+
+assert_match \
+  "scan governance timeline must distinguish AutoRepair artifact attribution" \
+  'ownerType=AUTO_REPAIR \+ ownerId in scan autoRepairs' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/service/ScanTaskGovernanceTimelineService.java
+
+assert_match \
+  "scan governance timeline must distinguish AgentTask artifact attribution" \
+  'ownerType=AGENT_TASK \+ ownerId in scan agentTasks' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/service/ScanTaskGovernanceTimelineService.java
+
+assert_no_match \
+  "scan governance timeline must not mark all artifact events as direct scan artifacts" \
+  'directAttribution\("artifact ownerType=SCAN_TASK ownerId=scanTaskId"\)' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/service/ScanTaskGovernanceTimelineService.java
+
+assert_match \
+  "scan governance timeline test must cover derived AutoRepair audit logs" \
+  'AUTO_REPAIR_PATCH_READY' \
+  backend-spring/src/test/java/com/sourcelens/ScanTaskGovernanceTimelineServiceTest.java
+
+assert_match \
+  "scan governance timeline test must cover derived AgentTask audit logs" \
+  'AGENT_TASK_CANCEL' \
+  backend-spring/src/test/java/com/sourcelens/ScanTaskGovernanceTimelineServiceTest.java
+
+assert_match \
+  "public repo smoke must seed derived scan governance evidence before UI smoke" \
+  'scan-governance-smoke-seed' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo UI smoke must require derived governance after seed" \
+  'SL_PUBLIC_REPO_UI_EXPECT_DERIVED_GOVERNANCE": "true"' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo UI smoke must emit derived governance audit marker fields" \
+  'derivedAuditResourceTypes' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit derived governance artifact owner marker fields" \
+  'derivedArtifactOwnerTypes' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit derived governance artifact type marker fields" \
+  'derivedArtifactTypes' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "public repo UI smoke must emit derived governance visibility marker fields" \
+  'derivedGovernanceVisible' \
+  web-console/tests/public-repo-ui-smoke.spec.ts
+
+assert_match \
+  "operations runbook must document verifiable required audit workbench smoke release evidence" \
+  '强制 Audit workbench smoke.*SOURCELENS_BASE_URL.*required failure.*verify-release-evidence' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document audit workbench smoke seed sample mode" \
+  'audit-workbench-smoke-seed.*SOURCELENS_AUDIT_WORKBENCH_SMOKE_REQUIRE_SAMPLES' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "security boundary must forbid dev audit workbench smoke seed in production" \
+  '/api/dev/projects/\{projectId\}/audit-workbench-smoke-seed' \
+  docs/SECURITY_BOUNDARY.md
+
+assert_match \
   "roadmap must document verifiable required smoke release evidence" \
   '强制 smoke.*SOURCELENS_BASE_URL.*required failure.*verify-release-evidence' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "phase requirements must list public repo smoke release evidence step" \
+  'public-repo-smoke.*公开仓库主链路' \
+  docs/PHASE_REQUIREMENTS.md
+
+assert_match \
+  "roadmap must document public repo smoke release evidence" \
+  'public-repo-smoke.*PUBLIC_REPO_SMOKE_OK.*GitHub App.*不阻塞' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document PATCH_READY UI smoke release evidence" \
+  'patch-ready-ui-smoke.*PATCH_READY_UI_SMOKE_OK' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document Dashboard next action UI smoke release evidence" \
+  'dashboard-next-action-ui-smoke.*DASHBOARD_NEXT_ACTION_SMOKE_OK' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document report evidence drawer UI smoke release evidence" \
+  'report-evidence-drawer-ui-smoke.*REPORT_EVIDENCE_DRAWER_SMOKE_OK' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document scan governance timeline UI smoke release evidence" \
+  'scan-governance-timeline-ui-smoke.*SCAN_GOVERNANCE_TIMELINE_SMOKE_OK' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document scan governance candidate receipt release evidence" \
+  'candidate receipt.*AutoRepair detail deep link bound.*无 raw prompt/answer' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document scan governance PR gate release evidence" \
+  'PR gate rejected 可见.*foreign PR gate hidden.*PR gate AutoRepair detail deep link bound.*无 raw prompt/answer' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document scan governance patch evidence release evidence" \
+  'patch evidence.*PATCH_READY.*CHANGE_PATCH.*AUTO_REPAIR_PATCH_READY.*无 raw prompt/answer' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document public repo code knowledge readiness release evidence" \
+  'codeKnowledge.*totalChunks > 0.*resultCount > 0.*当前 scan only.*READY/REVIEW' \
+  docs/REFACTOR_ROADMAP.md
+
+assert_match \
+  "roadmap must document verifiable required audit workbench smoke release evidence" \
+  '强制 Audit workbench smoke.*SOURCELENS_BASE_URL.*required failure.*verify-release-evidence' \
   docs/REFACTOR_ROADMAP.md
 
 assert_match \
@@ -7923,7 +21040,75 @@ assert_match \
   '强制 smoke.*SOURCELENS_BASE_URL.*required failure.*verify-release-evidence' \
   docs/CODEX_HANDOFF.md
 
+assert_match \
+  "handoff must document public repo smoke release evidence" \
+  'public-repo-smoke.*PUBLIC_REPO_SMOKE_OK.*GitHub App.*不阻塞' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document PATCH_READY UI smoke release evidence" \
+  'patch-ready-ui-smoke.*PATCH_READY_UI_SMOKE_OK' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document Dashboard next action UI smoke release evidence" \
+  'dashboard-next-action-ui-smoke.*DASHBOARD_NEXT_ACTION_SMOKE_OK' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document report evidence drawer UI smoke release evidence" \
+  'report-evidence-drawer-ui-smoke.*REPORT_EVIDENCE_DRAWER_SMOKE_OK' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document scan governance timeline UI smoke release evidence" \
+  'scan-governance-timeline-ui-smoke.*SCAN_GOVERNANCE_TIMELINE_SMOKE_OK' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document scan governance candidate receipt release evidence" \
+  'candidate receipt 可见.*AutoRepair detail deep link bound.*无 raw prompt/answer' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document scan governance PR gate release evidence" \
+  'PR gate rejected 可见.*foreign PR gate hidden.*AutoRepair detail deep link bound.*无 raw prompt/answer' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document scan governance patch evidence release evidence" \
+  'patch evidence.*PATCH_READY.*CHANGE_PATCH.*AUTO_REPAIR_PATCH_READY.*foreign patch evidence hidden.*无 raw prompt/answer' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document public repo code knowledge readiness release evidence" \
+  'codeKnowledge.*totalChunks > 0.*resultCount > 0.*currentScanOnly=true.*READY/REVIEW' \
+  docs/CODEX_HANDOFF.md
+
+assert_match \
+  "handoff must document verifiable required audit workbench smoke release evidence" \
+  '强制 Audit workbench smoke.*SOURCELENS_BASE_URL.*required failure.*verify-release-evidence' \
+  docs/CODEX_HANDOFF.md
+
 assert_release_evidence_required_smoke_failure_is_verifiable
+assert_release_evidence_rejects_unsafe_loopback_runtime
+assert_release_evidence_required_public_repo_smoke_failure_is_verifiable
+assert_release_evidence_public_repo_smoke_false_skip_is_verifiable
+assert_release_evidence_ci_profile_contract_is_verifiable
+assert_release_evidence_profile_overrides_are_rejected
+assert_release_verifier_rejects_public_repo_smoke_ok_without_marker
+assert_release_verifier_rejects_public_repo_smoke_ok_without_natural_endpoint_probes
+assert_release_verifier_rejects_public_repo_weak_keyword_eval_forgery
+assert_release_verifier_rejects_public_repo_ui_smoke_marker_forgery
+assert_release_evidence_required_autorepair_patch_smoke_failure_is_verifiable
+assert_release_verifier_rejects_autorepair_patch_smoke_ok_without_marker
+assert_release_verifier_rejects_patch_ready_ui_smoke_ok_without_marker
+assert_release_verifier_rejects_dashboard_next_action_ui_smoke_ok_without_marker
+assert_release_verifier_rejects_report_evidence_drawer_ui_smoke_ok_without_marker
+assert_release_verifier_rejects_scan_governance_timeline_ui_smoke_ok_without_marker
+assert_release_evidence_required_audit_workbench_smoke_failure_is_verifiable
+assert_audit_workbench_strict_sample_rejects_remote_base_url
+assert_release_verifier_requires_strict_audit_workbench_sample_evidence
 
 assert_match \
   "release evidence script must include optional phase 12 baseline evidence" \
@@ -8049,7 +21234,7 @@ assert_match \
 
 assert_match \
   "operations runbook must document release evidence standard step slug completeness" \
-  '`git-metadata`、`worktree-inventory`、`make-verify`、`prod-preflight`、`backup-preflight`、`rollback-preflight`、`backup-restore-drill-evidence`、`rollback-plan`、`smoke`、`phase12-baseline`、`sandbox-drill`、`github-app-drill`、`github-webhook-drill` 和 `llm-provider-run` 标准 step 行都必须各出现一次' \
+  '`agent-chat-tool-audit-smoke` 已进入 release evidence 标准 step 清单' \
   docs/OPERATIONS_RUNBOOK.md
 
 assert_match \
@@ -8099,7 +21284,7 @@ assert_match \
 
 assert_match \
   "security boundary must require release evidence structure verification" \
-  '校验核心证据文件、summary/manifest metadata 一致性与格式、实际 verifier 目录名和 `summary.md` 的 `evidence_dir` 末段都必须匹配 `run_id`、summary marker、`## Steps` 的状态/slug 与 `status.tsv` 一一对应、summary 三项计数与 `status.tsv` 中 `FAIL/WARN/SKIP` 行数一致、status 表头、14 个标准 step slug 各出现一次、`status`/`exit_code` 语义一致、核心 `git-metadata` 状态必须保持 `OK`，`worktree-inventory` 不得被伪造成 `SKIP`，且 `worktree_inventory_strict=true` 下 `worktree-inventory` 状态为 `OK` 时不得在 `worktree-inventory.md` 中出现非零 `Other` 分组或 strict failure marker，`worktree-inventory` strict failure 必须在 `worktree-inventory.md` 中保留非零 `Other` 分组和 strict failure marker、manifest include 模式与 `status.tsv` 一致，强制步骤不得被伪造成 `SKIP` 或 `WARN`，显式关闭步骤的 `SKIP` detail 不得伪装成环境未配置，每个标准 step 的 `log_file` 匹配固定证据文件名和 status 引用文件' \
+  '校验核心证据文件、summary/manifest metadata 一致性与格式、实际 verifier 目录名和 `summary.md` 的 `evidence_dir` 末段都必须匹配 `run_id`、summary marker、`## Steps` 的状态/slug 与 `status.tsv` 一一对应、summary 三项计数与 `status.tsv` 中 `FAIL/WARN/SKIP` 行数一致、status 表头、.*个标准 step slug 各出现一次、`status`/`exit_code` 语义一致、核心 `git-metadata` 状态必须保持 `OK`，`worktree-inventory` 不得被伪造成 `SKIP`，且 `worktree_inventory_strict=true` 下 `worktree-inventory` 状态为 `OK` 时不得在 `worktree-inventory.md` 中出现非零 `Other` 分组或 strict failure marker，`worktree-inventory` strict failure 必须在 `worktree-inventory.md` 中保留非零 `Other` 分组和 strict failure marker、manifest include 模式与 `status.tsv` 一致，强制步骤不得被伪造成 `SKIP` 或 `WARN`，显式关闭步骤的 `SKIP` detail 不得伪装成环境未配置，每个标准 step 的 `log_file` 匹配固定证据文件名和 status 引用文件' \
   docs/SECURITY_BOUNDARY.md
 
 assert_match \
@@ -8194,7 +21379,7 @@ assert_match \
 
 assert_match \
   "roadmap must record release evidence structure verification" \
-  '核心证据存在，拒绝 `git-status.txt` / `git-diff-stat.txt` / `worktree-inventory.md` 控制字符，校验 summary/manifest metadata 一致性与格式、实际 verifier 目录名和 `summary.md` 的 `evidence_dir` 末段都必须匹配 `run_id`、summary marker、`## Steps` 的状态/slug 与 `status.tsv` 一一对应、summary 三项计数与 `status.tsv` 中 `FAIL/WARN/SKIP` 行数一致、status 表头、14 个标准 step slug 各出现一次、`status`/`exit_code` 语义一致、每个标准 step 的 `log_file` 必须匹配固定证据文件名和 status 引用文件' \
+  '核心证据存在，拒绝 `git-status.txt` / `git-diff-stat.txt` / `worktree-inventory.md` 控制字符，校验 summary/manifest metadata 一致性与格式、实际 verifier 目录名和 `summary.md` 的 `evidence_dir` 末段都必须匹配 `run_id`、summary marker、`## Steps` 的状态/slug 与 `status.tsv` 一一对应、summary 三项计数与 `status.tsv` 中 `FAIL/WARN/SKIP` 行数一致、status 表头、当前标准 step slug 各出现一次、`status`/`exit_code` 语义一致、每个标准 step 的 `log_file` 必须匹配固定证据文件名和 status 引用文件' \
   docs/REFACTOR_ROADMAP.md
 
 assert_match \
@@ -8251,7 +21436,7 @@ assert_match \
 
 assert_match \
   "handoff must record release evidence structure verification closure" \
-  '核心证据文件、拒绝 `git-status.txt` / `git-diff-stat.txt` / `worktree-inventory.md` 控制字符、校验 summary/manifest metadata 一致性与格式、实际 verifier 目录名和 `summary.md` 的 `evidence_dir` 末段都必须匹配 `run_id`、summary marker、`## Steps` 的状态/slug 与 `status.tsv` 一一对应、summary 三项计数与 `status.tsv` 中 `FAIL/WARN/SKIP` 行数一致、status 表头、14 个标准 step slug 各出现一次、`status`/`exit_code` 语义一致、每个标准 step 的 `log_file` 必须匹配固定证据文件名和 status 引用文件' \
+  '核心证据文件、拒绝 `git-status.txt` / `git-diff-stat.txt` / `worktree-inventory.md` 控制字符、校验 summary/manifest metadata 一致性与格式、实际 verifier 目录名和 `summary.md` 的 `evidence_dir` 末段都必须匹配 `run_id`、summary marker、`## Steps` 的状态/slug 与 `status.tsv` 一一对应、summary 三项计数与 `status.tsv` 中 `FAIL/WARN/SKIP` 行数一致、status 表头、当前标准 step slug 各出现一次、`status`/`exit_code` 语义一致、每个标准 step 的 `log_file` 必须匹配固定证据文件名和 status 引用文件' \
   docs/CODEX_HANDOFF.md
 
 assert_match \
@@ -8352,6 +21537,16 @@ assert_match \
 assert_match \
   "worktree inventory must classify scanstat module tests with analysis changes" \
   'backend-spring/src/test/java/com/sourcelens/module/scanstat/\*' \
+  scripts/worktree-inventory.sh
+
+assert_match \
+  "worktree inventory must classify code chunk embedding model migration with analysis changes" \
+  'backend-spring/src/main/resources/db/migration/V029__\*' \
+  scripts/worktree-inventory.sh
+
+assert_match \
+  "worktree inventory must classify AnalyzerRunner regression tests with analysis changes" \
+  'backend-spring/src/test/java/com/sourcelens/AnalyzerRunnerTest\.java' \
   scripts/worktree-inventory.sh
 
 assert_match \
@@ -8645,6 +21840,16 @@ assert_match \
   scripts/backup-restore-preflight.sh
 
 assert_match \
+  "backup preflight must support Docker MySQL toolchain executor" \
+  'SOURCELENS_BACKUP_TOOLCHAIN_EXECUTOR.*docker:<container>' \
+  scripts/backup-restore-preflight.sh
+
+assert_match \
+  "backup preflight Docker executor must validate safe container names" \
+  'is_safe_docker_container_name' \
+  scripts/backup-restore-preflight.sh
+
+assert_match \
   "backup preflight must require tar for artifact/workspace backup" \
   'require_cmd tar "workspace and artifact backup"' \
   scripts/backup-restore-preflight.sh
@@ -8925,6 +22130,103 @@ assert_match \
   'restore_drill_completed_at is older than SOURCELENS_BACKUP_RESTORE_DRILL_MAX_AGE_DAYS' \
   scripts/backup-restore-preflight.sh
 
+backup_drill_long_id_probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/sourcelens-backup-drill-long-id-probe.XXXXXX")" \
+  || fail "could not create backup drill long id probe dir"
+backup_drill_long_id_failure=""
+(
+  cd "$backup_drill_long_id_probe_dir"
+  backup_id="backup-$(printf 'a%.0s' {1..121})"
+  backup_dir="${backup_drill_long_id_probe_dir}/backups"
+  evidence_file="${backup_drill_long_id_probe_dir}/restore-drill.env"
+  fake_bin="${backup_drill_long_id_probe_dir}/bin"
+  mkdir -p "$backup_dir" workspace-dir artifacts-dir "$fake_bin"
+  chmod 700 "$backup_drill_long_id_probe_dir" "$backup_dir" "$fake_bin"
+  printf 'CREATE TABLE source_lens_probe (id INT PRIMARY KEY);\nINSERT INTO source_lens_probe VALUES (1);\n' > database.sql
+  gzip -c database.sql > "${backup_dir}/${backup_id}-database.sql.gz"
+  printf 'workspace\n' > workspace-dir/file.txt
+  tar -czf "${backup_dir}/${backup_id}-workspace.tar.gz" -C workspace-dir .
+  printf 'artifact\n' > artifacts-dir/artifact.txt
+  tar -czf "${backup_dir}/${backup_id}-artifacts.tar.gz" -C artifacts-dir .
+  (
+    cd "$backup_dir"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "${backup_id}-database.sql.gz" "${backup_id}-workspace.tar.gz" "${backup_id}-artifacts.tar.gz"
+    elif command -v openssl >/dev/null 2>&1; then
+      for file in "${backup_id}-database.sql.gz" "${backup_id}-workspace.tar.gz" "${backup_id}-artifacts.tar.gz"; do
+        printf '%s  %s\n' "$(openssl dgst -sha256 "$file" | awk '{print tolower($2)}')" "$file"
+      done
+    elif command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 "${backup_id}-database.sql.gz" "${backup_id}-workspace.tar.gz" "${backup_id}-artifacts.tar.gz"
+    else
+      fail "sha256sum, openssl or shasum is required for backup drill long id probe"
+    fi
+  ) > "${backup_dir}/${backup_id}-checksums.sha256"
+  chmod 600 "${backup_dir}"/*
+  cat > "${fake_bin}/docker" <<'FAKE_DOCKER'
+#!/usr/bin/env bash
+set -euo pipefail
+capture_file="${SOURCELENS_FAKE_DOCKER_CAPTURE:?}"
+if [[ "${1:-}" == "inspect" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" != "exec" ]]; then
+  echo "unexpected fake docker command: $*" >&2
+  exit 2
+fi
+shift
+if [[ "${1:-}" == "-i" ]]; then
+  shift
+fi
+container="${1:-}"
+shift || true
+args="$*"
+last="${@: -1}"
+if [[ "$args" == *'test -n "$MYSQL_ROOT_PASSWORD"'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *"CREATE DATABASE"* ]]; then
+  db_name="$(printf '%s\n' "$last" | sed -n 's/.*CREATE DATABASE `\([^`]*\)`.*/\1/p')"
+  printf 'create_db=%s\n' "$db_name" >> "$capture_file"
+  if (( ${#db_name} > 64 )); then
+    echo "identifier too long: $db_name" >&2
+    exit 1
+  fi
+  exit 0
+fi
+if [[ "$args" == *"SELECT COUNT(*) FROM information_schema.tables"* ]]; then
+  printf '1\n'
+  exit 0
+fi
+if [[ "$args" == *'mysql -uroot "$1"'* ]]; then
+  printf 'restore_db=%s\n' "$last" >> "$capture_file"
+  cat >/dev/null
+  exit 0
+fi
+if [[ "$args" == *"DROP DATABASE IF EXISTS"* ]]; then
+  exit 0
+fi
+echo "unexpected fake docker exec args for $container: $args" >&2
+exit 2
+FAKE_DOCKER
+  chmod 700 "${fake_bin}/docker"
+  SOURCELENS_BACKUP_DIR="$backup_dir" \
+  SOURCELENS_BACKUP_DRILL_BACKUP_ID="$backup_id" \
+  SOURCELENS_BACKUP_DRILL_EVIDENCE_FILE="$evidence_file" \
+  SOURCELENS_BACKUP_DRILL_MYSQL_CONTAINER=sourcelens-mysql \
+  SOURCELENS_FAKE_DOCKER_CAPTURE="${backup_drill_long_id_probe_dir}/docker-capture.env" \
+  PATH="${fake_bin}:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+    "$ROOT_DIR/scripts/backup-restore-drill.sh" >/tmp/sourcelens-backup-drill-long-id-probe.log 2>&1
+  scratch_db="$(awk -F= '/^create_db=/{print $2; exit}' "${backup_drill_long_id_probe_dir}/docker-capture.env")"
+  [[ -n "$scratch_db" ]] || fail "backup drill long id probe did not capture scratch database name"
+  (( ${#scratch_db} <= 64 )) || fail "backup drill long id probe produced scratch database longer than 64 characters: $scratch_db"
+  [[ "$scratch_db" =~ ^sourcelens_drill_[a-f0-9]{16}_[0-9]+_[0-9]+$ ]] \
+    || fail "backup drill long id probe produced unexpected scratch database name: $scratch_db"
+  grep -Fx "backup_id=$backup_id" "$evidence_file" >/dev/null \
+    || fail "backup drill long id probe did not preserve full backup_id in evidence"
+) || backup_drill_long_id_failure="backup restore drill long backup_id probe failed; see /tmp/sourcelens-backup-drill-long-id-probe.log"
+rm -rf "$backup_drill_long_id_probe_dir"
+[[ -z "$backup_drill_long_id_failure" ]] || fail "$backup_drill_long_id_failure"
+
 assert_match \
   "env example must define a production backup directory" \
   '^SOURCELENS_BACKUP_DIR=/var/backups/sourcelens' \
@@ -9006,6 +22308,26 @@ assert_match \
   scripts/backup-restore-drill.sh
 
 assert_match \
+  "backup restore drill must derive scratch database names from a bounded backup id hash" \
+  '^scratch_database_name_for_backup_id\(\)' \
+  scripts/backup-restore-drill.sh
+
+assert_match \
+  "backup restore drill must hash backup id before scratch database naming" \
+  'sha256_text "\$backup_id" \| cut -c1-16' \
+  scripts/backup-restore-drill.sh
+
+assert_match \
+  "backup restore drill must enforce MySQL scratch database identifier length" \
+  'generated scratch database name exceeds MySQL 64 character identifier limit' \
+  scripts/backup-restore-drill.sh
+
+assert_no_match \
+  "backup restore drill must not concatenate raw backup id into scratch database name" \
+  'SCRATCH_DB="sourcelens_drill_\$\{backup_id' \
+  scripts/backup-restore-drill.sh
+
+assert_match \
   "backup restore drill must use docker exec mysql for scratch restore" \
   'docker exec -i "\$MYSQL_CONTAINER".*mysql -uroot "\$1"' \
   scripts/backup-restore-drill.sh
@@ -9043,6 +22365,11 @@ assert_match \
 assert_match \
   "operations runbook must document scratch database restore" \
   'Docker MySQL 临时 scratch database' \
+  docs/OPERATIONS_RUNBOOK.md
+
+assert_match \
+  "operations runbook must document hashed bounded scratch database naming" \
+  'scratch database 名使用 backup id 的短 SHA-256 派生' \
   docs/OPERATIONS_RUNBOOK.md
 
 assert_match \
@@ -9601,6 +22928,91 @@ assert_match \
   docs/PHASE12_BASELINE.md
 
 assert_match \
+  "code chunk ranker must recognize endpoint questions as controller intent" \
+  'tokens\.contains\("endpoint"\)' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkRanker.java
+
+assert_match \
+  "code chunk ranker must recognize Chinese interface questions as controller intent" \
+  'input\.contains\("接口"\)' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkRanker.java
+
+assert_match \
+  "code chunk ranker must recognize Chinese route questions as controller intent" \
+  'input\.contains\("路由"\)' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkRanker.java
+
+assert_match \
+  "code chunk ranker must suppress frontend route questions from controller intent" \
+  'input\.contains\("前端"\)' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkRanker.java
+
+assert_match \
+  "code chunk service tests must cover natural endpoint controller retrieval" \
+  'searchChunks_shouldTreatEndpointAsControllerIntentWhenKeywordPoolMissesController' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "code chunk service tests must cover Chinese interface controller retrieval" \
+  'searchChunks_shouldTreatChineseInterfaceAsControllerIntent' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "code chunk service tests must cover frontend route negative intent" \
+  'roleIntentTypes_shouldNotTreatFrontendRoutesAsControllerIntent' \
+  backend-spring/src/test/java/com/sourcelens/CodeChunkServiceTest.java
+
+assert_match \
+  "code QA retrieval tests must cover natural endpoint controller evidence" \
+  'selectTopChunks_shouldTreatNaturalEndpointQuestionAsControllerEvidence' \
+  backend-spring/src/test/java/com/sourcelens/CodeQaRetrievalServiceTest.java
+
+assert_match \
+  "code QA retrieval tests must cover Chinese interface controller evidence" \
+  'selectTopChunks_shouldTreatChineseInterfaceQuestionAsControllerEvidence' \
+  backend-spring/src/test/java/com/sourcelens/CodeQaRetrievalServiceTest.java
+
+assert_match \
+  "public repo smoke must include Chinese natural endpoint role probe" \
+  '"naturalEndpointCn"' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke natural endpoint probe must use stable generic Chinese interface query" \
+  '"业务接口"' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke Chinese natural endpoint probe must expect controller evidence" \
+  '"naturalEndpointCn",[[:space:]]*"业务接口",[[:space:]]*"CONTROLLER"' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke Chinese natural endpoint probe must use controller fallback evidence boundary" \
+  '"naturalEndpointCn",[[:space:]]*"业务接口",[[:space:]]*"CONTROLLER",[[:space:]]*controller_fallback_reason' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke must include English natural endpoint role probe" \
+  '"naturalEndpointEn"' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke natural endpoint probe must use stable generic English endpoint query" \
+  '"business endpoint"' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke English natural endpoint probe must expect controller evidence" \
+  '"naturalEndpointEn",[[:space:]]*"business endpoint",[[:space:]]*"CONTROLLER"' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
+  "public repo smoke English natural endpoint probe must use controller fallback evidence boundary" \
+  '"naturalEndpointEn",[[:space:]]*"business endpoint",[[:space:]]*"CONTROLLER",[[:space:]]*controller_fallback_reason' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
   "operations runbook must document phase12 env file input" \
   'SOURCELENS_PHASE12_BASELINE_ENV_FILE=/path/to/prod\.env' \
   docs/OPERATIONS_RUNBOOK.md
@@ -9612,11 +23024,67 @@ assert_match \
 
 assert_ci_job_timeout security
 assert_ci_job_timeout supply-chain
+assert_ci_job_timeout release-evidence-ci
 assert_ci_job_timeout backend
 assert_ci_job_timeout llm-safety
 assert_ci_job_timeout frontend
 assert_ci_job_timeout analyzer
 assert_ci_job_timeout docker
+
+assert_match \
+  "security regression must expose progress by default" \
+  'SOURCELENS_SECURITY_REGRESSION_VERBOSE:-true' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must keep progress visible through redirected probes" \
+  'exec 9>&2' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must wrap release evidence probes with a timeout" \
+  '^run_release_evidence\(\)' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must wrap verifier probes with a timeout" \
+  '^run_verify_release_evidence\(\)' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must wrap node probe scripts with a timeout" \
+  '^run_security_node\(\)' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must expose an explicit fail-closed suite selector" \
+  'SOURCELENS_SECURITY_REGRESSION_SUITE' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression suite selector must keep full as the default" \
+  'SOURCELENS_SECURITY_REGRESSION_SUITE:-full' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression suite selector must reject unknown suites" \
+  'must be one of: \$\(security_suite_names\)' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression timeout wrapper must fail closed on timeout exit" \
+  'SECURITY CHECK TIMEOUT:' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release evidence must prefer local Playwright binary for availability probes" \
+  'web-console/node_modules/\.bin/playwright' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence Playwright availability fallback must be timeout bounded" \
+  'SOURCELENS_RELEASE_EVIDENCE_PLAYWRIGHT_VERSION_TIMEOUT_SECONDS' \
+  scripts/release-evidence.sh
 
 assert_match \
   "CI workflow must keep GitHub token permissions read-only" \
@@ -9630,6 +23098,131 @@ assert_match \
   'cancel-in-progress:[[:space:]]*true' \
   .github/workflows/ci.yml
 
+assert_match \
+  "CI security job must run security regression as an explicit suite matrix" \
+  'SOURCELENS_SECURITY_REGRESSION_SUITE="\$\{\{ matrix\.suite \}\}"' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI security suite matrix must include split public repo marker checks" \
+  'release-verifier-public-repo-marker' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI security suite matrix must include split public repo UI marker checks" \
+  'release-verifier-public-repo-ui-marker' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI security suite matrix must include split AutoRepair UI marker checks" \
+  'release-verifier-autorepair-ui-marker' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI security suite matrix must include split Dashboard UI marker checks" \
+  'release-verifier-dashboard-ui-marker' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI security suite matrix must include split report evidence marker checks" \
+  'release-verifier-report-evidence-marker' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI security suite matrix must include split scan governance marker checks" \
+  'release-verifier-scan-governance-marker' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI security suite matrix must include split AgentChat closure marker checks" \
+  'release-verifier-agent-chat-marker' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI security suite matrix must include split Artifacts marker checks" \
+  'release-verifier-artifacts-marker' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "Makefile must expose suite-selectable security regression checks" \
+  'SOURCELENS_SECURITY_REGRESSION_SUITE="\$\(SUITE\)"' \
+  Makefile
+
+assert_match \
+  "Makefile must expose split public repo marker security regression checks" \
+  'security-regression-release-verifier-public-repo-marker' \
+  Makefile
+
+assert_match \
+  "Makefile must expose split public repo UI marker security regression checks" \
+  'security-regression-release-verifier-public-repo-ui-marker' \
+  Makefile
+
+assert_match \
+  "Makefile must expose split AutoRepair UI marker security regression checks" \
+  'security-regression-release-verifier-autorepair-ui-marker' \
+  Makefile
+
+assert_match \
+  "Makefile must expose split Dashboard UI marker security regression checks" \
+  'security-regression-release-verifier-dashboard-ui-marker' \
+  Makefile
+
+assert_match \
+  "Makefile must expose split report evidence marker security regression checks" \
+  'security-regression-release-verifier-report-evidence-marker' \
+  Makefile
+
+assert_match \
+  "Makefile must expose split scan governance marker security regression checks" \
+  'security-regression-release-verifier-scan-governance-marker' \
+  Makefile
+
+assert_match \
+  "Makefile must expose split AgentChat closure marker security regression checks" \
+  'security-regression-release-verifier-agent-chat-marker' \
+  Makefile
+
+assert_match \
+  "Makefile must expose split Artifacts marker security regression checks" \
+  'security-regression-release-verifier-artifacts-marker' \
+  Makefile
+
+assert_match \
+  "release evidence must expose AgentChat closure rail include mode" \
+  'SOURCELENS_RELEASE_EVIDENCE_INCLUDE_AGENT_CHAT_CLOSURE_RAIL_UI_SMOKE' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release verifier must validate AgentChat closure rail smoke success marker" \
+  'AGENT_CHAT_CLOSURE_RAIL_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically verify AgentChat closure marker forgery rejection" \
+  '^assert_release_verifier_rejects_agent_chat_closure_rail_marker_forgery\(\)' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "release verifier must validate optional Artifacts detail selection marker" \
+  'ARTIFACTS_DETAIL_SELECTION_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must validate optional AuditLogs artifact raw download marker" \
+  'AUDIT_LOGS_ARTIFACT_RAW_DOWNLOAD_DEEP_LINK_SMOKE_OK' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "security regression must dynamically verify Artifacts marker forgery rejection" \
+  '^assert_release_verifier_rejects_artifacts_detail_selection_marker_forgery\(\)' \
+  scripts/security-regression-check.sh
+
+assert_match \
+  "security regression must dynamically verify AuditLogs artifact marker forgery rejection" \
+  '^assert_release_verifier_rejects_audit_logs_artifact_raw_download_marker_forgery\(\)' \
+  scripts/security-regression-check.sh
+
 assert_no_match \
   "CI workflow must not use pull_request_target" \
   'pull_request_target:' \
@@ -9640,9 +23233,69 @@ assert_no_match \
   '\$\{\{[^}]*secrets(\.|\[)' \
   .github/workflows/ci.yml
 
+assert_match \
+  "CI workflow must include release evidence ci profile job" \
+  '^  release-evidence-ci:' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI release evidence job must write evidence outside the repository workspace" \
+  'SOURCELENS_RELEASE_EVIDENCE_DIR:[[:space:]]*\$\{\{ runner\.temp \}\}/release-evidence' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI release evidence job must use the public example env file" \
+  'SOURCELENS_RELEASE_EVIDENCE_ENV_FILE:[[:space:]]*deploy/\.env\.example' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI workflow must generate the ci release evidence profile through the Make target" \
+  'make release-evidence-ci' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI workflow must verify the generated ci release evidence package" \
+  'make verify-release-evidence DIR="\$\{RUN_DIR\}"' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI workflow must assert the release evidence ci manifest profile" \
+  'release_evidence_profile:[[:space:]]*ci' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI workflow must assert the release evidence ci package has zero required failures" \
+  "grep -Fx -- '- required_failures: \`0\`'" \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI workflow must assert the release evidence ci package has zero optional warnings" \
+  "grep -Fx -- '- optional_warnings: \`0\`'" \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI workflow must upload the generated ci release evidence artifact" \
+  'actions/upload-artifact@[0-9a-f]{40}' \
+  .github/workflows/ci.yml
+
+assert_match \
+  "CI release evidence artifact must have short retention" \
+  'retention-days:[[:space:]]*7' \
+  .github/workflows/ci.yml
+
+assert_no_match \
+  "ordinary CI must not run release or nightly release evidence profiles" \
+  'SOURCELENS_RELEASE_EVIDENCE_PROFILE[=:][[:space:]]*(release|nightly)|make[[:space:]]+release-evidence-(release|nightly)' \
+  .github/workflows/ci.yml
+
+assert_no_match \
+  "ordinary CI release evidence gate must not consume real environment inputs" \
+  'SOURCELENS_(BASE_URL|BACKUP_RESTORE_DRILL_EVIDENCE_FILE|ROLLBACK_PLAN_FILE|RELEASE_EVIDENCE_LLM_PROVIDER_RUN_FILE|RELEASE_EVIDENCE_LLM_RAW_OUTPUT_DIR)|GITHUB_APP_|OPENAI_API_KEY|DB_PASSWORD|MYSQL_PASSWORD' \
+  .github/workflows/ci.yml
+
 assert_match_count \
   "CI checkout steps must not persist GitHub credentials" \
-  7 \
+  8 \
   'persist-credentials:[[:space:]]*false' \
   .github/workflows/ci.yml
 
@@ -9665,7 +23318,7 @@ assert_match \
 
 assert_match_count \
   "CI workflow action uses entries must be pinned to full commit SHAs" \
-  13 \
+  17 \
   'uses:[[:space:]]*[^#[:space:]]+@[0-9a-f]{40}' \
   .github/workflows/ci.yml
 
@@ -10335,6 +23988,11 @@ assert_no_match \
   scripts/verify-all.sh
 
 assert_match \
+  "verify-all must keep daily security gate on the bounded static suite" \
+  'SOURCELENS_SECURITY_REGRESSION_SUITE=static' \
+  scripts/verify-all.sh
+
+assert_match \
   "operations runbook must document make verify whitespace checks" \
   'Shell 脚本语法检查、Git diff 空白检查、后端测试' \
   docs/OPERATIONS_RUNBOOK.md
@@ -10370,6 +24028,56 @@ assert_match \
   Makefile
 
 assert_match \
+  "backend jar dev runner must copy the jar outside target before execution" \
+  'prepare_runtime_jar' \
+  scripts/run-backend-jar-dev.sh
+
+assert_match \
+  "backend jar dev runner must not use a non-portable mktemp suffix pattern" \
+  'mktemp "\$RUNTIME_DIR/source-lens-backend\.XXXXXX"' \
+  scripts/run-backend-jar-dev.sh
+
+assert_match \
+  "backend jar dev runner must copy source jar into runtime jar" \
+  'cp "\$source_jar" "\$runtime_jar"' \
+  scripts/run-backend-jar-dev.sh
+
+assert_match \
+  "backend jar dev runner must make runtime jar private" \
+  'chmod 600 "\$runtime_jar"' \
+  scripts/run-backend-jar-dev.sh
+
+assert_match \
+  "backend jar dev runner must launch the stable runtime jar copy" \
+  'exec java -jar "\$RUNTIME_JAR_FILE"' \
+  scripts/run-backend-jar-dev.sh
+
+assert_match \
+  "backend jar dev runner must reject stale target jar listeners explicitly" \
+  'unsafe target jar runtime' \
+  scripts/run-backend-jar-dev.sh
+
+assert_match \
+  "runtime jar directory must be ignored by git" \
+  '^\.sourcelens-runtime/' \
+  .gitignore
+
+assert_match \
+  "runtime jar directory must be excluded from docker build context" \
+  '^\.sourcelens-runtime/' \
+  .dockerignore
+
+assert_match \
+  "Makefile backend-jar help must document stable release evidence runtime" \
+  'backend-jar:.*release evidence.*Maven clean.*target jar' \
+  Makefile
+
+assert_match \
+  "backend jar port conflict help must warn against target runtimes for release evidence" \
+  'release evidence.*target/classes.*backend-spring/target/\*\.jar' \
+  scripts/run-backend-jar-dev.sh
+
+assert_match \
   "production preflight must support warn-only mode" \
   'SOURCELENS_PREFLIGHT_WARN_ONLY' \
   scripts/production-preflight.sh
@@ -10382,6 +24090,11 @@ assert_match \
 assert_match \
   "production preflight must reject invalid GitHub App readiness mode values" \
   'validate_bool_mode SOURCELENS_PREFLIGHT_REQUIRE_GITHUB_APP "\$REQUIRE_GITHUB_APP"' \
+  scripts/production-preflight.sh
+
+assert_match \
+  "production preflight must reject invalid static gate mode values" \
+  'validate_bool_mode SOURCELENS_PREFLIGHT_INCLUDE_STATIC_GATES "\$INCLUDE_STATIC_GATES"' \
   scripts/production-preflight.sh
 
 assert_match \
@@ -10644,6 +24357,11 @@ assert_match \
 assert_match \
   "production preflight must run LLM safety regression gate" \
   'llm-safety-regression\.sh' \
+  scripts/production-preflight.sh
+
+assert_match \
+  "production preflight must document static gate skip as warn-only evidence" \
+  'Static release gates skipped by SOURCELENS_PREFLIGHT_INCLUDE_STATIC_GATES=false' \
   scripts/production-preflight.sh
 
 assert_match \
@@ -11509,6 +25227,101 @@ assert_match \
   backend-spring/src/main/java/com/sourcelens/module/repository/service/GitHubPullRequestService.java
 
 assert_match \
+  "Scan task creation must validate requested branches before persistence" \
+  'RepositoryUrlPolicy\.validateBranch\(' \
+  backend-spring/src/main/java/com/sourcelens/module/scantask/service/ScanTaskService.java
+
+assert_match \
+  "Scan task tests must reject invalid branches before persistence" \
+  'create_shouldRejectInvalidBranchBeforePersistingTask' \
+  backend-spring/src/test/java/com/sourcelens/ScanTaskServiceTest.java
+
+assert_match \
+  "GitService must bind local file execution to the repository allow-local-file config" \
+  'sourcelens\.repository\.allow-local-file:false' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService must validate repository URLs with the local file config at execution time" \
+  'parseAndValidate\(repoUrl, allowLocalFileRepositories\)' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService native git command must disable credential helpers" \
+  'credential\.helper=' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService native git command must pin non-interactive askpass" \
+  'core\.askPass=/bin/false' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService native git must use ProcessBuilder argument arrays" \
+  'new ProcessBuilder\(buildNativeGitCloneCommand' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_no_match \
+  "GitService native git must not invoke a shell wrapper" \
+  'new ProcessBuilder\([^)]*"(sh|bash|cmd|powershell)"' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService native git must disable terminal prompts" \
+  'GIT_TERMINAL_PROMPT' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService native git must disable askpass prompts" \
+  'GIT_ASKPASS' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService native git must disable Git Credential Manager interaction" \
+  'GCM_INTERACTIVE' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService native git must ignore system git config" \
+  'GIT_CONFIG_NOSYSTEM' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService native git must isolate global git config" \
+  'GIT_CONFIG_GLOBAL' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService must sanitize git errors before propagation" \
+  'SensitiveDataSanitizer\.sanitizeAndTruncate' \
+  backend-spring/src/main/java/com/sourcelens/module/repository/service/GitService.java
+
+assert_match \
+  "GitService tests must cover missing git CLI error messaging" \
+  'runNativeGitClone_shouldReportActionableErrorWhenGitCliIsMissing' \
+  backend-spring/src/test/java/com/sourcelens/module/repository/service/GitServiceTest.java
+
+assert_match \
+  "GitService tests must cover native git ambient credential isolation" \
+  'applyNativeGitEnvironment_shouldDisableAmbientCredentialsAndGlobalConfig' \
+  backend-spring/src/test/java/com/sourcelens/module/repository/service/GitServiceTest.java
+
+assert_match \
+  "GitService tests must cover git error sanitization" \
+  'sanitizeGitError_shouldRedactCredentialsBeforePropagation' \
+  backend-spring/src/test/java/com/sourcelens/module/repository/service/GitServiceTest.java
+
+assert_match \
+  "production preflight must check git for GitService public repo clone runtime dependency" \
+  'git is required for GitService anonymous GitHub clone runtime dependency and public repo smoke' \
+  scripts/production-preflight.sh
+
+assert_match \
+  "public repo smoke must fail fast when git is missing" \
+  'PUBLIC_REPO_SMOKE_FAIL: git is required for GitService anonymous GitHub public repo clone' \
+  scripts/public-repo-analysis-smoke.sh
+
+assert_match \
   "GitHub Pull Request service must map permission failures to forbidden" \
   'statusCode == 401 \|\| statusCode == 403' \
   backend-spring/src/main/java/com/sourcelens/module/repository/service/GitHubPullRequestService.java
@@ -11609,6 +25422,101 @@ assert_match \
   backend-spring/src/test/java/com/sourcelens/AutoRepairServiceTest.java
 
 assert_match \
+  "AutoRepair async PR execution must revalidate runtime boundary before token access" \
+  'validateSubmitPrRuntimeBeforeToken\(repair\)' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair async PR preflight must run before repository token decryption" \
+  'Repository repo = validateSubmitPrRuntimeBeforeToken\(repair\);' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair async PR preflight rejections must use rejected audit action" \
+  'AUTO_REPAIR_PR_REJECTED' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair async PR tests must reject disabled submit-pr flag before token access" \
+  'executeSubmitPrAsync_shouldFailClosedWhenSubmitPrDisabledBeforeToken' \
+  backend-spring/src/test/java/com/sourcelens/AutoRepairServiceTest.java
+
+assert_match \
+  "AutoRepair async PR tests must reject auth drift before token access" \
+  'executeSubmitPrAsync_shouldFailClosedWhenRepositoryAuthDriftsToPatBeforeToken' \
+  backend-spring/src/test/java/com/sourcelens/AutoRepairServiceTest.java
+
+assert_match \
+  "AutoRepair async PR tests must reject patch evidence drift before token access" \
+  'executeSubmitPrAsync_shouldFailClosedWhenPatchReadyAuditDisappearsBeforeToken' \
+  backend-spring/src/test/java/com/sourcelens/AutoRepairServiceTest.java
+
+assert_match \
+  "AutoRepair submit-pr must start a separate PR execution attempt" \
+  'startPrExecutionAttempt\(executionTaskId\)' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair async PR must reuse current PR execution attempt" \
+  'getOrCreatePrExecutionAttempt\(executionTaskId\)' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair async PR steps must be attempt-scoped" \
+  'startExecutionAttemptStep\(prAttemptId, stepKey, stepName\)' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair async PR success must mark only the PR attempt" \
+  'markExecutionAttemptSuccess\(prAttemptId, "create_pull_request"\)' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair async PR failure must mark only the PR attempt" \
+  'markExecutionAttemptFailed\(prAttemptId, currentStep\.get\(\), e\.getMessage\(\)\)' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair PR retry tests must prove failed PR attempts do not invalidate patch evidence" \
+  'submitPr_enabled_shouldRetryAfterFailedPrAttemptUsingOldPatchEvidence' \
+  backend-spring/src/test/java/com/sourcelens/AutoRepairServiceTest.java
+
+assert_match \
+  "AutoRepair records must persist source scan task id for report-origin repair candidates" \
+  'ADD COLUMN `scan_task_id` BIGINT DEFAULT NULL' \
+  backend-spring/src/main/resources/db/migration/V030__add_auto_repair_scan_task_id.sql
+
+assert_match \
+  "AutoRepair service must validate source scan tasks before creating report-origin repair candidates" \
+  'validateSourceScanTask\(projectId, req\.getRepositoryId\(\), req\.getScanTaskId\(\)\)' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair candidate receipt must write a server-derived repair evidence gate" \
+  'putServerDerivedRepairEvidenceGate\(provenance\)' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair candidate receipt must mark repair evidence gate source as server derived" \
+  'repairEvidenceGateSource", "SERVER_DERIVED"' \
+  backend-spring/src/main/java/com/sourcelens/module/autorepair/service/AutoRepairService.java
+
+assert_match \
+  "AutoRepair service tests must reject unfinished source scans" \
+  'createRepairTask_withUnfinishedSourceScan_shouldReject' \
+  backend-spring/src/test/java/com/sourcelens/AutoRepairServiceTest.java
+
+assert_match \
+  "AutoRepair service tests must prove file-only QA provenance is REVIEW not READY" \
+  'createRepairTask_withFileOnlyQaCitationProvenance_shouldAuditReviewGate' \
+  backend-spring/src/test/java/com/sourcelens/AutoRepairServiceTest.java
+
+assert_match \
+  "AutoRepair controller tests must preserve scanTaskId request binding and response" \
+  'createRepair_shouldBindScanTaskIdReturnItAndStartAsyncExecution' \
+  backend-spring/src/test/java/com/sourcelens/AutoRepairControllerTest.java
+
+assert_match \
   "GitHub webhook delivery tests must cover duplicate claim handling" \
   'claimProcessing_shouldReturnFalseForDuplicateDeliveryId' \
   backend-spring/src/test/java/com/sourcelens/GitHubWebhookDeliveryServiceTest.java
@@ -11645,12 +25553,87 @@ assert_match \
 
 assert_match \
   "Docker sandbox executor must clear image entrypoints before user commands" \
-  'dockerCommand\.add\("--entrypoint"\)' \
+  'dockerCommand\.add\("--entrypoint="\)' \
   backend-spring/src/main/java/com/sourcelens/module/sandbox/DockerSandboxExecutor.java
 
 assert_match \
   "Docker sandbox executor tests must assert cleared image entrypoint" \
-  '"--entrypoint", ""' \
+  '"--entrypoint="' \
+  backend-spring/src/test/java/com/sourcelens/DockerSandboxExecutorTest.java
+
+assert_no_match \
+  "Docker sandbox executor must not emit a blank entrypoint argument that local validation rejects" \
+  'dockerCommand\.add\(""\)' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/DockerSandboxExecutor.java
+
+assert_match \
+  "Docker sandbox executor must route HOME inside workspace" \
+  'HOME", "/workspace/\.sourcelens-home"' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/DockerSandboxExecutor.java
+
+assert_match \
+  "Docker sandbox executor must route Maven cache inside workspace" \
+  'MAVEN_CONFIG", "/workspace/\.sourcelens-cache/maven"' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/DockerSandboxExecutor.java
+
+assert_match \
+  "Docker sandbox executor must route npm cache inside workspace" \
+  'npm_config_cache", "/workspace/\.sourcelens-cache/npm"' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/DockerSandboxExecutor.java
+
+assert_match \
+  "Docker sandbox executor must route Gradle cache inside workspace" \
+  'GRADLE_USER_HOME", "/workspace/\.sourcelens-cache/gradle"' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/DockerSandboxExecutor.java
+
+assert_match \
+  "Docker sandbox executor must pass validated command environment into the container" \
+  'containerEnvironment\.forEach\(\(key, value\) -> addContainerEnvironment\(dockerCommand, key, value\)\)' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/DockerSandboxExecutor.java
+
+assert_match \
+  "Docker sandbox executor must not pass command environment to the host docker CLI" \
+  '\.environment\(Map\.of\(\)\)' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/DockerSandboxExecutor.java
+
+assert_match \
+  "Docker sandbox tests must assert build cache env routing" \
+  'execute_shouldRouteBuildToolCachesInsideWorkspace' \
+  backend-spring/src/test/java/com/sourcelens/DockerSandboxExecutorTest.java
+
+assert_match \
+  "Sandbox command validator must block shell interpreters at executor boundary" \
+  'BLOCKED_EXECUTABLES = Set\.of' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/SandboxCommandValidator.java
+
+assert_match \
+  "Sandbox command validator must reject secret-bearing environment keys" \
+  'BLOCKED_SECRET_KEY_PARTS = Set\.of' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/SandboxCommandValidator.java
+
+assert_match \
+  "Local sandbox executor must clear inherited process environment" \
+  'pb\.environment\(\)\.clear\(\)' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/LocalProcessSandboxExecutor.java
+
+assert_match \
+  "Local sandbox executor must restore only safe base environment keys" \
+  'safeBaseEnvironment\(System\.getenv\(\)\)' \
+  backend-spring/src/main/java/com/sourcelens/module/sandbox/LocalProcessSandboxExecutor.java
+
+assert_match \
+  "Local sandbox tests must reject shell interpreter commands" \
+  'execute_shouldRejectShellInterpreterCommands' \
+  backend-spring/src/test/java/com/sourcelens/LocalProcessSandboxExecutorTest.java
+
+assert_match \
+  "Local sandbox tests must reject secret environment overrides" \
+  'execute_shouldRejectSecretEnvironmentOverrides' \
+  backend-spring/src/test/java/com/sourcelens/LocalProcessSandboxExecutorTest.java
+
+assert_match \
+  "Docker sandbox tests must reject shell interpreters before docker run" \
+  'execute_shouldRejectShellInterpreterBeforeDockerRun' \
   backend-spring/src/test/java/com/sourcelens/DockerSandboxExecutorTest.java
 
 assert_match \
@@ -11763,6 +25746,26 @@ assert_match \
   scripts/sandbox-drill.sh
 
 assert_match \
+  "Docker sandbox drill must verify build cache paths stay inside workspace" \
+  'build cache path is outside workspace' \
+  scripts/sandbox-drill.sh
+
+assert_match \
+  "Docker sandbox drill must verify Maven cache write compatibility" \
+  'MAVEN_CONFIG=/workspace/\.sourcelens-cache/maven' \
+  scripts/sandbox-drill.sh
+
+assert_match \
+  "Docker sandbox drill must verify npm cache write compatibility" \
+  'npm_config_cache=/workspace/\.sourcelens-cache/npm' \
+  scripts/sandbox-drill.sh
+
+assert_match \
+  "Docker sandbox drill must verify Gradle cache write compatibility" \
+  'GRADLE_USER_HOME=/workspace/\.sourcelens-cache/gradle' \
+  scripts/sandbox-drill.sh
+
+assert_match \
   "Docker sandbox drill must verify network isolation" \
   'default network route is present' \
   scripts/sandbox-drill.sh
@@ -11788,8 +25791,231 @@ assert_match \
   backend-spring/Dockerfile
 
 assert_match \
+  "backend Docker runtime image must install git for anonymous public repo clone" \
+  'apt-get install -y --no-install-recommends git ca-certificates' \
+  backend-spring/Dockerfile
+
+assert_match \
   "backend Docker image must create a writable JGit config directory" \
   '/home/app/\.config/jgit' \
   backend-spring/Dockerfile
 
+assert_match \
+  "AnalyzerRunner must start async stdout draining before waiting for exit" \
+  'CompletableFuture<StreamCapture> stdoutFuture' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/AnalyzerRunner.java
+
+assert_match \
+  "AnalyzerRunner must fail explicitly when analyzer stdout exceeds retention cap" \
+  'Rust Analyzer stdout 超出上限' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/AnalyzerRunner.java
+
+assert_match \
+  "AnalyzerRunner tests must cover valid analyzer stdout larger than the legacy 4MB limit" \
+  'scan_shouldParseStdoutLargerThanLegacyLimit' \
+  backend-spring/src/test/java/com/sourcelens/AnalyzerRunnerTest.java
+
+assert_match \
+  "AnalyzerRunner must enforce timeout with process waitFor before collecting output" \
+  'process\.waitFor\(timeoutSeconds, TimeUnit\.SECONDS\)' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/AnalyzerRunner.java
+
+assert_match \
+  "AnalyzerRunner stream reader must drain to EOF after retention cap" \
+  'while \(\(read = stream\.read\(buffer\)\) != -1\)' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/AnalyzerRunner.java
+
+assert_match \
+  "AnalyzerRunner must log stderr summary instead of raw stderr" \
+  'stderrSummary' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/AnalyzerRunner.java
+
+assert_match \
+  "AnalyzerRunner tests must cover large stderr without blocking stdout JSON" \
+  'scan_shouldDrainLargeStderrWithoutBlockingStdoutJson' \
+  backend-spring/src/test/java/com/sourcelens/AnalyzerRunnerTest.java
+
+assert_match \
+  "code_chunks migration must track embedding model keys" \
+  'ADD COLUMN `embedding_model` VARCHAR\(128\)' \
+  backend-spring/src/main/resources/db/migration/V029__add_code_chunk_embedding_model.sql
+
+assert_match \
+  "CodeChunk mapper must persist embedding model keys" \
+  'embedding_model' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/mapper/CodeChunkMapper.java
+
+assert_match \
+  "CodeChunkService must reuse embeddings only for the active embedding model" \
+  'loadReusableEmbeddings\(scanTaskId, embeddingModelKey\)' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkService.java
+
+assert_match \
+  "CodeChunkService must recompute stale embeddings from a different model" \
+  'ne\(CodeChunk::getEmbeddingModel, embeddingModelKey\)' \
+  backend-spring/src/main/java/com/sourcelens/module/analysis/service/CodeChunkService.java
+
+assert_match \
+  "CodeQaRetrievalService must ignore embeddings from a different model key" \
+  'embeddingModelKey\.equals\(chunk\.getEmbeddingModel\(\)\)' \
+  backend-spring/src/main/java/com/sourcelens/module/agent/service/CodeQaRetrievalService.java
+
+assert_match \
+  "Code QA tests must cover embedding model mismatch ranking" \
+  'selectTopChunks_shouldIgnoreEmbeddingsFromDifferentModelKey' \
+  backend-spring/src/test/java/com/sourcelens/CodeQaRetrievalServiceTest.java
+
+assert_match \
+  "release evidence release/nightly verifier must require public_repo_smoke_ui manifest field presence" \
+  'public_repo_smoke_ui_manifest_present' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence release/nightly verifier must require public repo report evidence QA citation manifest field presence" \
+  'public_repo_report_evidence_qa_citation_manifest_present' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence must force public repo smoke cleanup for mutating release profiles" \
+  'SOURCELENS_PUBLIC_REPO_SMOKE_CLEANUP="\$\(public_repo_smoke_cleanup_value\)"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must pass report evidence QA citation mode into public repo smoke" \
+  'SOURCELENS_PUBLIC_REPO_SMOKE_REPORT_EVIDENCE_QA_CITATION="\$\(normalize_config_value "\$PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION"\)"' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence manifest must record public repo report evidence QA citation mode" \
+  'public_repo_report_evidence_qa_citation: %s' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release verifier must require report evidence QA citation marker when release manifest enables it" \
+  'PUBLIC_REPO_SMOKE_OK reportEvidenceQaCitationQuality must be present when public_repo_report_evidence_qa_citation=true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require Code QA raw chunk content absence marker" \
+  'rawRetrievedChunkContentAbsent === true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require claim noise raw chunk content absence marker" \
+  'assertRawRetrievedChunkContentAbsent\(boundary, "PUBLIC_REPO_SMOKE_OK codeQa\.claimCitationNoiseBoundary"\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must require report evidence QA raw chunk content absence sample count" \
+  'rawRetrievedChunkContentAbsentSampleCount === value\.sampleCount' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must validate semantic weak keyword probe when marker is present" \
+  'validateSemanticWeakKeywordProbe\(payload\.semanticWeakKeywordProbe, payload\)' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release evidence release/nightly verifier must hard require public repo report evidence QA citation mode" \
+  'public_repo_report_evidence_qa_citation "\$MANIFEST_PUBLIC_REPO_REPORT_EVIDENCE_QA_CITATION" true' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "release verifier must match the real backend AutoRepair patch smoke fixture target" \
+  'const targetFile = "src/main/java/demo/LargeController\.java";' \
+  scripts/verify-release-evidence.sh
+
+assert_match \
+  "AutoRepair patch smoke must emit the verifier target fixture" \
+  'TARGET_FILE = "src/main/java/demo/LargeController\.java"' \
+  scripts/autorepair-patch-smoke.sh
+
+assert_match \
+  "release evidence cleanup helper must enable cleanup for release and nightly profiles" \
+  'public_repo_smoke_cleanup_value\(\)' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence cleanup helper must return true for mutating profiles" \
+  'printf '\''true\\n'\''' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must validate non-local mutating target boundaries before creating evidence output" \
+  'validate_mutating_target_boundary' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must validate loopback backend runtime before creating evidence output" \
+  'validate_loopback_backend_runtime_boundary' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence loopback runtime guard must reject target classes runtimes" \
+  'backend-spring/target/classes' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence loopback runtime guard must reject target jar runtimes" \
+  'backend-spring/target/' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence loopback runtime guard must reject Maven spring-boot run runtimes" \
+  'spring-boot:run' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence loopback runtime guard must recommend stable runtime jar copy" \
+  '\.sourcelens-runtime/backend' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence loopback runtime guard must recommend backend-jar" \
+  'SERVER_PORT=\$port make backend-jar' \
+  scripts/release-evidence.sh
+
+assert_release_evidence_loopback_runtime_guard_runs_before_init_output
+
+assert_match \
+  "release evidence must require explicit production mutation acknowledgement" \
+  'SOURCELENS_RELEASE_EVIDENCE_ALLOW_MUTATING_PROD=true' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must require explicit external drill acknowledgement outside local profile" \
+  'SOURCELENS_RELEASE_EVIDENCE_ALLOW_EXTERNAL_DRILLS=true is required to run auto GitHub App drill outside local profile' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "release evidence must require explicit external webhook drill acknowledgement outside local profile" \
+  'SOURCELENS_RELEASE_EVIDENCE_ALLOW_EXTERNAL_DRILLS=true is required to run auto GitHub webhook drill outside local profile' \
+  scripts/release-evidence.sh
+
+assert_match \
+  "env example must document release evidence target environment boundary" \
+  '^SOURCELENS_RELEASE_EVIDENCE_TARGET_ENV=local$' \
+  deploy/.env.example
+
+assert_match \
+  "env example must document production mutation acknowledgement default" \
+  '^SOURCELENS_RELEASE_EVIDENCE_ALLOW_MUTATING_PROD=false$' \
+  deploy/.env.example
+
+assert_match \
+  "env example must document external drill acknowledgement default" \
+  '^SOURCELENS_RELEASE_EVIDENCE_ALLOW_EXTERNAL_DRILLS=false$' \
+  deploy/.env.example
+
+assert_match \
+  "backend dev runner must pin the Spring Boot main class to avoid slow classpath scanning" \
+  'SOURCELENS_BACKEND_MAIN_CLASS:-com\.sourcelens\.SourceLensApplication' \
+  scripts/run-backend-dev.sh
+
+assert_match \
+  "backend dev runner must pass the explicit Spring Boot main class to Maven" \
+  'spring-boot\.run\.main-class="\$\{SOURCELENS_BACKEND_MAIN_CLASS\}"' \
+  scripts/run-backend-dev.sh
+
+security_log "OK all security regression checks"
 echo "Security regression checks passed."

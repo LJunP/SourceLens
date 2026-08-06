@@ -11,6 +11,7 @@ import com.sourcelens.module.execution.entity.ExecutionTask;
 import com.sourcelens.module.execution.service.ExecutionTaskService;
 import com.sourcelens.module.repository.entity.Repository;
 import com.sourcelens.module.repository.service.GitService;
+import com.sourcelens.module.repository.service.RepositoryUrlPolicy;
 import com.sourcelens.module.repository.service.RepositoryService;
 import com.sourcelens.module.scantask.dto.CreateScanTaskRequest;
 import com.sourcelens.module.scantask.entity.ScanTask;
@@ -67,11 +68,13 @@ public class ScanTaskService extends ServiceImpl<ScanTaskMapper, ScanTask> {
         if (runningCount > 0) {
             throw BizException.badRequest("该仓库已有正在进行或排队中的扫描任务，请勿重复提交");
         }
+        String normalizedBranch = RepositoryUrlPolicy.validateBranch(
+                req.getBranch() != null ? req.getBranch() : repo.getDefaultBranch());
 
         ScanTask task = ScanTask.builder()
                 .projectId(projectId)
                 .repositoryId(req.getRepositoryId())
-                .branch(req.getBranch() != null ? req.getBranch() : repo.getDefaultBranch())
+                .branch(normalizedBranch)
                 .status("PENDING")
                 .activeLockKey(activeLockKey(req.getRepositoryId()))
                 .triggerType("MANUAL")

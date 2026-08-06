@@ -36,7 +36,7 @@ public class CodeChunkFileFilter {
         }
         Path relative = repoRoot.relativize(file);
         for (Path element : relative) {
-            if (SKIP_DIRS.contains(element.toString())) {
+            if (isSkippedDirectoryName(element.toString())) {
                 return false;
             }
         }
@@ -58,6 +58,10 @@ public class CodeChunkFileFilter {
         } catch (IOException e) {
             return false;
         }
+    }
+
+    static boolean isSkippedDirectoryName(String name) {
+        return name != null && SKIP_DIRS.contains(name);
     }
 
     private String extensionOf(String fileName) {

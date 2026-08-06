@@ -26,7 +26,9 @@ export interface AuditLog {
 export interface AuditLogQuery {
   page?: number
   pageSize?: number
+  auditLogId?: number
   resourceType?: string
+  resourceId?: number
   action?: string
   status?: string
 }

@@ -1,6 +1,8 @@
 # SourceLens 工作区整理说明
 
-状态：已整理第一轮，已增加分组清单工具
+> AIOS v2.3 状态：`P0 SUPPORTING INPUT`。当前巨大脏工作区禁止自动 clean/stash/reset；恢复顺序和 review slices 以 `aios/P0_GATE.md` 为准。
+
+状态：P0基线切片支持输入；是否完成只由 `aios/P0_GATE.md` 与Truth Registry判定。
 
 ## 1. 当前现象
 
@@ -112,6 +114,8 @@ SOURCELENS_WORKTREE_INVENTORY_STRICT=true make worktree-inventory
 最近一次清单复核：2026-06-26 00:04 +0800，`make worktree-inventory` 通过。当前主要分组规模为：安全 18、审计/可观测性 12、分析/图谱/项目生命周期 43、执行任务/Artifact/自动化 52、Agent/LLM/工具 48、沙箱/Workspace 10、GitHub App/仓库集成 31、前端 42、Rust analyzer 9、运维/CI/发布门禁 23、构建产物清理 4、文档/交接 14、Backend shared infrastructure 3。
 
 本轮复核同时修正了清单工具的分类规则：`PromptInjectionGuardTest` 和 `V014__add_agent_tool_calls.sql` 归入 Agent/LLM 组，`ScanStatServiceTest` 归入分析/图谱/项目生命周期组。清单工具也支持单组过滤，便于按模块拆审；顶部 review order 和实际分组输出现在共用同一份 category 数组，避免建议顺序和实际输出顺序漂移；strict 模式会在出现 `Other` 分组时失败，且 `SOURCELENS_WORKTREE_INVENTORY_STRICT` 拼写错误会 fail-closed。安全回归门禁已锁住这些分类入口和过滤行为，避免后续拆审时重新落入 uncategorized、因分组名错误静默漏项，或因 strict 开关拼错而静默降级。
+
+本轮继续修正当前工作区的新增分析文件分类：`V029__add_code_chunk_embedding_model.sql` 和 `AnalyzerRunnerTest.java` 已归入 Analysis, graph and project lifecycle，而不是兜底 Backend shared infrastructure。安全回归门禁已锁住这两条分类规则，避免 code_chunks embedding 边界和 analyzer runner 阻塞回归测试在拆审时脱离分析主线。
 
 最近一次刷新还把 `backend-spring/src/test/java/com/sourcelens/common/security/*` 测试归入安全组，并将剩余跨模块共享文件统一标为 Backend shared infrastructure，避免拆审输出继续使用含糊的 uncategorized 标签。
 

@@ -5,7 +5,7 @@
 - 数据库: MySQL 8.4
 - 字符集: utf8mb4 / utf8mb4_unicode_ci
 - ORM: MyBatis-Plus (逻辑删除: `deleted` 字段)
-- 迁移: Flyway (V001 ~ V026)
+- 迁移: Flyway (V001 ~ V032)
 
 ## 表结构
 
@@ -221,12 +221,13 @@
 | embedding_json | JSON | 向量或向量占位数据 |
 | created_at | DATETIME | 创建时间 |
 
-### auto_repairs (V012 / V015 / V024)
+### auto_repairs (V012 / V015 / V024 / V030)
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | BIGINT PK AUTO_INCREMENT | 主键 |
 | project_id / repository_id | BIGINT | 所属项目和仓库 |
+| scan_task_id | BIGINT NULL | 来源扫描任务。报告风险项创建的修复候选必须回到同项目、同仓库且成功完成的扫描任务 |
 | file_path | VARCHAR(500) | 目标文件 |
 | status | VARCHAR(30) | PENDING/RUNNING/PATCH_READY/PR_RUNNING/PR_CREATED/FAILED/CANCELLED |
 | patch_artifact_path | VARCHAR(500) | patch artifact 路径 |

@@ -54,10 +54,12 @@ class AuditLogControllerTest {
         page.setRecords(List.of(log));
         doNothing().when(projectService).verifyOwnership(projectId, userId);
         when(auditLogService.listByProject(projectId, 1, 20,
-                "AUTO_REPAIR", "AUTO_REPAIR_PR_CREATED", "SUCCESS")).thenReturn(page);
+                99L, "AUTO_REPAIR", 9L, "AUTO_REPAIR_PR_CREATED", "SUCCESS")).thenReturn(page);
 
         mockMvc.perform(get("/api/projects/10/audit-logs")
+                        .param("auditLogId", "99")
                         .param("resourceType", "AUTO_REPAIR")
+                        .param("resourceId", "9")
                         .param("action", "AUTO_REPAIR_PR_CREATED")
                         .param("status", "SUCCESS")
                         .requestAttr("userId", userId))
@@ -68,6 +70,6 @@ class AuditLogControllerTest {
 
         verify(projectService).verifyOwnership(projectId, userId);
         verify(auditLogService).listByProject(eq(projectId), eq(1), eq(20),
-                eq("AUTO_REPAIR"), eq("AUTO_REPAIR_PR_CREATED"), eq("SUCCESS"));
+                eq(99L), eq("AUTO_REPAIR"), eq(9L), eq("AUTO_REPAIR_PR_CREATED"), eq("SUCCESS"));
     }
 }

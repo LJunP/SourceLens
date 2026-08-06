@@ -3,6 +3,7 @@ package com.sourcelens.module.autorepair.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.sourcelens.common.exception.BizException;
+import com.sourcelens.common.security.SensitiveDataSanitizer;
 import com.sourcelens.common.security.TokenEncryptor;
 import com.sourcelens.module.agent.entity.LlmConfig;
 import com.sourcelens.module.agent.service.LlmClient;
@@ -13,13 +14,18 @@ import com.sourcelens.module.autorepair.entity.AutoRepair;
 import com.sourcelens.module.autorepair.mapper.AutoRepairMapper;
 import com.sourcelens.module.artifact.entity.ArtifactRecord;
 import com.sourcelens.module.artifact.service.ArtifactStorageService;
+import com.sourcelens.module.audit.entity.AuditLog;
 import com.sourcelens.module.audit.service.AuditLogService;
+import com.sourcelens.module.execution.entity.ExecutionAttempt;
+import com.sourcelens.module.execution.entity.ExecutionStep;
 import com.sourcelens.module.execution.entity.ExecutionTask;
 import com.sourcelens.module.execution.service.ExecutionTaskService;
 import com.sourcelens.module.project.service.ProjectService;
 import com.sourcelens.module.repository.entity.Repository;
 import com.sourcelens.module.repository.service.GitHubAppInstallationService;
 import com.sourcelens.module.repository.service.RepositoryService;
+import com.sourcelens.module.scantask.entity.ScanTask;
+import com.sourcelens.module.scantask.service.ScanTaskService;
 import com.sourcelens.module.sandbox.SandboxCommand;
 import com.sourcelens.module.sandbox.SandboxExecutionResult;
 import com.sourcelens.module.sandbox.SandboxExecutor;
@@ -62,6 +68,7 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
     private final AutoRepairPrService autoRepairPrService;
     private final GitHubAppInstallationService gitHubAppInstallationService;
     private final AuditLogService auditLogService;
+    private final ScanTaskService scanTaskService;
 
     @Value("${sourcelens.workspace.base-path:/tmp/sourcelens/repos}")
     private String workspaceBasePath;
@@ -82,6 +89,7 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
         if (!projectId.equals(repo.getProjectId())) {
             throw BizException.badRequest("该仓库不属于指定项目");
         }
+        ScanTask sourceScanTask = validateSourceScanTask(projectId, req.getRepositoryId(), req.getScanTaskId());
 
         // 3. 校验是否有激活的大模型配置
         LlmConfig activeConfig = llmConfigService.getActiveConfig(userId);
@@ -101,6 +109,7 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
         AutoRepair autoRepair = AutoRepair.builder()
                 .projectId(projectId)
                 .repositoryId(req.getRepositoryId())
+                .scanTaskId(sourceScanTask == null ? null : sourceScanTask.getId())
                 .filePath(normalizedFilePath)
                 .targetDesc(req.getTargetDesc())
                 .status("PENDING")
@@ -114,11 +123,31 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
         }
         executionTaskService.create(projectId, req.getRepositoryId(), "AUTO_REPAIR",
                 "AUTO_REPAIR", autoRepair.getId(), userId);
+        auditAutoRepair(autoRepair, userId, "AUTO_REPAIR_CANDIDATE_CREATED", "SUCCESS",
+                autoRepairCandidateCreatedInput(autoRepair, req),
+                "自动修复候选已创建");
 
         log.info("成功创建自动补丁任务: id={}, project={}, repo={}, file={}",
                 autoRepair.getId(), projectId, req.getRepositoryId(), normalizedFilePath);
 
         return autoRepair;
+    }
+
+    private ScanTask validateSourceScanTask(Long projectId, Long repositoryId, Long scanTaskId) {
+        if (scanTaskId == null) {
+            return null;
+        }
+        ScanTask scanTask = scanTaskService.getDetail(scanTaskId);
+        if (!projectId.equals(scanTask.getProjectId())) {
+            throw BizException.badRequest("来源扫描任务不属于指定项目");
+        }
+        if (!repositoryId.equals(scanTask.getRepositoryId())) {
+            throw BizException.badRequest("来源扫描任务不属于指定仓库");
+        }
+        if (!"SUCCESS".equals(scanTask.getStatus())) {
+            throw BizException.badRequest("来源扫描任务尚未成功完成，不能作为自动修复候选证据");
+        }
+        return scanTask;
     }
 
     /**
@@ -153,7 +182,7 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
             Repository repo = repositoryService.getDetail(repair.getRepositoryId());
             String token = repositoryService.getDecryptedToken(repo.getId());
 
-            log.info("准备克隆或拷贝仓库到隔离沙箱: repoUrl={}, branch={}, sandboxPath={}", 
+            log.info("准备克隆或拷贝仓库到隔离沙箱: repoUrl={}, branch={}, sandboxPath={}",
                     repo.getUrl(), repo.getDefaultBranch(), sandboxPath);
 
             boolean isLocalNonGit = checkIsLocalNonGit(repo);
@@ -312,17 +341,10 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
         if (repair.getDiffContent() == null || repair.getDiffContent().isBlank()) {
             throw BizException.badRequest("补丁 diff 为空，无法提交 PR");
         }
+        validatePatchReadyForPr(repair, userId);
 
         Repository repo = repositoryService.getDetail(repair.getRepositoryId());
-        if (!projectId.equals(repo.getProjectId())) {
-            throw BizException.badRequest("该仓库不属于指定项目");
-        }
-        if (!"GITHUB".equals(repo.getProvider())) {
-            throw BizException.badRequest("受控 PR 目前只支持 GitHub 仓库");
-        }
-        if (!"GITHUB_APP".equals(repo.getAuthType())) {
-            throw BizException.badRequest("受控 PR 只允许使用 GitHub App installation token，不允许使用 PAT");
-        }
+        validateSubmitPrRepositoryBoundary(projectId, repo);
         try {
             gitHubAppInstallationService.assertCanCreatePullRequest(repo.getId());
         } catch (BizException e) {
@@ -351,14 +373,123 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
             repair.setActiveLockKey(null);
             throw BizException.badRequest("该文件已有正在生成补丁或创建 PR 的任务，请勿重复提交");
         }
-        if (executionTaskId != null) {
-            executionTaskService.markRunning(executionTaskId, "queued_pull_request");
-        }
+        ExecutionAttempt prAttempt = startPrExecutionAttempt(executionTaskId);
+        Long prAttemptId = prAttempt == null ? null : prAttempt.getId();
+        startExecutionAttemptStep(prAttemptId, "queued_pull_request", "受控 PR 创建已排队");
+        completeExecutionAttemptStep(prAttemptId, "queued_pull_request", "受控 PR 创建已排队");
         auditAutoRepair(repair, userId, "AUTO_REPAIR_PR_QUEUED", "SUCCESS",
                 autoRepairAuditInput(repair, "branchName", buildAutoRepairBranchName(repair)),
                 "受控 PR 创建已排队");
 
         return repair;
+    }
+
+    private void validatePatchReadyForPr(AutoRepair repair, Long userId) {
+        try {
+            validatePatchReadyEvidenceForPr(repair);
+        } catch (BizException e) {
+            auditAutoRepair(repair, userId, "AUTO_REPAIR_PR_REJECTED", "FAILED",
+                    autoRepairAuditInput(repair, "step", "validate_patch_ready_evidence"),
+                    e.getMessage());
+            throw e;
+        }
+    }
+
+    private void validatePatchReadyEvidenceForPr(AutoRepair repair) {
+        AutoRepairPatchPolicy.validateSingleFilePatch(repair.getFilePath(), repair.getDiffContent());
+        validatePatchArtifactForPr(repair);
+        validateExecutionEvidenceForPr(repair);
+        validatePatchReadyAuditForPr(repair);
+    }
+
+    private void validateSubmitPrRepositoryBoundary(Long projectId, Repository repo) {
+        if (!projectId.equals(repo.getProjectId())) {
+            throw BizException.badRequest("该仓库不属于指定项目");
+        }
+        if (!"GITHUB".equals(repo.getProvider())) {
+            throw BizException.badRequest("受控 PR 目前只支持 GitHub 仓库");
+        }
+        if (!"GITHUB_APP".equals(repo.getAuthType())) {
+            throw BizException.badRequest("受控 PR 只允许使用 GitHub App installation token，不允许使用 PAT");
+        }
+    }
+
+    private Repository validateSubmitPrRuntimeBeforeToken(AutoRepair repair) {
+        if (!submitPrEnabled) {
+            throw BizException.badRequest("受控 PR 提交流程未开启，请配置 sourcelens.autorepair.submit-pr-enabled=true 后再使用");
+        }
+        if (repair.getPrUrl() != null && !repair.getPrUrl().isBlank()) {
+            throw BizException.badRequest("该补丁已经创建过 Pull Request");
+        }
+        validatePatchReadyEvidenceForPr(repair);
+        Repository repo = repositoryService.getDetail(repair.getRepositoryId());
+        validateSubmitPrRepositoryBoundary(repair.getProjectId(), repo);
+        gitHubAppInstallationService.assertCanCreatePullRequest(repo.getId());
+        return repo;
+    }
+
+    private void validatePatchArtifactForPr(AutoRepair repair) {
+        if (repair.getPatchArtifactPath() == null || repair.getPatchArtifactPath().isBlank()) {
+            throw BizException.badRequest("缺少 CHANGE_PATCH 补丁产物，无法提交 PR");
+        }
+        List<ArtifactRecord> records = artifactStorageService.listByOwner("AUTO_REPAIR", repair.getId());
+        boolean artifactMatched = (records == null ? List.<ArtifactRecord>of() : records).stream()
+                .anyMatch(record -> record != null
+                        && repair.getProjectId().equals(record.getProjectId())
+                        && repair.getRepositoryId().equals(record.getRepositoryId())
+                        && "AUTO_REPAIR".equals(record.getOwnerType())
+                        && repair.getId().equals(record.getOwnerId())
+                        && "CHANGE_PATCH".equals(record.getArtifactType())
+                        && repair.getPatchArtifactPath().equals(record.getStoragePath()));
+        if (!artifactMatched) {
+            throw BizException.badRequest("CHANGE_PATCH 补丁产物记录缺失或与当前任务不匹配，无法提交 PR");
+        }
+    }
+
+    private void validateExecutionEvidenceForPr(AutoRepair repair) {
+        ExecutionTask executionTask = executionTaskService.getByProjectAndSource(
+                repair.getProjectId(), "AUTO_REPAIR", repair.getId());
+        if (executionTask == null
+                || !"AUTO_REPAIR".equals(executionTask.getTaskType())
+                || !"AUTO_REPAIR".equals(executionTask.getSourceType())
+                || !repair.getId().equals(executionTask.getSourceId())
+                || !repair.getProjectId().equals(executionTask.getProjectId())
+                || !repair.getRepositoryId().equals(executionTask.getRepositoryId())) {
+            throw BizException.badRequest("缺少成功的 AutoRepair 执行任务证据，无法提交 PR");
+        }
+        List<ExecutionStep> steps = executionTaskService.listSteps(executionTask.getId());
+        boolean generatedPatch = (steps == null ? List.<ExecutionStep>of() : steps).stream()
+                .anyMatch(step -> step != null
+                        && "generate_patch".equals(step.getStepKey())
+                        && "SUCCESS".equals(step.getStatus()));
+        if (!generatedPatch) {
+            throw BizException.badRequest("缺少成功的 generate_patch 执行步骤，无法提交 PR");
+        }
+    }
+
+    private void validatePatchReadyAuditForPr(AutoRepair repair) {
+        var auditPage = auditLogService.listByProject(
+                repair.getProjectId(),
+                1,
+                1,
+                null,
+                "AUTO_REPAIR",
+                repair.getId(),
+                "AUTO_REPAIR_PATCH_READY",
+                "SUCCESS");
+        List<AuditLog> records = auditPage == null || auditPage.getRecords() == null
+                ? List.of()
+                : auditPage.getRecords();
+        boolean auditMatched = records.stream()
+                .anyMatch(record -> record != null
+                        && repair.getProjectId().equals(record.getProjectId())
+                        && "AUTO_REPAIR".equals(record.getResourceType())
+                        && repair.getId().equals(record.getResourceId())
+                        && "AUTO_REPAIR_PATCH_READY".equals(record.getAction())
+                        && "SUCCESS".equals(record.getStatus()));
+        if (!auditMatched) {
+            throw BizException.badRequest("缺少 AUTO_REPAIR_PATCH_READY 成功审计事件，无法提交 PR");
+        }
     }
 
     @Async("scanTaskExecutor")
@@ -374,11 +505,17 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
         }
         ExecutionTask executionTask = executionTaskService.findBySource("AUTO_REPAIR", repairId);
         Long executionTaskId = executionTask == null ? null : executionTask.getId();
+        ExecutionAttempt prAttempt = getOrCreatePrExecutionAttempt(executionTaskId);
+        Long prAttemptId = prAttempt == null ? null : prAttempt.getId();
         AtomicReference<String> currentStep = new AtomicReference<>("create_pull_request");
         try {
             assertNotCancelled(repairId, executionTaskId);
+            currentStep.set("validate_submit_pr_runtime");
+            startExecutionAttemptStep(prAttemptId, currentStep.get(), "复验受控 PR 运行时边界");
             projectService.verifyOwnership(repair.getProjectId(), userId);
-            Repository repo = repositoryService.getDetail(repair.getRepositoryId());
+            Repository repo = validateSubmitPrRuntimeBeforeToken(repair);
+            completeExecutionAttemptStep(prAttemptId, currentStep.get(), "PR 运行时边界复验通过");
+            currentStep.set("create_pull_request");
             String token = repositoryService.getDecryptedToken(repo.getId());
             String branchName = buildAutoRepairBranchName(repair);
             AutoRepairPrService.ProgressReporter progressReporter = new AutoRepairPrService.ProgressReporter() {
@@ -386,13 +523,13 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
                 public void start(String stepKey, String stepName) {
                     assertNotCancelled(repairId, executionTaskId);
                     currentStep.set(stepKey);
-                    startExecutionStep(executionTaskId, stepKey, stepName);
+                    startExecutionAttemptStep(prAttemptId, stepKey, stepName);
                 }
 
                 @Override
                 public void complete(String stepKey, String summary) {
                     assertNotCancelled(repairId, executionTaskId);
-                    completeExecutionStep(executionTaskId, stepKey, summary);
+                    completeExecutionAttemptStep(prAttemptId, stepKey, summary);
                 }
             };
 
@@ -408,23 +545,25 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
             repair.setTestLog((repair.getTestLog() == null ? "" : repair.getTestLog() + "\n")
                     + "受控 PR 已创建: " + result.prUrl());
             updateById(repair);
-            markExecutionSuccess(executionTaskId, "create_pull_request");
+            markExecutionAttemptSuccess(prAttemptId, "create_pull_request");
             auditAutoRepair(repair, userId, "AUTO_REPAIR_PR_CREATED", "SUCCESS",
                     autoRepairAuditInput(repair, "branchName", result.branchName(), "prUrl", result.prUrl()),
                     "受控 PR 已创建");
         } catch (AutoRepairCancelledException e) {
             log.info("受控 PR 创建已取消, repairId={}, step={}", repairId, currentStep.get());
-            cancelExecutionStep(executionTaskId, currentStep.get(), e.getMessage());
-            markExecutionCancelled(executionTaskId, currentStep.get(), e.getMessage());
+            cancelExecutionAttemptStep(prAttemptId, currentStep.get(), e.getMessage());
+            markExecutionAttemptCancelled(prAttemptId, currentStep.get(), e.getMessage());
         } catch (Exception e) {
             log.error("受控 PR 异步创建失败, repairId={}", repairId, e);
+            boolean preflightRejected = "validate_submit_pr_runtime".equals(currentStep.get());
+            String auditAction = preflightRejected ? "AUTO_REPAIR_PR_REJECTED" : "AUTO_REPAIR_PR_FAILED";
             repair.setStatus("PATCH_READY");
             repair.setActiveLockKey(null);
             repair.setErrorMessage(e.getMessage());
             updateById(repair);
-            failExecutionStep(executionTaskId, currentStep.get(), e.getMessage());
-            markExecutionFailed(executionTaskId, currentStep.get(), e.getMessage());
-            auditAutoRepair(repair, userId, "AUTO_REPAIR_PR_FAILED", "FAILED",
+            failExecutionAttemptStep(prAttemptId, currentStep.get(), e.getMessage());
+            markExecutionAttemptFailed(prAttemptId, currentStep.get(), e.getMessage());
+            auditAutoRepair(repair, userId, auditAction, "FAILED",
                     autoRepairAuditInput(repair, "step", currentStep.get()), e.getMessage());
         }
     }
@@ -446,7 +585,12 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
 
         ExecutionTask executionTask = executionTaskService.findBySource("AUTO_REPAIR", repairId);
         if (executionTask != null) {
-            executionTaskService.markCancelled(executionTask.getId(), "cancelled", "自动补丁任务已取消");
+            if (executionTask.getCurrentAttemptId() != null) {
+                executionTaskService.markAttemptCancelled(executionTask.getCurrentAttemptId(),
+                        "cancelled", "自动补丁任务已取消");
+            } else {
+                executionTaskService.markCancelled(executionTask.getId(), "cancelled", "自动补丁任务已取消");
+            }
         }
         auditAutoRepair(repair, userId, "AUTO_REPAIR_CANCEL", "SUCCESS",
                 autoRepairAuditInput(repair), "自动补丁任务已取消");
@@ -522,7 +666,7 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
                 try {
                     Path relative = source.relativize(src);
                     String relStr = relative.toString();
-                    if (relStr.contains("node_modules") || relStr.contains("target") || 
+                    if (relStr.contains("node_modules") || relStr.contains("target") ||
                         relStr.contains(".git") || relStr.contains(".idea") ||
                         relStr.contains("build") || relStr.contains("dist")) {
                         return;
@@ -616,6 +760,70 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
         }
     }
 
+    private ExecutionAttempt startPrExecutionAttempt(Long executionTaskId) {
+        if (executionTaskId == null) {
+            return null;
+        }
+        return executionTaskService.startNewAttempt(executionTaskId);
+    }
+
+    private ExecutionAttempt getOrCreatePrExecutionAttempt(Long executionTaskId) {
+        if (executionTaskId == null) {
+            return null;
+        }
+        ExecutionAttempt attempt = executionTaskService.getOrCreateCurrentAttempt(executionTaskId);
+        if (attempt == null || isTerminalAttemptStatus(attempt.getStatus())) {
+            return executionTaskService.startNewAttempt(executionTaskId);
+        }
+        return attempt;
+    }
+
+    private boolean isTerminalAttemptStatus(String status) {
+        return "SUCCESS".equals(status) || "FAILED".equals(status) || "CANCELLED".equals(status);
+    }
+
+    private void startExecutionAttemptStep(Long executionAttemptId, String stepKey, String stepName) {
+        if (executionAttemptId != null) {
+            executionTaskService.startAttemptStep(executionAttemptId, stepKey, stepName);
+        }
+    }
+
+    private void completeExecutionAttemptStep(Long executionAttemptId, String stepKey, String summary) {
+        if (executionAttemptId != null) {
+            executionTaskService.completeAttemptStep(executionAttemptId, stepKey, summary);
+        }
+    }
+
+    private void failExecutionAttemptStep(Long executionAttemptId, String stepKey, String errorMessage) {
+        if (executionAttemptId != null) {
+            executionTaskService.failAttemptStep(executionAttemptId, stepKey, errorMessage);
+        }
+    }
+
+    private void cancelExecutionAttemptStep(Long executionAttemptId, String stepKey, String reason) {
+        if (executionAttemptId != null) {
+            executionTaskService.cancelAttemptStep(executionAttemptId, stepKey, reason);
+        }
+    }
+
+    private void markExecutionAttemptSuccess(Long executionAttemptId, String currentStep) {
+        if (executionAttemptId != null) {
+            executionTaskService.markAttemptSuccess(executionAttemptId, currentStep);
+        }
+    }
+
+    private void markExecutionAttemptFailed(Long executionAttemptId, String currentStep, String errorMessage) {
+        if (executionAttemptId != null) {
+            executionTaskService.markAttemptFailed(executionAttemptId, currentStep, errorMessage);
+        }
+    }
+
+    private void markExecutionAttemptCancelled(Long executionAttemptId, String currentStep, String reason) {
+        if (executionAttemptId != null) {
+            executionTaskService.markAttemptCancelled(executionAttemptId, currentStep, reason);
+        }
+    }
+
     private void completeExecutionStep(Long executionTaskId, String stepKey, String summary) {
         if (executionTaskId != null) {
             executionTaskService.completeStep(executionTaskId, stepKey, summary);
@@ -668,6 +876,7 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
     private Map<String, Object> autoRepairAuditInput(AutoRepair repair, Object... extraPairs) {
         Map<String, Object> input = new LinkedHashMap<>();
         input.put("repositoryId", repair.getRepositoryId());
+        input.put("scanTaskId", repair.getScanTaskId());
         input.put("filePath", repair.getFilePath());
         input.put("status", repair.getStatus());
         input.put("patchArtifactPath", repair.getPatchArtifactPath());
@@ -675,6 +884,163 @@ public class AutoRepairService extends ServiceImpl<AutoRepairMapper, AutoRepair>
             input.put(String.valueOf(extraPairs[i]), extraPairs[i + 1]);
         }
         return input;
+    }
+
+    private Map<String, Object> autoRepairCandidateCreatedInput(AutoRepair repair, AutoRepairRequest req) {
+        Map<String, Object> input = autoRepairAuditInput(repair);
+        Map<String, Object> provenance = sanitizedProvenance(repair, req);
+        input.put("sourceType", provenance.getOrDefault("sourceType", "MANUAL_CANDIDATE"));
+        input.put("provenance", provenance);
+        return input;
+    }
+
+    private Map<String, Object> sanitizedProvenance(AutoRepair repair, AutoRepairRequest req) {
+        Map<String, Object> provenance = new LinkedHashMap<>();
+        AutoRepairRequest.Provenance source = req.getProvenance();
+        String sourceType = normalizeSourceType(source == null ? null : source.getSourceType());
+        provenance.put("sourceType", sourceType);
+        provenance.put("scanTaskId", repair.getScanTaskId());
+        provenance.put("filePath", repair.getFilePath());
+        if (source == null) {
+            putServerDerivedRepairEvidenceGate(provenance);
+            return provenance;
+        }
+        putText(provenance, "source", source.getSource(), 120);
+        putLong(provenance, "chunkId", source.getChunkId());
+        putText(provenance, "citationId", source.getCitationId(), 120);
+        putText(provenance, "sourceLabel", source.getSourceLabel(), 40);
+        putPositiveInteger(provenance, "startLine", source.getStartLine());
+        putPositiveInteger(provenance, "endLine", source.getEndLine());
+        if (source.getCitedByAnswer() != null) {
+            provenance.put("citedByAnswer", source.getCitedByAnswer());
+        }
+        putText(provenance, "groundingStatus", source.getGroundingStatus(), 40);
+        putText(provenance, "citationEnforcementStatus", source.getCitationEnforcementStatus(), 60);
+        putText(provenance, "citationEnforcementReason", source.getCitationEnforcementReason(), 80);
+        putText(provenance, "evidenceType", source.getEvidenceType(), 60);
+        putText(provenance, "evidenceReason", source.getEvidenceReason(), 240);
+        putText(provenance, "sourceEvidenceCategory", source.getSourceEvidenceCategory(), 120);
+        putText(provenance, "sourceEvidenceSource", source.getSourceEvidenceSource(), 120);
+        putText(provenance, "sourceEvidenceTitle", source.getSourceEvidenceTitle(), 160);
+        putText(provenance, "sourceEvidenceFilePath", source.getSourceEvidenceFilePath(), 300);
+        putText(provenance, "sourceEvidenceLineNumber", source.getSourceEvidenceLineNumber(), 80);
+        if (source.getSourceEvidenceMatched() != null) {
+            provenance.put("sourceEvidenceMatched", source.getSourceEvidenceMatched());
+        }
+        putText(provenance, "sourceEvidenceMatchType", source.getSourceEvidenceMatchType(), 80);
+        putLong(provenance, "artifactId", source.getArtifactId());
+        putText(provenance, "artifactType", source.getArtifactType(), 80);
+        putText(provenance, "riskKey", source.getRiskKey(), 120);
+        putText(provenance, "riskCategory", source.getRiskCategory(), 120);
+        putText(provenance, "riskSeverity", source.getRiskSeverity(), 40);
+        putPositiveInteger(provenance, "lineNumber", source.getLineNumber());
+        putServerDerivedRepairEvidenceGate(provenance);
+        return provenance;
+    }
+
+    private void putServerDerivedRepairEvidenceGate(Map<String, Object> provenance) {
+        String sourceType = stringValue(provenance.get("sourceType"));
+        String gate;
+        String reason;
+        if ("PROJECT_QA_VERIFIED_CITATION".equals(sourceType)) {
+            boolean hasScan = provenance.get("scanTaskId") != null;
+            boolean hasFile = hasText(provenance.get("filePath"));
+            boolean hasCitation = hasText(provenance.get("sourceLabel"))
+                    || provenance.get("citationId") != null
+                    || provenance.get("chunkId") != null;
+            boolean hasReportEvidence = hasText(provenance.get("sourceEvidenceFilePath"))
+                    || hasText(provenance.get("sourceEvidenceTitle"));
+            boolean sourceMatched = Boolean.TRUE.equals(provenance.get("sourceEvidenceMatched"));
+            boolean lineAnchored = "REPORT_LINE_ANCHOR".equals(stringValue(provenance.get("sourceEvidenceMatchType")));
+            boolean cited = Boolean.TRUE.equals(provenance.get("citedByAnswer"));
+            boolean verified = "VERIFIED".equals(stringValue(provenance.get("groundingStatus")));
+            boolean citationGate = successfulCandidateCitationGate(stringValue(provenance.get("citationEnforcementStatus")));
+            boolean ready = hasScan && hasFile && hasCitation && hasReportEvidence
+                    && sourceMatched && lineAnchored && cited && verified && citationGate;
+            boolean review = hasScan && hasFile && hasCitation && hasReportEvidence
+                    && sourceMatched && cited && verified && citationGate;
+            gate = ready ? "READY" : review ? "REVIEW" : "BLOCKED";
+            reason = ready
+                    ? "QA citation, report evidence and target file are line-anchored for candidate review"
+                    : review
+                    ? "QA citation and report evidence are bound but need human line-level confirmation"
+                    : "QA candidate provenance is incomplete or not verified enough for repair review";
+        } else if ("SCAN_REPORT_RISK".equals(sourceType)) {
+            boolean hasScan = provenance.get("scanTaskId") != null;
+            boolean hasFile = hasText(provenance.get("filePath"));
+            boolean hasRisk = hasText(provenance.get("riskKey"))
+                    || hasText(provenance.get("riskCategory"))
+                    || hasText(provenance.get("riskSeverity"));
+            boolean ready = hasScan && hasFile && hasRisk;
+            if (ready) {
+                gate = "READY";
+                reason = "Scan report risk is bound to a target file and risk fields";
+            } else if (hasScan && hasFile) {
+                gate = "REVIEW";
+                reason = "Scan report risk provenance is incomplete and needs review";
+            } else {
+                gate = "BLOCKED";
+                reason = "Scan report risk provenance is missing scan or target file binding";
+            }
+        } else {
+            gate = "REVIEW";
+            reason = "Manual candidate provenance needs human review";
+        }
+        provenance.put("repairEvidenceGate", gate);
+        provenance.put("repairEvidenceGateReason", reason);
+        provenance.put("repairEvidenceGateSource", "SERVER_DERIVED");
+    }
+
+    private boolean successfulCandidateCitationGate(String status) {
+        return "DIRECT_VERIFIED".equals(status)
+                || "RETRY_VERIFIED".equals(status)
+                || "FALLBACK_CITED".equals(status);
+    }
+
+    private boolean hasText(Object value) {
+        return value != null && !String.valueOf(value).isBlank();
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    private String normalizeSourceType(String sourceType) {
+        if (sourceType == null || sourceType.isBlank()) {
+            return "MANUAL_CANDIDATE";
+        }
+        String normalized = sourceType.trim().toUpperCase();
+        if (List.of("PROJECT_QA_VERIFIED_CITATION", "SCAN_REPORT_RISK", "MANUAL_CANDIDATE").contains(normalized)) {
+            return normalized;
+        }
+        return "MANUAL_CANDIDATE";
+    }
+
+    private void putText(Map<String, Object> target, String key, String value, int maxLength) {
+        if (value == null || value.isBlank()) {
+            return;
+        }
+        String normalized = SensitiveDataSanitizer.sanitize(value)
+                .replaceAll("[\\p{Cntrl}&&[^\r\n\t]]", "")
+                .trim();
+        if (normalized.length() > maxLength) {
+            normalized = normalized.substring(0, maxLength);
+        }
+        if (!normalized.isBlank()) {
+            target.put(key, normalized);
+        }
+    }
+
+    private void putLong(Map<String, Object> target, String key, Long value) {
+        if (value != null && value > 0) {
+            target.put(key, value);
+        }
+    }
+
+    private void putPositiveInteger(Map<String, Object> target, String key, Integer value) {
+        if (value != null && value > 0) {
+            target.put(key, value);
+        }
     }
 
     private void assertNotCancelled(Long repairId, Long executionTaskId) {

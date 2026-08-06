@@ -1,5 +1,7 @@
 # SourceLens LLM Safety Evals
 
+> AIOS v2.3 状态：`INHERITED SAFETY REGRESSION INPUT`。这些 eval 继续有效，但不替代 Baseline Suite、hidden set、独立 evaluator 或真实 provider 质量研究。
+
 状态：Prompt injection 第一版边界、本地红队样例和输出质量评估契约。
 
 ## 目标

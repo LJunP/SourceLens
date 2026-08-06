@@ -394,6 +394,14 @@ if [ "$(pwd)" != "/workspace" ]; then
   exit 11
 fi
 echo workspace-ok > /workspace/sandbox-drill-write.txt
+for cache_dir in "$HOME" "$XDG_CACHE_HOME" "$MAVEN_CONFIG" "$npm_config_cache" "$GRADLE_USER_HOME"; do
+  case "$cache_dir" in
+    /workspace/.sourcelens-home|/workspace/.sourcelens-cache/*) ;;
+    *) echo "build cache path is outside workspace: $cache_dir"; exit 21 ;;
+  esac
+  mkdir -p "$cache_dir"
+  echo cache-ok > "$cache_dir/sandbox-drill-cache-write.txt"
+done
 if awk "\$2 == \"00000000\" && \$1 != \"lo\" { found = 1 } END { exit(found ? 0 : 1) }" /proc/net/route; then
   echo "default network route is present"
   exit 12
@@ -454,6 +462,11 @@ create_output="$(docker create \
   --read-only \
   --tmpfs "$tmpfs" \
   -e EXPECTED_PIDS_LIMIT="$pids_limit" \
+  -e HOME=/workspace/.sourcelens-home \
+  -e XDG_CACHE_HOME=/workspace/.sourcelens-cache/xdg \
+  -e MAVEN_CONFIG=/workspace/.sourcelens-cache/maven \
+  -e npm_config_cache=/workspace/.sourcelens-cache/npm \
+  -e GRADLE_USER_HOME=/workspace/.sourcelens-cache/gradle \
   -v "$workdir:/workspace:rw" \
   -w /workspace \
   "$image" \
@@ -499,5 +512,18 @@ if [[ -f "$workdir/sandbox-drill-write.txt" ]]; then
 else
   record_fail "workspace mount write marker was not created"
 fi
+
+for cache_marker in \
+  "$workdir/.sourcelens-home/sandbox-drill-cache-write.txt" \
+  "$workdir/.sourcelens-cache/xdg/sandbox-drill-cache-write.txt" \
+  "$workdir/.sourcelens-cache/maven/sandbox-drill-cache-write.txt" \
+  "$workdir/.sourcelens-cache/npm/sandbox-drill-cache-write.txt" \
+  "$workdir/.sourcelens-cache/gradle/sandbox-drill-cache-write.txt"; do
+  if [[ -f "$cache_marker" ]]; then
+    record_ok "sandbox build cache marker exists: ${cache_marker#$workdir/}"
+  else
+    record_fail "sandbox build cache marker was not created: ${cache_marker#$workdir/}"
+  fi
+done
 
 finish

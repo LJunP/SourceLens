@@ -46,6 +46,15 @@ class DashboardControllerTest {
                 .latestCodeChunks(64L)
                 .latestEmbeddedChunks(16L)
                 .latestRiskCount(2L)
+                .trustedLoopCompletionRate(100L)
+                .trustedLoopStatus("warning")
+                .trustedLoopStatusLabel("需要复核")
+                .trustedLoopReadyStages(4L)
+                .trustedLoopTotalStages(4L)
+                .reportEvidenceReady(true)
+                .codeQaReadiness("READY")
+                .recoverySignal("RISK")
+                .trustedLoopMetricsSource("API")
                 .build());
 
         mockMvc.perform(get("/api/dashboard/stats").requestAttr("userId", userId))
@@ -53,7 +62,16 @@ class DashboardControllerTest {
                 .andExpect(jsonPath("$.data.latestTotalFiles").value(128))
                 .andExpect(jsonPath("$.data.latestCodeChunks").value(64))
                 .andExpect(jsonPath("$.data.latestEmbeddedChunks").value(16))
-                .andExpect(jsonPath("$.data.latestRiskCount").value(2));
+                .andExpect(jsonPath("$.data.latestRiskCount").value(2))
+                .andExpect(jsonPath("$.data.trustedLoopCompletionRate").value(100))
+                .andExpect(jsonPath("$.data.trustedLoopStatus").value("warning"))
+                .andExpect(jsonPath("$.data.trustedLoopStatusLabel").value("需要复核"))
+                .andExpect(jsonPath("$.data.trustedLoopReadyStages").value(4))
+                .andExpect(jsonPath("$.data.trustedLoopTotalStages").value(4))
+                .andExpect(jsonPath("$.data.reportEvidenceReady").value(true))
+                .andExpect(jsonPath("$.data.codeQaReadiness").value("READY"))
+                .andExpect(jsonPath("$.data.recoverySignal").value("RISK"))
+                .andExpect(jsonPath("$.data.trustedLoopMetricsSource").value("API"));
     }
 
     @Test

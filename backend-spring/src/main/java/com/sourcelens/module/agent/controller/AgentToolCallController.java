@@ -32,12 +32,13 @@ public class AgentToolCallController {
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "20") int pageSize,
             @RequestParam(required = false) String toolName,
+            @RequestParam(required = false) Long conversationId,
             @RequestParam(required = false) Long scanTaskId,
             @RequestParam(required = false) Boolean success,
             @RequestAttribute("userId") Long userId) {
         projectService.verifyOwnership(projectId, userId);
         Page<AgentToolCall> records = agentToolCallService.listByProject(projectId, page, pageSize,
-                toolName, scanTaskId, success);
+                toolName, conversationId, scanTaskId, success);
         return Result.ok(PageResult.of(records.getRecords(), page, pageSize, records.getTotal()));
     }
 }

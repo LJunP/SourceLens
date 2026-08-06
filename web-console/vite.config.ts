@@ -4,6 +4,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '')
   const apiProxyTarget = env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8080'
+  const apiProxyTimeoutMs = Number(env.VITE_API_PROXY_TIMEOUT_MS || 300_000)
 
   function writeProxyUnavailable(res: any) {
     if (!res || res.headersSent) return
@@ -18,6 +19,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     build: {
+      chunkSizeWarningLimit: 1100,
       rollupOptions: {
         output: {
           manualChunks(id) {
@@ -30,6 +32,14 @@ export default defineConfig(({ mode }) => {
             if (id.indexOf('/axios/') !== -1) {
               return 'vendor-http'
             }
+            if (
+              id.indexOf('/antd/') !== -1
+              || id.indexOf('/@ant-design/icons/') !== -1
+              || id.indexOf('/@ant-design/cssinjs/') !== -1
+              || id.indexOf('/rc-') !== -1
+            ) {
+              return 'vendor-antd'
+            }
             return undefined
           },
         },
@@ -41,8 +51,8 @@ export default defineConfig(({ mode }) => {
         '/api': {
           target: apiProxyTarget,
           changeOrigin: true,
-          proxyTimeout: 10000,
-          timeout: 10000,
+          proxyTimeout: apiProxyTimeoutMs,
+          timeout: apiProxyTimeoutMs,
           configure(proxy) {
             proxy.on('error', (err, req, res) => {
               const path = req?.url || '/api'

@@ -36,4 +36,14 @@ public class ScanStat {
     private Long latestEmbeddedChunks;
     /** 语言分布 JSON: [{"name":"Java","files":10,"lines":5000},...] */
     private String languagesJson;
+    /** Dashboard trusted engineering loop product metrics. */
+    private Long trustedLoopCompletionRate;
+    private String trustedLoopStatus;
+    private String trustedLoopStatusLabel;
+    private Long trustedLoopReadyStages;
+    private Long trustedLoopTotalStages;
+    private Boolean reportEvidenceReady;
+    private String codeQaReadiness;
+    private String recoverySignal;
+    private String trustedLoopMetricsSource;
 }

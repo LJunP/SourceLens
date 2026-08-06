@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
-import { Form, Input, Button, Card, message, Typography } from 'antd'
+import { Form, Input, Card, message, Typography } from 'antd'
 import { UserOutlined, LockOutlined } from '@ant-design/icons'
 import { useAuth } from '../contexts/AuthContext'
 import { showApiError } from '../api/client'
+import ActionButton from '../components/ui/ActionButton'
 
 export default function Login() {
   const [loading, setLoading] = useState(false)
@@ -15,7 +16,7 @@ export default function Login() {
     try {
       await login(values.username, values.password)
       message.success('登录成功')
-      navigate('/dashboard')
+      navigate('/')
     } catch (error) {
       showApiError(error, '登录失败')
     } finally {
@@ -35,7 +36,7 @@ export default function Login() {
             <Input.Password prefix={<LockOutlined />} placeholder="密码" />
           </Form.Item>
           <Form.Item>
-            <Button type="primary" htmlType="submit" loading={loading} block>登录</Button>
+            <ActionButton type="primary" htmlType="submit" loading={loading} block label="登录" />
           </Form.Item>
           <div style={{ textAlign: 'center' }}>
             还没有账号？ <Link to="/register">立即注册</Link>

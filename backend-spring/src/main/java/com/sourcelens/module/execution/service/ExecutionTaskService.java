@@ -197,6 +197,19 @@ public class ExecutionTaskService {
         appendLog(step.getTaskId(), attemptId, stepKey, "ERROR", errorMessage);
     }
 
+    public void cancelAttemptStep(Long attemptId, String stepKey, String reason) {
+        ExecutionStep step = getAttemptStep(attemptId, stepKey);
+        if (step == null || isTerminalStep(step)) {
+            return;
+        }
+        step.setStatus("CANCELLED");
+        step.setErrorMessage(sanitizeSummary(reason));
+        step.setFinishedAt(LocalDateTime.now());
+        executionStepMapper.updateById(step);
+        metrics.recordExecutionStepStatus(stepKey, "CANCELLED");
+        appendLog(step.getTaskId(), attemptId, stepKey, "WARN", reason);
+    }
+
     public void markAttemptSuccess(Long attemptId, String currentStep) {
         ExecutionAttempt attempt = executionAttemptMapper.selectById(attemptId);
         if (attempt == null || isTerminalAttempt(attempt)) {
@@ -222,6 +235,20 @@ public class ExecutionTaskService {
         attempt.setFinishedAt(LocalDateTime.now());
         executionAttemptMapper.updateById(attempt);
         recordTaskStatusMetric(attempt.getTaskId(), "FAILED");
+        syncTaskFromCurrentAttempt(attempt, null);
+    }
+
+    public void markAttemptCancelled(Long attemptId, String currentStep, String reason) {
+        ExecutionAttempt attempt = executionAttemptMapper.selectById(attemptId);
+        if (attempt == null || isTerminalAttempt(attempt)) {
+            return;
+        }
+        attempt.setStatus("CANCELLED");
+        attempt.setCurrentStep(currentStep);
+        attempt.setErrorMessage(sanitizeSummary(reason));
+        attempt.setFinishedAt(LocalDateTime.now());
+        executionAttemptMapper.updateById(attempt);
+        recordTaskStatusMetric(attempt.getTaskId(), "CANCELLED");
         syncTaskFromCurrentAttempt(attempt, null);
     }
 

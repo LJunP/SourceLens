@@ -3,6 +3,8 @@ import type { Result } from './client'
 
 export interface CodeChunkSearchItem {
   id: number
+  citationId?: string
+  sourceLabel?: string
   scanTaskId: number
   filePath: string
   startLine: number
@@ -63,4 +65,6 @@ export interface CodeChunkSearchResponse {
 export const codeChunkApi = {
   search: (projectId: number, params?: { query?: string; scanTaskId?: number; limit?: number }) =>
     client.get<Result<CodeChunkSearchResponse>>(`/projects/${projectId}/code-chunks/search`, { params }),
+  status: (projectId: number, params?: { scanTaskId?: number; limit?: number }) =>
+    client.get<Result<CodeChunkSearchResponse>>(`/projects/${projectId}/code-chunks/status`, { params }),
 }

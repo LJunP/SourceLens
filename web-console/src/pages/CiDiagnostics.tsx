@@ -1,9 +1,9 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Alert, Button, Card, Descriptions, Empty, Form, Input, Modal, Select, Space,
-  Spin, Table, Tag, Tooltip, Typography, message
+  Alert, Card, Descriptions, Form, Input, Modal, Select, Space,
+  Table, Tag, Typography, message
 } from 'antd'
 import {
   ApiOutlined,
@@ -18,7 +18,12 @@ import {
   ToolOutlined,
 } from '@ant-design/icons'
 import { ciApi, CiDiagnostic } from '../api/ciDiagnostic'
-import { showApiError } from '../api/client'
+import { formatApiError, showApiError } from '../api/client'
+import ActionButton from '../components/ui/ActionButton'
+import IconActionButton from '../components/ui/IconActionButton'
+import StateBlock from '../components/ui/StateBlock'
+import { createSelectableTableRowProps } from '../components/ui/selectableTableRow'
+import { redactSensitiveText } from '../utils/displayRedaction'
 
 const { Text, Paragraph } = Typography
 const { TextArea } = Input
@@ -54,11 +59,39 @@ interface DiagnosticSignal {
   }>
 }
 
-interface Props {
-  projectId: number
+interface RepairReadiness {
+  ready: boolean
+  summary: string
+  targetFile: string | null
+  checks: Array<{
+    label: string
+    value: string
+    tone: DiagnosticTone
+  }>
 }
 
-export default function CiDiagnostics({ projectId }: Props) {
+interface CiGovernanceStep {
+  key: 'log-intake' | 'root-cause-evidence' | 'repair-gate' | 'autorepair-handoff'
+  sequence: string
+  label: string
+  state: DiagnosticTone
+  status: string
+  detail: string
+  actionLabel?: string
+  actionDisabled?: boolean
+  onAction?: () => void
+}
+
+interface Props {
+  projectId: number
+  initialDiagnosticId?: number
+}
+
+function redactCiLogSnippet(value: string) {
+  return redactSensitiveText(value)
+}
+
+export default function CiDiagnostics({ projectId, initialDiagnosticId }: Props) {
   const navigate = useNavigate()
   const [items, setItems] = useState<CiDiagnostic[]>([])
   const [loading, setLoading] = useState(true)
@@ -68,13 +101,17 @@ export default function CiDiagnostics({ projectId }: Props) {
   const [showCreate, setShowCreate] = useState(false)
   const [creating, setCreating] = useState(false)
   const [selected, setSelected] = useState<CiDiagnostic | null>(null)
+  const [listError, setListError] = useState<string | null>(null)
+  const [deepLinkError, setDeepLinkError] = useState<string | null>(null)
   const [form] = Form.useForm()
+  const deepLinkRequestRef = useRef<number | null>(null)
 
   const fetchItems = useCallback((silent = false) => {
     if (!silent) setLoading(true)
     ciApi.listByProject(projectId, page, 20, statusFilter)
       .then(res => {
         const data = res.data.data
+        setListError(null)
         setItems(data.items || [])
         setTotal(data.total)
         setSelected(prev => {
@@ -82,7 +119,10 @@ export default function CiDiagnostics({ projectId }: Props) {
           return data.items?.find(item => item.id === prev.id) || prev
         })
       })
-      .catch(error => showApiError(error, '加载 CI 诊断失败'))
+      .catch(error => {
+        setListError(formatApiError(error, '加载 CI 诊断失败'))
+        showApiError(error, '加载 CI 诊断失败')
+      })
       .finally(() => {
         if (!silent) setLoading(false)
       })
@@ -90,14 +130,128 @@ export default function CiDiagnostics({ projectId }: Props) {
 
   useEffect(() => { fetchItems() }, [fetchItems])
 
+  useEffect(() => {
+    deepLinkRequestRef.current = null
+    setDeepLinkError(null)
+    setSelected(null)
+  }, [projectId, initialDiagnosticId])
+
+  useEffect(() => {
+    if (!initialDiagnosticId || loading || selected?.id === initialDiagnosticId) return
+
+    const listedDiagnostic = items.find(item => item.id === initialDiagnosticId)
+    if (listedDiagnostic) {
+      setDeepLinkError(null)
+      setSelected(listedDiagnostic)
+      return
+    }
+
+    if (deepLinkRequestRef.current === initialDiagnosticId) return
+    deepLinkRequestRef.current = initialDiagnosticId
+    ciApi.detail(initialDiagnosticId)
+      .then(res => {
+        const detail = res.data.data
+        if (detail.projectId !== projectId) {
+          setDeepLinkError(`目标 CI 诊断 #${initialDiagnosticId} 不属于当前项目，已保留当前列表。`)
+          return
+        }
+        setDeepLinkError(null)
+        setSelected(detail)
+        setItems(prev => prev.some(item => item.id === detail.id) ? prev : [detail, ...prev])
+      })
+      .catch(error => {
+        setDeepLinkError(formatApiError(error, `未找到 CI 诊断 #${initialDiagnosticId}`))
+        showApiError(error, `未找到 CI 诊断 #${initialDiagnosticId}`)
+      })
+  }, [initialDiagnosticId, items, loading, projectId, selected?.id])
+
   const activeCount = useMemo(() => items.filter(item => item.status === 'PENDING' || item.status === 'ANALYZING').length, [items])
   const completedCount = useMemo(() => items.filter(item => item.status === 'COMPLETED').length, [items])
   const failedCount = useMemo(() => items.filter(item => item.status === 'FAILED').length, [items])
   const actionableCount = useMemo(() => items.filter(item => parseJsonList(item.fixSuggestions).length > 0).length, [items])
+  const evidenceReadyCount = useMemo(
+    () => items.filter(item => (
+      item.status === 'COMPLETED'
+      && Boolean(item.rootCause)
+      && parseJsonList(item.relatedFiles).length > 0
+      && parseJsonList(item.fixSuggestions).length > 0
+    )).length,
+    [items],
+  )
   const selectedSignal = selected ? buildDiagnosticSignal(selected) : null
   const selectedRelatedFiles = selected ? parseJsonList(selected.relatedFiles) : []
   const selectedFixSuggestions = selected ? parseJsonList(selected.fixSuggestions) : []
   const repairUrl = selected ? autoRepairCandidateUrl(selected, selectedRelatedFiles, selectedFixSuggestions) : null
+  const repairReadiness = selected ? buildRepairReadiness(selected, selectedRelatedFiles, selectedFixSuggestions) : null
+  const governanceLoopSteps = useMemo<CiGovernanceStep[]>(() => [
+    {
+      key: 'log-intake',
+      sequence: 'C1',
+      label: '日志接入',
+      state: listError ? 'danger' : total > 0 ? 'ready' : 'idle',
+      status: listError ? '数据源异常' : total > 0 ? `${total} 条已接入` : '等待输入',
+      detail: listError
+        ? 'CI 诊断列表加载失败，当前数量和状态不可作为判断依据。'
+        : '失败日志与提交上下文进入诊断队列；页面展示脱敏不代表原始日志可以直接外发。',
+    },
+    {
+      key: 'root-cause-evidence',
+      sequence: 'C2',
+      label: '根因证据',
+      state: evidenceReadyCount > 0 ? 'ready' : completedCount > 0 ? 'warning' : failedCount > 0 ? 'danger' : 'idle',
+      status: evidenceReadyCount > 0
+        ? `当前页 ${evidenceReadyCount} 条证据齐全`
+        : completedCount > 0
+          ? '已完成但证据不足'
+          : failedCount > 0
+            ? '诊断失败'
+            : '等待分析',
+      detail: '根因、相关文件和修复建议必须同时存在；诊断完成不代表根因正确或 LLM 输出事实正确。',
+    },
+    {
+      key: 'repair-gate',
+      sequence: 'C3',
+      label: '修复资格',
+      state: repairReadiness?.ready
+        ? 'ready'
+        : selected?.status === 'FAILED'
+          ? 'danger'
+          : selected
+            ? 'warning'
+            : 'idle',
+      status: repairReadiness?.ready
+        ? '候选条件满足'
+        : selected
+          ? '证据仍需补齐'
+          : '等待选择诊断',
+      detail: repairReadiness?.ready
+        ? `已绑定仓库、相关文件和修复建议，目标文件为 ${repairReadiness.targetFile}。`
+        : repairReadiness?.summary || '选择一条诊断后，系统会检查仓库、文件定位和修复建议是否齐全。',
+    },
+    {
+      key: 'autorepair-handoff',
+      sequence: 'C4',
+      label: 'AutoRepair 交接',
+      state: repairUrl ? 'ready' : selected ? 'warning' : 'idle',
+      status: repairUrl ? '可以交接' : selected ? '交接受阻' : '等待修复资格',
+      detail: repairUrl
+        ? '创建修复候选只传递受控上下文，后续仍需补丁审查、CI、人工 review 和审计复盘。'
+        : '只有修复资格门禁通过后才开放交接；不得把诊断建议直接视为已验证修复。',
+      actionLabel: repairUrl ? '生成修复候选' : selected ? '补齐诊断证据' : '先选择诊断',
+      actionDisabled: !repairUrl,
+      onAction: repairUrl ? () => navigate(repairUrl) : undefined,
+    },
+  ], [completedCount, evidenceReadyCount, failedCount, listError, navigate, repairReadiness, repairUrl, selected, total])
+  const selectedDetailId = selected ? `ci-diagnostic-detail-${selected.id}` : undefined
+  const selectedTitleId = selected ? `ci-diagnostic-detail-title-${selected.id}` : undefined
+  const selectedRedactedRawLogSnippet = useMemo(
+    () => selected?.rawLogSnippet ? redactCiLogSnippet(selected.rawLogSnippet) : '',
+    [selected?.rawLogSnippet],
+  )
+
+  const selectDiagnostic = useCallback((record: CiDiagnostic) => {
+    setSelected(record)
+  }, [])
 
   const handleCreate = async () => {
     try {
@@ -133,9 +287,15 @@ export default function CiDiagnostics({ projectId }: Props) {
       key: 'workflowName',
       ellipsis: true,
       render: (name: string, record: CiDiagnostic) => (
-        <Button type="link" className="sl-ci-table-link" onClick={() => setSelected(record)}>
-          {name || `#${record.runNumber || record.id}`}
-        </Button>
+        <ActionButton
+          type="link"
+          className="sl-ci-table-link"
+          onClick={(event) => {
+            event.stopPropagation()
+            selectDiagnostic(record)
+          }}
+          label={name || `#${record.runNumber || record.id}`}
+        />
       ),
     },
     {
@@ -184,9 +344,13 @@ export default function CiDiagnostics({ projectId }: Props) {
       key: 'action',
       width: 92,
       render: (_: unknown, record: CiDiagnostic) => (
-        <Tooltip title="重新分析">
-          <Button size="small" icon={<ReloadOutlined />} onClick={(event) => { event.stopPropagation(); handleReanalyze(record.id) }} />
-        </Tooltip>
+        <IconActionButton
+          label={`重新分析 CI 诊断 #${record.id}`}
+          tooltip="重新分析"
+          size="small"
+          icon={<ReloadOutlined />}
+          onClick={(event) => { event.stopPropagation(); handleReanalyze(record.id) }}
+        />
       ),
     },
   ]
@@ -213,12 +377,8 @@ export default function CiDiagnostics({ projectId }: Props) {
               onChange={setStatusFilter}
               options={Object.keys(STATUS_MAP).map(status => ({ label: STATUS_MAP[status].label, value: status }))}
             />
-            <Button icon={<ReloadOutlined />} onClick={() => fetchItems(true)}>
-              刷新
-            </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowCreate(true)}>
-              新建诊断
-            </Button>
+            <ActionButton icon={<ReloadOutlined />} onClick={() => fetchItems(true)} label="刷新" />
+            <ActionButton type="primary" icon={<PlusOutlined />} onClick={() => setShowCreate(true)} label="新建诊断" />
           </div>
         </section>
 
@@ -245,14 +405,40 @@ export default function CiDiagnostics({ projectId }: Props) {
         <CiStat icon={<ToolOutlined />} label="可修复建议" value={actionableCount} tone={actionableCount > 0 ? 'ready' : 'idle'} />
       </div>
 
+      <CiGovernanceLoop steps={governanceLoopSteps} />
+
       <div className={`sl-ci-workbench ${selected ? 'sl-ci-workbench-with-detail' : ''}`}>
-        <Card className="sl-section-card sl-ci-table-card" title={<span className="sl-card-title"><BugOutlined /> 诊断列表</span>}>
+        {deepLinkError && (
+          <Alert
+            className="sl-ci-deep-link-alert"
+            type="warning"
+            showIcon
+            message="目标 CI 诊断未能定位"
+            description={deepLinkError}
+          />
+        )}
+        <Card className="sl-section-card sl-ci-table-card sl-selectable-table-card" title={<span className="sl-card-title"><BugOutlined /> 诊断列表</span>}>
           <Table
+            className="sl-ci-diagnostics-table"
             dataSource={items}
             columns={columns}
             rowKey="id"
             loading={loading}
             size="middle"
+            scroll={{ x: 760 }}
+            locale={{
+              emptyText: listError ? (
+                <StateBlock
+                  compact
+                  tone="error"
+                  title="CI 诊断加载失败"
+                  description={listError}
+                  action={<ActionButton size="small" icon={<ReloadOutlined />} onClick={() => fetchItems()} label="重试" />}
+                />
+              ) : (
+                <StateBlock compact title="暂无 CI 诊断" description="粘贴失败日志或接入 CI 事件后会在这里生成诊断记录。" />
+              ),
+            }}
             pagination={{
               current: page,
               total,
@@ -261,34 +447,40 @@ export default function CiDiagnostics({ projectId }: Props) {
               onChange: setPage,
             }}
             rowClassName={(record) => selected?.id === record.id ? 'sl-ci-row-selected' : ''}
-            onRow={(record) => ({
-              onClick: () => setSelected(record),
+            onRow={(record) => createSelectableTableRowProps({
+              record,
+              selected: selected?.id === record.id,
+              onSelect: selectDiagnostic,
+              controlsId: selectedDetailId,
+              label: `CiDiagnostic #${record.id} ${record.workflowName || `#${record.runNumber || record.id}`} ${selected?.id === record.id ? '已选中' : '查看详情'}`,
             })}
           />
         </Card>
 
         {selected && selectedSignal && (
           <Card
+            id={selectedDetailId}
+            role="region"
+            aria-labelledby={selectedTitleId}
             className="sl-section-card sl-ci-detail-card"
             title={
-              <span className="sl-card-title">
+              <span className="sl-card-title" id={selectedTitleId}>
                 <Tag color={STATUS_MAP[selected.status]?.color || 'default'}>{STATUS_MAP[selected.status]?.label || selected.status}</Tag>
                 {selected.workflowName || `#${selected.runNumber || selected.id}`}
               </span>
             }
             extra={
               <Space>
-                {repairUrl && (
-                  <Button size="small" type="primary" icon={<ToolOutlined />} onClick={() => navigate(repairUrl)}>
-                    生成修复候选
-                  </Button>
+              {repairUrl && (
+                  <ActionButton size="small" type="primary" icon={<ToolOutlined />} onClick={() => navigate(repairUrl)} label="生成修复候选" />
                 )}
-                <Button size="small" onClick={() => setSelected(null)}>关闭</Button>
+                <ActionButton size="small" onClick={() => setSelected(null)} label="关闭" />
               </Space>
             }
           >
             <div className="sl-ci-detail-stack">
               <DiagnosticSignalCard signal={selectedSignal} />
+              {repairReadiness && <RepairReadinessCard readiness={repairReadiness} />}
 
               {selected.status === 'COMPLETED' ? (
                 <>
@@ -302,7 +494,7 @@ export default function CiDiagnostics({ projectId }: Props) {
                         {selectedRelatedFiles.map((file, index) => <Tag key={`${file}-${index}`}>{file}</Tag>)}
                       </div>
                     ) : (
-                      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="未识别相关文件" />
+                      <StateBlock compact title="未识别相关文件" description="当前诊断结果没有返回可定位的文件路径。" />
                     )}
                   </section>
 
@@ -318,7 +510,7 @@ export default function CiDiagnostics({ projectId }: Props) {
                         ))}
                       </div>
                     ) : (
-                      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无修复建议" />
+                      <StateBlock compact title="暂无修复建议" description="当前诊断没有形成可直接推进到自动修码的建议。" />
                     )}
                   </section>
 
@@ -331,22 +523,19 @@ export default function CiDiagnostics({ projectId }: Props) {
                   </Descriptions>
                 </>
               ) : selected.status === 'ANALYZING' ? (
-                <div className="sl-ci-running">
-                  <Spin size="large" />
-                  <Text type="secondary">正在分析 CI 日志...</Text>
-                </div>
+                <StateBlock tone="loading" title="正在分析 CI 日志" description="系统正在提取失败摘要、根因和修复建议。" />
               ) : selected.status === 'FAILED' ? (
                 <Alert type="error" showIcon message="诊断失败" description={selected.errorMessage || '分析任务失败'} />
               ) : (
-                <Empty description="等待分析" />
+                <StateBlock compact title="等待分析" description="诊断进入分析队列后会生成根因、相关文件和建议。" />
               )}
 
               <section className="sl-ci-section">
                 <div className="sl-ci-section-title">原始日志片段</div>
                 {selected.rawLogSnippet ? (
-                  <pre className="sl-ci-log">{selected.rawLogSnippet}</pre>
+                  <pre className="sl-ci-log sl-ci-log-redacted" aria-label="脱敏 CI 日志片段">{selectedRedactedRawLogSnippet}</pre>
                 ) : (
-                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="无日志数据" />
+                  <StateBlock compact title="无日志数据" description="创建诊断时没有保存可展示的原始日志片段。" />
                 )}
               </section>
             </div>
@@ -415,6 +604,57 @@ function CiStat({ icon, label, value, tone = 'idle' }: { icon: ReactNode; label:
   )
 }
 
+function CiGovernanceLoop({ steps }: { steps: CiGovernanceStep[] }) {
+  const iconByStep: Record<CiGovernanceStep['key'], ReactNode> = {
+    'log-intake': <BugOutlined />,
+    'root-cause-evidence': <FileSearchOutlined />,
+    'repair-gate': <SafetyCertificateOutlined />,
+    'autorepair-handoff': <ToolOutlined />,
+  }
+
+  return (
+    <section className="sl-ci-governance-loop" role="region" aria-label="CI 失败诊断治理闭环">
+      <div className="sl-ci-governance-head">
+        <div>
+          <span>Failure governance</span>
+          <h2>CI 失败诊断治理闭环</h2>
+        </div>
+        <p>把失败输入、根因证据、修复资格和 AutoRepair 出口放在同一条可审计链路中。</p>
+      </div>
+      <div className="sl-ci-governance-grid">
+        {steps.map(step => (
+          <article
+            className={`sl-ci-governance-step sl-ci-governance-step-${step.state}`}
+            data-sl-ci-governance-step={step.key}
+            key={step.key}
+          >
+            <div className="sl-ci-governance-step-head">
+              <div className="sl-ci-governance-icon">{iconByStep[step.key]}</div>
+              <div className="sl-ci-governance-meta">
+                <span>{step.sequence}</span>
+                <strong>{step.status}</strong>
+              </div>
+            </div>
+            <div className="sl-ci-governance-copy">
+              <h3>{step.label}</h3>
+              <p>{step.detail}</p>
+            </div>
+            {step.actionLabel && (
+              <ActionButton
+                type={step.onAction ? 'primary' : 'default'}
+                disabled={step.actionDisabled}
+                icon={<ToolOutlined />}
+                onClick={step.onAction}
+                label={step.actionLabel}
+              />
+            )}
+          </article>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function DiagnosticSignalCard({ signal }: { signal: DiagnosticSignal }) {
   return (
     <section className={`sl-ci-diagnostic-signal sl-ci-diagnostic-signal-${signal.tone}`}>
@@ -438,6 +678,35 @@ function DiagnosticSignalCard({ signal }: { signal: DiagnosticSignal }) {
         <ApiOutlined />
         <span>{signal.nextAction}</span>
       </div>
+    </section>
+  )
+}
+
+function RepairReadinessCard({ readiness }: { readiness: RepairReadiness }) {
+  return (
+    <section className={`sl-ci-repair-readiness ${readiness.ready ? 'sl-ci-repair-readiness-ready' : 'sl-ci-repair-readiness-warning'}`}>
+      <div className="sl-ci-repair-readiness-head">
+        <ToolOutlined />
+        <div>
+          <span>修复候选资格</span>
+          <strong>{readiness.ready ? '可以生成' : '暂不可生成'}</strong>
+        </div>
+      </div>
+      <p>{readiness.summary}</p>
+      <div className="sl-ci-diagnostic-grid">
+        {readiness.checks.map(check => (
+          <div className={`sl-ci-diagnostic-check sl-ci-diagnostic-check-${check.tone}`} key={check.label}>
+            <span>{check.label}</span>
+            <strong>{check.value}</strong>
+          </div>
+        ))}
+      </div>
+      {readiness.targetFile && (
+        <div className="sl-ci-next-action">
+          <FileSearchOutlined />
+          <span>候选会默认绑定第一个相关文件：{readiness.targetFile}</span>
+        </div>
+      )}
     </section>
   )
 }
@@ -503,6 +772,31 @@ function buildDiagnosticSignal(item: CiDiagnostic): DiagnosticSignal {
   }
 }
 
+function buildRepairReadiness(item: CiDiagnostic, relatedFiles: string[], suggestions: string[]): RepairReadiness {
+  const hasRepository = Boolean(item.repositoryId)
+  const hasRelatedFile = relatedFiles.length > 0
+  const hasSuggestion = suggestions.length > 0
+  const ready = hasRepository && hasRelatedFile && hasSuggestion
+  const missing = [
+    hasRepository ? null : '仓库 ID',
+    hasRelatedFile ? null : '相关文件',
+    hasSuggestion ? null : '修复建议',
+  ].filter(Boolean)
+
+  return {
+    ready,
+    targetFile: ready ? relatedFiles[0] : null,
+    summary: ready
+      ? '当前诊断具备仓库、相关文件和修复建议，可以进入 AutoRepair 候选创建。'
+      : `当前诊断缺少 ${missing.join('、')}，需要补充日志或重新分析后再生成修复候选。`,
+    checks: [
+      { label: '仓库绑定', value: hasRepository ? `#${item.repositoryId}` : '缺失', tone: hasRepository ? 'ready' : 'warning' },
+      { label: '相关文件', value: `${relatedFiles.length} 个`, tone: hasRelatedFile ? 'ready' : 'warning' },
+      { label: '修复建议', value: `${suggestions.length} 条`, tone: hasSuggestion ? 'ready' : 'warning' },
+    ],
+  }
+}
+
 function autoRepairCandidateUrl(item: CiDiagnostic, relatedFiles: string[], suggestions: string[]) {
   if (!item.repositoryId || relatedFiles.length === 0 || suggestions.length === 0) return null
   const targetDesc = [
@@ -512,6 +806,7 @@ function autoRepairCandidateUrl(item: CiDiagnostic, relatedFiles: string[], sugg
     `修复建议：${suggestions.join('；')}`,
   ].filter(Boolean).join('\n')
   const params = new URLSearchParams({
+    projectId: String(item.projectId),
     repositoryId: String(item.repositoryId),
     filePath: relatedFiles[0],
     targetDesc,

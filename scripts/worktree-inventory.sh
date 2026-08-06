@@ -108,7 +108,7 @@ category_for() {
     .github/*|scripts/*|deploy/*|.dockerignore|.gitignore|Makefile|backend-spring/Dockerfile)
       echo "Operations, CI and release gates"
       ;;
-    docs/*|README.md)
+    docs/*|README.md|CHAIRMAN_BRIEFING.md|CHANGELOG.md|CODE_OF_CONDUCT.md|CONTRIBUTING.md|LICENSE|ROADMAP.md|SECURITY.md|SUPPORT.md)
       echo "Documentation and handoff"
       ;;
     analyzer-rust/*)
@@ -157,7 +157,9 @@ backend-spring/src/main/resources/db/migration/V010__*|\
 backend-spring/src/main/resources/db/migration/V011__*|\
 backend-spring/src/main/resources/db/migration/V013__*|\
 backend-spring/src/main/resources/db/migration/V023__*|\
+backend-spring/src/main/resources/db/migration/V029__*|\
 backend-spring/src/test/java/com/sourcelens/Analysis*|\
+backend-spring/src/test/java/com/sourcelens/AnalyzerRunnerTest.java|\
 backend-spring/src/test/java/com/sourcelens/ArchitectureRiskAnalyzerTest.java|\
 backend-spring/src/test/java/com/sourcelens/CodeChunk*|\
 backend-spring/src/test/java/com/sourcelens/CodeGraph*|\

@@ -1,0 +1,73 @@
+schema_version: 1
+record_type: sourcelens_aios_task_contract
+
+task_id: AIOS-P0-005
+phase: P0
+title: Partition the inherited dirty worktree into reviewable checkpoints
+objective: Establish one reviewable and reproducible SourceLens AIOS source baseline without losing, rewriting or silently accepting inherited work.
+why_now: P0 cannot pass and P1 cannot start while the inherited dirty worktree remains one unreviewable combined state; 146 tracked modifications and 168 untracked paths are the captured starting-snapshot counts, not a current live count.
+task_spec_ref: docs/aios/P0_GATE.md#3-dirty-worktree-recovery-plan
+owner_role: Engineering Manager Agent
+worker_role: Baseline and Migration Worker
+
+write_scope:
+  - external audit artifacts under /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-05-*
+  - Git index and local checkpoint metadata for paths accepted by an independent slice review
+  - docs/aios/truth/project_state.yaml evidence pointers after review
+  - docs/aios/P0_GATE.md gate evidence after review
+read_context:
+  - docs/aios/truth/project_state.yaml
+  - docs/aios/STRATEGIC_CONSTITUTION.md
+  - docs/aios/MASTER_EXECUTION_PROTOCOL.md
+  - docs/aios/MIGRATION_LEDGER.yaml
+  - docs/aios/P0_GATE.md
+  - /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-b-preservation-20260710T154704Z
+dependencies:
+  - The captured pre-independent-review starting-state manifest and reconstruction checks remain hash-valid.
+  - Before partition begins, the exact post-remediation worktree snapshot and its external truth-binding attestation pass verification.
+  - Migration-ledger path ownership remains non-overlapping.
+
+risk_level: critical
+baseline_ref: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-b-preservation-20260710T154704Z
+baseline_semantics: CAPTURED_PRE_INDEPENDENT_REVIEW_STARTING_STATE_NOT_EXACT_CURRENT_WORKTREE
+starting_snapshot_counts:
+  tracked_changed: 146
+  untracked_files: 168
+final_exact_state_attestation_ref: /Users/lijunpeng/Desktop/cc/project/.sourcelens-audit/p0-truth-contained-final/truth-binding.json
+
+acceptance_criteria:
+  - Every tracked modification and non-ignored untracked path is assigned exactly once to review slice A through G or explicitly marked unresolved.
+  - Each slice records exact paths, dependencies, migration disposition, targeted tests, known failures and an independent verdict.
+  - No user work is deleted, reverted, stashed, reformatted or overwritten to manufacture a clean status.
+  - Every accepted checkpoint identifies its exact Git tree and can be reconciled against both the captured starting-state snapshot and the externally attested exact post-remediation snapshot.
+  - The resulting P1 candidate baseline records migrations, lockfiles, tool versions, build and test commands, skips and residual risks.
+  - The Truth Registry changes only after evidence and independent review exist.
+required_evidence:
+  - binary-safe status and path inventory for the starting state
+  - slice ownership manifest with no overlapping path owners
+  - per-slice dependency and migration-disposition report
+  - exact targeted command output and independent verdict for each accepted slice
+  - checkpoint commit or tree identifiers and rollback instructions
+  - final candidate-baseline manifest with reproduction commands
+
+independent_reviewer: Quality and Evaluation Agent
+additional_reviewers:
+  - CTO Agent for all slices
+  - Security Agent for slices B, D and E
+  - Chief AI Research Agent for slices C and D
+  - Product Intelligence Agent for slices A, F and G
+
+stop_conditions:
+  - A preserved-snapshot hash or reconstruction check fails.
+  - A path has multiple owners or cannot be assigned without first understanding a dependency.
+  - Partitioning would require source-content changes, destructive Git operations or loss of user work.
+  - A slice fails its declared targeted gate and cannot be separated safely.
+  - The task expands into P1 implementation, feature development or broad refactoring.
+forbidden_actions:
+  - git reset --hard, git clean, destructive checkout, automatic stash or history rewrite
+  - deleting, moving, reformatting or rewriting inherited source merely to simplify the baseline
+  - modifying business behavior while classifying or checkpointing a slice
+  - declaring a capability accepted from the aggregate inherited release package alone
+  - entering P1 or enabling model writes, shell execution, real-provider source egress, remote PR submission or autonomous merge
+
+status: ready

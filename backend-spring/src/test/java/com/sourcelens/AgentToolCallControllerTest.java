@@ -45,6 +45,7 @@ class AgentToolCallControllerTest {
         AgentToolCall call = AgentToolCall.builder()
                 .id(77L)
                 .projectId(projectId)
+                .conversationId(99L)
                 .scanTaskId(42L)
                 .toolName("read_file")
                 .permissionLevel("READ_ONLY")
@@ -54,21 +55,23 @@ class AgentToolCallControllerTest {
         Page<AgentToolCall> page = new Page<>(1, 20, 1);
         page.setRecords(List.of(call));
         doNothing().when(projectService).verifyOwnership(projectId, userId);
-        when(agentToolCallService.listByProject(projectId, 1, 20, "read_file", 42L, true)).thenReturn(page);
+        when(agentToolCallService.listByProject(projectId, 1, 20, "read_file", 99L, 42L, true)).thenReturn(page);
 
         mockMvc.perform(get("/api/projects/10/agent-tool-calls")
                         .param("toolName", "read_file")
+                        .param("conversationId", "99")
                         .param("scanTaskId", "42")
                         .param("success", "true")
                         .requestAttr("userId", userId))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.items[0].id").value(77))
+                .andExpect(jsonPath("$.data.items[0].conversationId").value(99))
                 .andExpect(jsonPath("$.data.items[0].scanTaskId").value(42))
                 .andExpect(jsonPath("$.data.items[0].toolName").value("read_file"))
                 .andExpect(jsonPath("$.data.total").value(1));
 
         verify(projectService).verifyOwnership(projectId, userId);
         verify(agentToolCallService).listByProject(eq(projectId), eq(1), eq(20),
-                eq("read_file"), eq(42L), eq(true));
+                eq("read_file"), eq(99L), eq(42L), eq(true));
     }
 }

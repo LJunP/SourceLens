@@ -1,0 +1,109 @@
+schema_version: 1
+record_type: sourcelens_aios_task_contract
+
+task_id: AIOS-P0-004A
+phase: P0
+title: Contain active AIOS truth drift and legacy-context pollution
+objective: Make every active project entry expose the frozen P0 truth while retaining legacy material only as explicitly cited historical evidence.
+why_now: Active Dashboard and Founder surfaces contradicted canonical P0 facts, and default retrieval of old phase documents could reactivate the retired roadmap.
+task_spec_ref: docs/aios/truth/project_state.yaml#blocking_risks
+owner_role: Product Intelligence Agent
+worker_role: Truth Containment Worker
+
+write_scope:
+  - AIOS truth, gate, migration and operator-entry files
+  - status banners and first-page authority wording in legacy and supporting documents
+  - Dashboard phase, metric and project-task boundary copy
+  - governance and frontend assertions that prevent the same truth drift
+  - directly related project metadata and generated code-map index
+read_context:
+  - docs/aios/STRATEGIC_CONSTITUTION.md
+  - docs/aios/MASTER_EXECUTION_PROTOCOL.md
+  - docs/aios/truth/project_state.yaml
+  - docs/aios/MIGRATION_LEDGER.yaml
+  - docs/aios/P0_GATE.md
+dependencies: []
+
+risk_level: medium
+baseline_ref: docs/aios/STRATEGIC_CONSTITUTION.md
+acceptance_criteria:
+  - Active entries expose P0 Strategic Foundation, P0 IN_PROGRESS and P0 Gate NOT_READY or NO-GO without presenting retired phases as current.
+  - Dashboard exposes Verified Task Success Rate as not measured and presents P0-05 as the only current project-development task.
+  - Existing product navigation is explicitly labeled inherited runtime guidance and cannot be mistaken for AIOS project intake or investment priority.
+  - Legacy strategy, status, handoff, backlog, scorecard, progress and activity files are excluded from default Agent context in both the migration ledger and their headers.
+  - Governance validation fails if decisive phase, gate, task-status, active-copy or context-policy facts regress.
+  - No legacy file is deleted, moved or rewritten beyond bounded authority containment.
+required_evidence:
+  - AIOS governance validation output
+  - active-entry legacy-claim scan
+  - legacy-context header scan
+  - frontend UI regression result
+  - frontend production build result
+  - Git diff whitespace result
+
+changed_path_inventory:
+  authority_and_truth:
+    - docs/aios/tasks/P0-04A_TRUTH_CONTAINMENT.yaml
+    - docs/aios/tasks/P0-05_BASELINE_SLICING.yaml
+    - docs/aios/truth/project_state.yaml
+    - docs/aios/P0_GATE.md
+    - docs/aios/P0_INDEPENDENT_REVIEW.md
+    - docs/aios/MIGRATION_LEDGER.yaml
+    - docs/aios/README.md
+    - docs/aios/CODEX_MASTER_PROMPT.md
+    - docs/aios/BASELINE_ADAPTER_CONTRACT.md
+    - CHAIRMAN_BRIEFING.md
+    - CHANGELOG.md
+  active_product_entry:
+    - web-console/src/pages/Dashboard.tsx
+    - web-console/tests/dashboard-next-action-smoke.spec.ts
+  legacy_strategy_and_status_headers:
+    - docs/PROJECT_PLAN.md
+    - docs/PHASE_REQUIREMENTS.md
+    - docs/PRODUCT_POSITIONING_AND_ACCESS_MODEL.md
+    - docs/TOP_LEVEL_PRODUCT_OPERATING_DEFINITIONS.md
+    - docs/REFACTOR_ROADMAP.md
+    - docs/PRODUCT_METRICS_AND_FEEDBACK.md
+    - docs/AGENT_STATUS_BOARD.md
+    - docs/CODEX_HANDOFF.md
+    - docs/QUALITY_SCORECARD.md
+    - docs/WORK_INTAKE_AND_BACKLOG.md
+    - docs/PRODUCT_PROGRESS_LOG.md
+    - docs/AGENT_ACTIVITY_LOG.md
+    - docs/AGENT_DECISION_REGISTER.md
+  supporting_reference_headers:
+    - docs/FRONTEND_DESIGN_SYSTEM.md
+    - docs/THREAT_MODEL.md
+    - docs/OPERATIONS_RUNBOOK.md
+    - docs/PHASE12_BASELINE.md
+    - docs/DISASTER_RECOVERY_AND_ROLLBACK_SIGNOFF.md
+    - docs/SECURITY_BOUNDARY.md
+    - docs/WORKTREE_HYGIENE.md
+    - docs/PRODUCT_GOVERNANCE.md
+    - docs/RISK_REGISTER.md
+    - docs/PROJECT_STRUCTURE_AUDIT.md
+    - docs/PERFORMANCE_BENCHMARK.md
+  validation_and_metadata:
+    - scripts/validate-aios-governance.sh
+    - scripts/validate-frontend-ui.mjs
+    - docs/DATABASE_DESIGN.md
+    - .github/ISSUE_TEMPLATE/config.yml
+    - backend-spring/pom.xml
+  generated_index:
+    - docs/PROJECT_CODE_MAP.md
+
+independent_reviewer: Quality and Evaluation Agent
+additional_reviewers:
+  - CTO Agent
+  - Security Agent for context-policy and evidence-boundary claims
+stop_conditions:
+  - The task changes mission, ICP, year-one outcome or phase route.
+  - The task expands into broad UI redesign, legacy-body rewriting or P1 implementation.
+  - A current fact cannot be supported by a canonical file or reproducible command.
+forbidden_actions:
+  - deleting, moving or bulk-rewriting historical assets
+  - treating a header as technical prevention of retrieval
+  - enabling any blocked execution or egress permission
+  - declaring P0 complete or P1 authorized
+
+status: accepted

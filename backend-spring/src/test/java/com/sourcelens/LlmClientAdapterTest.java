@@ -25,6 +25,25 @@ class LlmClientAdapterTest {
     }
 
     @Test
+    void chat_shouldEmitUsableCitationWhenPromptRequiresEvidenceLabels() {
+        String response = client.chat(mockConfig(), List.of(
+                Map.of("role", "user", "content", "请重写回答并引用可用证据标签，只能使用这些标签：[C1, C2]。")));
+
+        assertEquals("Mock LLM response: 已基于当前检索证据生成可验证回答 [C1]。", response);
+    }
+
+    @Test
+    void chat_shouldEmitDeterministicFakeCitationNoiseBoundaryAnswer() {
+        String response = client.chat(mockConfig(), List.of(
+                Map.of("role", "user", "content", "claim citation noise boundary 假引用噪声 C1")));
+
+        assertTrue(response.contains("fake citation marker in code must be ignored [C1]"));
+        assertTrue(response.contains("ERROR AuthService failed token validation [C1]"));
+        assertTrue(response.contains("IllegalStateException"));
+        assertTrue(response.contains("`[C1]`"));
+    }
+
+    @Test
     void getEmbedding_shouldRouteToMatchingProviderAdapter() {
         List<Float> embedding = client.getEmbedding(mockConfig(), "hello");
 
@@ -50,6 +69,30 @@ class LlmClientAdapterTest {
 
         assertEquals("Mock LLM response: use a tool", result.getContent());
         assertTrue(result.getTokensUsed() > 0);
+        assertTrue(result.hasToolCalls());
+        assertEquals("list_dir", ((Map<?, ?>) result.getToolCalls().get(0).get("function")).get("name"));
+    }
+
+    @Test
+    void chatWithTools_shouldNotStartToolLoopForCitationRetryAnswer() {
+        LlmClient.LlmStreamResult result = client.chatWithTools(
+                mockConfig(),
+                List.of(Map.<String, Object>of("role", "user", "content", "请引用 evidence 标签：[C1, C2]。")),
+                List.of(Map.<String, Object>of("type", "function")));
+
+        assertEquals("Mock LLM response: 已基于当前检索证据生成可验证回答 [C1]。", result.getContent());
+        assertFalse(result.hasToolCalls());
+    }
+
+    @Test
+    void chatWithTools_shouldStopToolLoopAfterToolResult() {
+        LlmClient.LlmStreamResult result = client.chatWithTools(
+                mockConfig(),
+                List.of(Map.<String, Object>of("role", "tool", "name", "list_dir", "content", "README.md")),
+                List.of(Map.<String, Object>of("type", "function")));
+
+        assertEquals("Mock LLM observed tool result from list_dir.", result.getContent());
+        assertFalse(result.hasToolCalls());
     }
 
     @Test

@@ -1,6 +1,11 @@
-import { useState, useEffect } from 'react'
-import { Select, Typography, Spin, Empty } from 'antd'
+import { useCallback, useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { ProjectOutlined, ReloadOutlined } from '@ant-design/icons'
+import { Select, Typography } from 'antd'
 import { projectApi, Project } from '../api/project'
+import { formatApiError } from '../api/client'
+import ActionButton from './ui/ActionButton'
+import StateBlock from './ui/StateBlock'
 
 const { Title } = Typography
 
@@ -11,11 +16,15 @@ interface Props {
 }
 
 export default function ProjectSelector({ title = '选择项目', initialProjectId, children }: Props) {
+  const navigate = useNavigate()
   const [projects, setProjects] = useState<Project[]>([])
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
-  useEffect(() => {
+  const loadProjects = useCallback(() => {
+    setLoading(true)
+    setLoadError(null)
     projectApi
       .list(1, 100)
       .then((res) => {
@@ -26,35 +35,64 @@ export default function ProjectSelector({ title = '选择项目', initialProject
             ? initialProjectId
             : items[0].id
           setSelectedProjectId(initial)
+        } else {
+          setSelectedProjectId(null)
         }
+      })
+      .catch((error) => {
+        setProjects([])
+        setSelectedProjectId(null)
+        setLoadError(formatApiError(error, '加载项目列表失败'))
       })
       .finally(() => setLoading(false))
   }, [initialProjectId])
 
+  useEffect(() => {
+    loadProjects()
+  }, [loadProjects])
+
   if (loading) {
     return (
-      <div style={{ textAlign: 'center', padding: 60 }}>
-        <Spin size="large" />
-        <div style={{ marginTop: 12, color: '#64748b' }}>加载中...</div>
+      <div style={{ padding: 60 }}>
+        <StateBlock tone="loading" title="正在加载项目" description="项目列表加载完成后会自动选择当前工作区。" />
       </div>
+    )
+  }
+
+  if (loadError) {
+    return (
+      <StateBlock
+        tone="error"
+        title="项目列表加载失败"
+        description={loadError}
+        action={<ActionButton icon={<ReloadOutlined />} onClick={loadProjects} label="重试加载" />}
+      />
     )
   }
 
   if (projects.length === 0) {
     return (
-      <Empty
-        description="暂无项目，请先创建一个项目"
-        style={{ marginTop: 60 }}
+      <StateBlock
+        title="暂无项目"
+        description="先创建项目并接入公开仓库，审计、任务、产物、修复和报告页面才能形成完整闭环。"
+        action={
+          <ActionButton
+            type="primary"
+            icon={<ProjectOutlined />}
+            onClick={() => navigate('/projects')}
+            label="去项目管理"
+          />
+        }
       />
     )
   }
 
   return (
     <div>
-      <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 16 }}>
+      <div className="sl-project-selector-bar">
         <Title level={5} style={{ margin: 0 }}>{title}：</Title>
         <Select
-          style={{ width: 300 }}
+          className="sl-project-selector-select"
           placeholder="请选择项目"
           value={selectedProjectId}
           onChange={setSelectedProjectId}

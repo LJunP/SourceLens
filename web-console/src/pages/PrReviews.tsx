@@ -1,9 +1,9 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Alert, Button, Card, Descriptions, Empty, Form, Input, Modal, Select, Space,
-  Spin, Table, Tag, Tooltip, Typography, message
+  Alert, Card, Descriptions, Form, Input, Modal, Select, Space,
+  Table, Tag, Typography, message
 } from 'antd'
 import {
   ApiOutlined,
@@ -19,7 +19,11 @@ import {
   ToolOutlined,
 } from '@ant-design/icons'
 import { prReviewApi, PrReview, PrReviewComment } from '../api/prReview'
-import { showApiError } from '../api/client'
+import { formatApiError, showApiError } from '../api/client'
+import ActionButton from '../components/ui/ActionButton'
+import IconActionButton from '../components/ui/IconActionButton'
+import StateBlock from '../components/ui/StateBlock'
+import { createSelectableTableRowProps } from '../components/ui/selectableTableRow'
 
 const { Text, Paragraph } = Typography
 const { TextArea } = Input
@@ -71,6 +75,29 @@ interface ReviewDecisionSignal {
   }>
 }
 
+interface ReviewRepairReadiness {
+  ready: boolean
+  summary: string
+  targetFile: string | null
+  checks: Array<{
+    label: string
+    value: string
+    tone: ReviewTone
+  }>
+}
+
+interface PrGovernanceStep {
+  key: 'pr-intake' | 'risk-decision' | 'merge-gate' | 'repair-handoff'
+  sequence: string
+  label: string
+  state: ReviewTone
+  status: string
+  detail: string
+  actionLabel?: string
+  actionDisabled?: boolean
+  onAction?: () => void
+}
+
 interface Props {
   projectId: number
 }
@@ -87,6 +114,9 @@ export default function PrReviews({ projectId }: Props) {
   const [selected, setSelected] = useState<PrReview | null>(null)
   const [comments, setComments] = useState<PrReviewComment[]>([])
   const [commentsLoading, setCommentsLoading] = useState(false)
+  const [listError, setListError] = useState<string | null>(null)
+  const [commentsError, setCommentsError] = useState<string | null>(null)
+  const commentsRequestSeq = useRef(0)
   const [form] = Form.useForm()
 
   const fetchItems = useCallback((silent = false) => {
@@ -94,14 +124,18 @@ export default function PrReviews({ projectId }: Props) {
     prReviewApi.listByProject(projectId, page, 20, statusFilter)
       .then(res => {
         const data = res.data.data
+        setListError(null)
         setItems(data.items || [])
         setTotal(data.total)
         setSelected(prev => {
           if (!prev) return prev
-          return data.items?.find(item => item.id === prev.id) || prev
+          return data.items?.find(item => item.id === prev.id) || null
         })
       })
-      .catch(error => showApiError(error, '加载 PR 审查失败'))
+      .catch(error => {
+        setListError(formatApiError(error, '加载 PR 审查失败'))
+        showApiError(error, '加载 PR 审查失败')
+      })
       .finally(() => {
         if (!silent) setLoading(false)
       })
@@ -110,33 +144,135 @@ export default function PrReviews({ projectId }: Props) {
   useEffect(() => { fetchItems() }, [fetchItems])
 
   const fetchComments = useCallback((id: number) => {
+    const requestSeq = commentsRequestSeq.current + 1
+    commentsRequestSeq.current = requestSeq
     setCommentsLoading(true)
+    setCommentsError(null)
     prReviewApi.listComments(id)
-      .then(res => setComments(res.data.data || []))
-      .catch(error => showApiError(error, '加载行级评论失败'))
-      .finally(() => setCommentsLoading(false))
+      .then(res => {
+        if (commentsRequestSeq.current !== requestSeq) return
+        setCommentsError(null)
+        setComments(res.data.data || [])
+      })
+      .catch(error => {
+        if (commentsRequestSeq.current !== requestSeq) return
+        setCommentsError(formatApiError(error, '加载行级评论失败'))
+        showApiError(error, '加载行级评论失败')
+      })
+      .finally(() => {
+        if (commentsRequestSeq.current === requestSeq) {
+          setCommentsLoading(false)
+        }
+      })
   }, [])
 
-  const handleSelect = (item: PrReview) => {
+  const handleSelect = useCallback((item: PrReview) => {
+    commentsRequestSeq.current += 1
     setSelected(item)
+    setComments([])
+    setCommentsError(null)
+    setCommentsLoading(false)
     if (item.status === 'COMPLETED') {
       fetchComments(item.id)
-    } else {
-      setComments([])
     }
-  }
+  }, [fetchComments])
 
   const activeCount = useMemo(() => items.filter(item => item.status === 'PENDING' || item.status === 'ANALYZING').length, [items])
   const blockedCount = useMemo(() => items.filter(item => item.mergeRecommendation === 'BLOCKED').length, [items])
   const changesRequestedCount = useMemo(() => items.filter(item => item.mergeRecommendation === 'CHANGES_REQUESTED').length, [items])
   const mergeReadyCount = useMemo(() => items.filter(item => item.mergeRecommendation === 'MERGE').length, [items])
   const highRiskCount = useMemo(() => items.filter(item => item.riskLevel === 'HIGH' || item.riskLevel === 'CRITICAL').length, [items])
+  const completedReviewCount = useMemo(() => items.filter(item => item.status === 'COMPLETED').length, [items])
+  const ciFailureCount = useMemo(() => items.filter(item => item.ciStatus === 'failure').length, [items])
   const selectedRisks = selected ? parseRisks(selected.risks) : []
   const selectedImpactScope = selected ? parseStringList(selected.impactScope) : []
   const selectedTestSuggestions = selected ? parseStringList(selected.testSuggestions) : []
   const selectedChangedFiles = selected ? parseStringList(selected.changedFiles) : []
   const selectedSignal = selected ? buildReviewDecisionSignal(selected, selectedRisks, comments, selectedChangedFiles) : null
   const repairUrl = selected ? autoRepairCandidateUrl(selected, selectedRisks, comments, selectedChangedFiles) : null
+  const repairReadiness = selected ? buildReviewRepairReadiness(selected, selectedRisks, comments, selectedChangedFiles) : null
+  const selectedCiFailed = selected?.ciStatus === 'failure'
+  const governanceLoopSteps = useMemo<PrGovernanceStep[]>(() => [
+    {
+      key: 'pr-intake',
+      sequence: 'R1',
+      label: 'PR 输入',
+      state: listError ? 'danger' : total > 0 ? 'ready' : 'idle',
+      status: listError ? '数据源异常' : total > 0 ? `${total} 条已接入` : '等待 PR',
+      detail: listError
+        ? 'PR 审查列表加载失败，当前合并和风险状态不可作为准入依据。'
+        : 'PR 标题、分支、Diff 摘要、变更文件和 CI 状态进入审查队列；缺少输入时必须先补上下文。',
+    },
+    {
+      key: 'risk-decision',
+      sequence: 'R2',
+      label: '风险判定',
+      state: blockedCount > 0 || highRiskCount > 0 ? 'danger' : changesRequestedCount > 0 ? 'warning' : completedReviewCount > 0 ? 'ready' : 'idle',
+      status: blockedCount > 0
+        ? `${blockedCount} 个阻止合并`
+        : highRiskCount > 0
+          ? `${highRiskCount} 个高风险`
+          : changesRequestedCount > 0
+            ? `${changesRequestedCount} 个需修改`
+            : completedReviewCount > 0
+              ? `${mergeReadyCount} 个可合并`
+              : '等待分析',
+      detail: '风险等级、风险点和行级评论共同决定审查结论；PR 审查完成不等于代码质量、业务正确性或安全性已被完全证明。',
+    },
+    {
+      key: 'merge-gate',
+      sequence: 'R3',
+      label: '合并门禁',
+      state: !selected
+        ? ciFailureCount > 0 ? 'danger' : 'idle'
+        : selected.mergeRecommendation === 'BLOCKED' || selectedCiFailed
+          ? 'danger'
+          : selected.mergeRecommendation === 'CHANGES_REQUESTED'
+            ? 'warning'
+            : selected.mergeRecommendation === 'MERGE'
+              ? 'ready'
+              : 'warning',
+      status: !selected
+        ? ciFailureCount > 0 ? `${ciFailureCount} 个 CI 失败` : '等待选择 PR'
+        : selectedCiFailed
+          ? 'CI 失败阻断'
+          : MERGE_MAP[selected.mergeRecommendation || '']?.label || '需人工复核',
+      detail: !selected
+        ? '选择一条 PR 审查后，系统会结合合并建议、CI 状态、风险点和行级评论判断门禁；当前页 CI 失败记录不得直接合并。'
+        : selected.mergeRecommendation === 'MERGE' && !selectedCiFailed
+          ? '当前只表示审查未发现阻断项，合并前仍需确认测试、部署窗口和人工 review。'
+          : '存在 CI 失败、阻断建议或需修改结论时，不应直接合并。',
+    },
+    {
+      key: 'repair-handoff',
+      sequence: 'R4',
+      label: 'AutoRepair 交接',
+      state: repairUrl ? 'ready' : selected ? 'warning' : 'idle',
+      status: repairUrl ? '可以交接' : selected ? '交接受阻' : '等待门禁',
+      detail: repairUrl
+        ? '创建修复候选只传递受控风险和文件上下文，后续仍需补丁审查、CI、人工 review 和审计复盘。'
+        : repairReadiness?.summary || '只有仓库、目标文件和风险/评论证据齐全时才开放修复候选交接。',
+      actionLabel: repairUrl ? '生成修复候选' : selected ? '补齐修复证据' : '先选择 PR',
+      actionDisabled: !repairUrl,
+      onAction: repairUrl ? () => navigate(repairUrl) : undefined,
+    },
+  ], [
+    blockedCount,
+    changesRequestedCount,
+    ciFailureCount,
+    completedReviewCount,
+    highRiskCount,
+    listError,
+    mergeReadyCount,
+    navigate,
+    repairReadiness,
+    repairUrl,
+    selected,
+    selectedCiFailed,
+    total,
+  ])
+  const selectedDetailId = selected ? `pr-review-detail-${selected.id}` : undefined
+  const selectedTitleId = selected ? `pr-review-detail-title-${selected.id}` : undefined
 
   const handleCreate = async () => {
     try {
@@ -171,9 +307,15 @@ export default function PrReviews({ projectId }: Props) {
       key: 'pr',
       ellipsis: true,
       render: (_: unknown, record: PrReview) => (
-        <Button type="link" className="sl-pr-table-link" onClick={() => handleSelect(record)}>
-          {record.prTitle || `PR #${record.prNumber || record.id}`}
-        </Button>
+        <ActionButton
+          type="link"
+          className="sl-pr-table-link"
+          onClick={(event) => {
+            event.stopPropagation()
+            handleSelect(record)
+          }}
+          label={record.prTitle || `PR #${record.prNumber || record.id}`}
+        />
       ),
     },
     {
@@ -233,9 +375,13 @@ export default function PrReviews({ projectId }: Props) {
       key: 'action',
       width: 92,
       render: (_: unknown, record: PrReview) => (
-        <Tooltip title="重新分析">
-          <Button size="small" icon={<ReloadOutlined />} onClick={(event) => { event.stopPropagation(); handleReanalyze(record.id) }} />
-        </Tooltip>
+        <IconActionButton
+          label={`重新分析 PR 审查 #${record.id}`}
+          tooltip="重新分析"
+          size="small"
+          icon={<ReloadOutlined />}
+          onClick={(event) => { event.stopPropagation(); handleReanalyze(record.id) }}
+        />
       ),
     },
   ]
@@ -263,12 +409,8 @@ export default function PrReviews({ projectId }: Props) {
               onChange={setStatusFilter}
               options={Object.keys(STATUS_MAP).map(status => ({ label: STATUS_MAP[status].label, value: status }))}
             />
-            <Button icon={<ReloadOutlined />} onClick={() => fetchItems(true)}>
-              刷新
-            </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowCreate(true)}>
-              新建审查
-            </Button>
+            <ActionButton icon={<ReloadOutlined />} onClick={() => fetchItems(true)} label="刷新" />
+            <ActionButton type="primary" icon={<PlusOutlined />} onClick={() => setShowCreate(true)} label="新建审查" />
           </div>
         </section>
 
@@ -295,14 +437,30 @@ export default function PrReviews({ projectId }: Props) {
         <PrStat icon={<CheckCircleOutlined />} label="可合并" value={mergeReadyCount} tone="ready" />
       </div>
 
+      <PrGovernanceLoop steps={governanceLoopSteps} />
+
       <div className={`sl-pr-workbench ${selected ? 'sl-pr-workbench-with-detail' : ''}`}>
-        <Card className="sl-section-card sl-pr-table-card" title={<span className="sl-card-title"><PullRequestOutlined /> 审查列表</span>}>
+        <Card className="sl-section-card sl-pr-table-card sl-selectable-table-card" title={<span className="sl-card-title"><PullRequestOutlined /> 审查列表</span>}>
           <Table
             dataSource={items}
             columns={columns}
             rowKey="id"
             loading={loading}
             size="middle"
+            scroll={{ x: 860 }}
+            locale={{
+              emptyText: listError ? (
+                <StateBlock
+                  compact
+                  tone="error"
+                  title="PR 审查加载失败"
+                  description={listError}
+                  action={<ActionButton size="small" icon={<ReloadOutlined />} onClick={() => fetchItems()} label="重试" />}
+                />
+              ) : (
+                <StateBlock compact title="暂无 PR 审查" description="创建 PR 风险审查后，合并决策、风险点和行级评论会在这里汇总。" />
+              ),
+            }}
             pagination={{
               current: page,
               total,
@@ -311,17 +469,24 @@ export default function PrReviews({ projectId }: Props) {
               onChange: setPage,
             }}
             rowClassName={(record) => selected?.id === record.id ? 'sl-pr-row-selected' : ''}
-            onRow={(record) => ({
-              onClick: () => handleSelect(record),
+            onRow={(record) => createSelectableTableRowProps({
+              record,
+              selected: selected?.id === record.id,
+              onSelect: handleSelect,
+              controlsId: selectedDetailId,
+              label: `PrReview #${record.id} ${record.prTitle || `PR #${record.prNumber || record.id}`} ${selected?.id === record.id ? '已选中' : '查看详情'}`,
             })}
           />
         </Card>
 
         {selected && selectedSignal && (
           <Card
+            id={selectedDetailId}
+            role="region"
+            aria-labelledby={selectedTitleId}
             className="sl-section-card sl-pr-detail-card"
             title={
-              <span className="sl-card-title">
+              <span className="sl-card-title" id={selectedTitleId}>
                 <Tag color={STATUS_MAP[selected.status]?.color || 'default'}>{STATUS_MAP[selected.status]?.label || selected.status}</Tag>
                 {selected.prTitle || `PR #${selected.prNumber || selected.id}`}
               </span>
@@ -329,16 +494,15 @@ export default function PrReviews({ projectId }: Props) {
             extra={
               <Space>
                 {repairUrl && (
-                  <Button size="small" type="primary" icon={<ToolOutlined />} onClick={() => navigate(repairUrl)}>
-                    生成修复候选
-                  </Button>
+                  <ActionButton size="small" type="primary" icon={<ToolOutlined />} onClick={() => navigate(repairUrl)} label="生成修复候选" />
                 )}
-                <Button size="small" onClick={() => setSelected(null)}>关闭</Button>
+                <ActionButton size="small" onClick={() => setSelected(null)} label="关闭" />
               </Space>
             }
           >
             <div className="sl-pr-detail-stack">
               <ReviewDecisionCard signal={selectedSignal} />
+              {repairReadiness && <ReviewRepairReadinessCard readiness={repairReadiness} />}
 
               {selected.status === 'COMPLETED' ? (
                 <>
@@ -351,7 +515,7 @@ export default function PrReviews({ projectId }: Props) {
                         {selectedImpactScope.map((scope, index) => <Tag key={`${scope}-${index}`}>{scope}</Tag>)}
                       </div>
                     ) : (
-                      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="未识别影响范围" />
+                      <StateBlock compact title="未识别影响范围" description="当前审查没有返回模块、接口或文件层面的影响范围。" />
                     )}
                   </section>
 
@@ -370,14 +534,22 @@ export default function PrReviews({ projectId }: Props) {
                         ))}
                       </div>
                     ) : (
-                      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无风险点" />
+                      <StateBlock compact title="暂无风险点" description="当前审查没有发现需要单独处理的风险项。" />
                     )}
                   </section>
 
                   <section className="sl-pr-section">
                     <div className="sl-pr-section-title">行级评论</div>
-                    {commentsLoading ? (
-                      <div className="sl-pr-running"><Spin /><Text type="secondary">加载评论...</Text></div>
+                    {commentsError ? (
+                      <StateBlock
+                        compact
+                        tone="error"
+                        title="行级评论加载失败"
+                        description={commentsError}
+                        action={<ActionButton size="small" icon={<ReloadOutlined />} onClick={() => fetchComments(selected.id)} label="重试" />}
+                      />
+                    ) : commentsLoading ? (
+                      <StateBlock compact tone="loading" title="正在加载行级评论" description="评论加载完成后会按文件和行号展示。" />
                     ) : comments.length > 0 ? (
                       <div className="sl-pr-comment-list">
                         {comments.map(comment => (
@@ -395,7 +567,7 @@ export default function PrReviews({ projectId }: Props) {
                         ))}
                       </div>
                     ) : (
-                      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无行级评论" />
+                      <StateBlock compact title="暂无行级评论" description="当前审查没有生成可定位到文件行号的评论。" />
                     )}
                   </section>
 
@@ -411,7 +583,7 @@ export default function PrReviews({ projectId }: Props) {
                         ))}
                       </div>
                     ) : (
-                      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无测试建议" />
+                      <StateBlock compact title="暂无测试建议" description="当前审查没有返回额外测试建议。" />
                     )}
                   </section>
 
@@ -422,7 +594,7 @@ export default function PrReviews({ projectId }: Props) {
                         {selectedChangedFiles.map((file, index) => <Tag key={`${file}-${index}`}>{file}</Tag>)}
                       </div>
                     ) : (
-                      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="无变更文件信息" />
+                      <StateBlock compact title="无变更文件信息" description="当前审查记录没有保存 changedFiles 数据。" />
                     )}
                   </section>
 
@@ -437,14 +609,11 @@ export default function PrReviews({ projectId }: Props) {
                   <InfoBlock title="Diff 摘要" content={selected.diffSummary} />
                 </>
               ) : selected.status === 'ANALYZING' ? (
-                <div className="sl-pr-running">
-                  <Spin size="large" />
-                  <Text type="secondary">正在分析 PR 变更...</Text>
-                </div>
+                <StateBlock tone="loading" title="正在分析 PR 变更" description="系统正在汇总风险、评论、测试建议和合并决策。" />
               ) : selected.status === 'FAILED' ? (
                 <Alert type="error" showIcon message="审查失败" description={selected.errorMessage || '分析任务失败'} />
               ) : (
-                <Empty description="等待分析" />
+                <StateBlock compact title="等待分析" description="审查进入分析队列后会生成风险、影响范围和合并建议。" />
               )}
             </div>
           </Card>
@@ -516,6 +685,57 @@ function PrStat({ icon, label, value, tone = 'idle' }: { icon: ReactNode; label:
   )
 }
 
+function PrGovernanceLoop({ steps }: { steps: PrGovernanceStep[] }) {
+  const iconByStep: Record<PrGovernanceStep['key'], ReactNode> = {
+    'pr-intake': <PullRequestOutlined />,
+    'risk-decision': <FileSearchOutlined />,
+    'merge-gate': <SafetyCertificateOutlined />,
+    'repair-handoff': <ToolOutlined />,
+  }
+
+  return (
+    <section className="sl-pr-governance-loop" role="region" aria-label="PR 审查治理闭环">
+      <div className="sl-pr-governance-head">
+        <div>
+          <span>Review governance</span>
+          <h2>PR 审查治理闭环</h2>
+        </div>
+        <p>把 PR 输入、风险判定、合并门禁和 AutoRepair 交接放到同一条可追踪链路中。</p>
+      </div>
+      <div className="sl-pr-governance-grid">
+        {steps.map(step => (
+          <article
+            className={`sl-pr-governance-step sl-pr-governance-step-${step.state}`}
+            data-sl-pr-governance-step={step.key}
+            key={step.key}
+          >
+            <div className="sl-pr-governance-step-head">
+              <div className="sl-pr-governance-icon">{iconByStep[step.key]}</div>
+              <div className="sl-pr-governance-meta">
+                <span>{step.sequence}</span>
+                <strong>{step.status}</strong>
+              </div>
+            </div>
+            <div className="sl-pr-governance-copy">
+              <h3>{step.label}</h3>
+              <p>{step.detail}</p>
+            </div>
+            {step.actionLabel && (
+              <ActionButton
+                type={step.onAction ? 'primary' : 'default'}
+                disabled={step.actionDisabled}
+                icon={<ToolOutlined />}
+                onClick={step.onAction}
+                label={step.actionLabel}
+              />
+            )}
+          </article>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function ReviewDecisionCard({ signal }: { signal: ReviewDecisionSignal }) {
   return (
     <section className={`sl-pr-decision sl-pr-decision-${signal.tone}`}>
@@ -539,6 +759,35 @@ function ReviewDecisionCard({ signal }: { signal: ReviewDecisionSignal }) {
         <ApiOutlined />
         <span>{signal.nextAction}</span>
       </div>
+    </section>
+  )
+}
+
+function ReviewRepairReadinessCard({ readiness }: { readiness: ReviewRepairReadiness }) {
+  return (
+    <section className={`sl-pr-repair-readiness ${readiness.ready ? 'sl-pr-repair-readiness-ready' : 'sl-pr-repair-readiness-warning'}`}>
+      <div className="sl-pr-repair-readiness-head">
+        <ToolOutlined />
+        <div>
+          <span>修复候选资格</span>
+          <strong>{readiness.ready ? '可以生成' : '暂不可生成'}</strong>
+        </div>
+      </div>
+      <p>{readiness.summary}</p>
+      <div className="sl-pr-decision-grid">
+        {readiness.checks.map(check => (
+          <div className={`sl-pr-decision-check sl-pr-decision-check-${check.tone}`} key={check.label}>
+            <span>{check.label}</span>
+            <strong>{check.value}</strong>
+          </div>
+        ))}
+      </div>
+      {readiness.targetFile && (
+        <div className="sl-pr-next-action">
+          <FileSearchOutlined />
+          <span>候选会优先绑定行级评论文件；无行级评论时使用第一个变更文件：{readiness.targetFile}</span>
+        </div>
+      )}
     </section>
   )
 }
@@ -616,6 +865,34 @@ function decisionNextAction(decision: string | null, commentCount: number) {
   return '补充 Diff、变更文件或 CI 状态后重新分析。'
 }
 
+function buildReviewRepairReadiness(review: PrReview, risks: ReviewRisk[], comments: PrReviewComment[], changedFiles: string[]): ReviewRepairReadiness {
+  const hasRepository = Boolean(review.repositoryId)
+  const actionableComment = comments.find(item => item.filePath && (item.suggestion || item.message))
+  const targetFile = actionableComment?.filePath || changedFiles[0] || null
+  const hasTargetFile = Boolean(targetFile)
+  const hasActionableEvidence = Boolean(actionableComment) || risks.length > 0
+  const ready = hasRepository && hasTargetFile && hasActionableEvidence
+  const missing = [
+    hasRepository ? null : '仓库 ID',
+    hasTargetFile ? null : '目标文件',
+    hasActionableEvidence ? null : '风险或行级评论',
+  ].filter(Boolean)
+
+  return {
+    ready,
+    targetFile: ready ? targetFile : null,
+    summary: ready
+      ? '当前 PR 审查具备仓库、目标文件和可行动风险证据，可以进入 AutoRepair 候选创建。'
+      : `当前 PR 审查缺少 ${missing.join('、')}，需要补充变更文件、行级评论或重新分析后再生成修复候选。`,
+    checks: [
+      { label: '仓库绑定', value: hasRepository ? `#${review.repositoryId}` : '缺失', tone: hasRepository ? 'ready' : 'warning' },
+      { label: '目标文件', value: targetFile || '缺失', tone: hasTargetFile ? 'ready' : 'warning' },
+      { label: '行级评论', value: `${comments.length} 条`, tone: comments.length > 0 ? 'warning' : 'idle' },
+      { label: '风险点', value: `${risks.length} 条`, tone: risks.length > 0 ? 'warning' : 'idle' },
+    ],
+  }
+}
+
 function autoRepairCandidateUrl(review: PrReview, risks: ReviewRisk[], comments: PrReviewComment[], changedFiles: string[]) {
   if (!review.repositoryId) return null
   const comment = comments.find(item => item.filePath && (item.suggestion || item.message))
@@ -632,6 +909,7 @@ function autoRepairCandidateUrl(review: PrReview, risks: ReviewRisk[], comments:
     riskSummary ? `风险摘要：${riskSummary}` : null,
   ].filter(Boolean).join('\n')
   const params = new URLSearchParams({
+    projectId: String(review.projectId),
     repositoryId: String(review.repositoryId),
     filePath,
     targetDesc,

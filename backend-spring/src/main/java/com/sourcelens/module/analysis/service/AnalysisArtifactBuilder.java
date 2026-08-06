@@ -177,7 +177,7 @@ public class AnalysisArtifactBuilder {
                 highRiskCount > 0 ? "RISK" : risks.isEmpty() ? "READY" : "WARNING",
                 risks.size() + " risks",
                 "HIGH " + highRiskCount + " / MEDIUM " + mediumRiskCount,
-                highRiskCount > 0 ? "存在高风险项" : null);
+                null);
 
         int confidence = 52;
         confidence += totalFiles > 0 ? 10 : -16;
@@ -185,9 +185,10 @@ public class AnalysisArtifactBuilder {
         confidence += testFiles > 0 ? 8 : -9;
         confidence += hasFingerprint ? 7 : -6;
         confidence += apiRoutes + dbEntities > 0 ? 4 : 0;
-        confidence -= (int) highRiskCount * 12;
-        confidence -= (int) mediumRiskCount * 4;
-        confidence -= technicalDebt.size() * 2;
+        int riskPenalty = Math.min(14, (int) highRiskCount * 3 + (int) mediumRiskCount);
+        int debtPenalty = Math.min(6, technicalDebt.size());
+        confidence -= riskPenalty;
+        confidence -= debtPenalty;
         confidence = Math.max(5, Math.min(96, confidence));
 
         String readiness;

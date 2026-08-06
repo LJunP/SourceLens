@@ -1,5 +1,7 @@
 # 架构设计
 
+> AIOS v2.3 状态：`CURRENT IMPLEMENTATION REFERENCE`。本文描述继承系统，不是最终 AIOS 目标架构；迁移边界见 `aios/MIGRATION_LEDGER.yaml`。
+
 ## 系统架构
 
 ```

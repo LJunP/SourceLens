@@ -22,6 +22,8 @@ public class AutoRepair {
 
     private Long repositoryId;
 
+    private Long scanTaskId;
+
     private String filePath;
 
     private String targetDesc;

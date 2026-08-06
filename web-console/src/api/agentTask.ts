@@ -48,6 +48,7 @@ export const agentTaskApi = {
   create: (data: {
     projectId: number
     scanTaskId?: number
+    conversationId?: number
     taskType: string
     title: string
     description?: string

@@ -45,16 +45,19 @@ public class AutoRepairController {
     @GetMapping
     public Result<List<AutoRepair>> listRepairs(
             @PathVariable Long projectId,
+            @RequestParam(required = false) Long scanTaskId,
             @RequestAttribute("userId") Long userId) {
         
         // 校验项目所有权
         projectService.verifyOwnership(projectId, userId);
 
-        List<AutoRepair> list = autoRepairService.list(
-                new LambdaQueryWrapper<AutoRepair>()
-                        .eq(AutoRepair::getProjectId, projectId)
-                        .orderByDesc(AutoRepair::getCreatedAt)
-        );
+        LambdaQueryWrapper<AutoRepair> wrapper = new LambdaQueryWrapper<AutoRepair>()
+                .eq(AutoRepair::getProjectId, projectId);
+        if (scanTaskId != null) {
+            wrapper.eq(AutoRepair::getScanTaskId, scanTaskId);
+        }
+        wrapper.orderByDesc(AutoRepair::getCreatedAt);
+        List<AutoRepair> list = autoRepairService.list(wrapper);
 
         return Result.ok(list);
     }

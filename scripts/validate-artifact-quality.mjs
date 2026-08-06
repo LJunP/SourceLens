@@ -1,9 +1,16 @@
 #!/usr/bin/env node
 import fs from 'node:fs'
+import os from 'node:os'
+import nodePath from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const recordsFile = process.argv[2]
 const backendContainer = process.argv[3] || ''
+
+if (recordsFile === '--self-test') {
+  runSelfTest()
+  process.exit(0)
+}
 
 if (!recordsFile) {
   fail('usage: validate-artifact-quality.mjs <records-tsv> [backend-container]')
@@ -137,6 +144,10 @@ function qualityChecksFor(artifactType, data) {
       message: `reportQuality.confidence is ${quality.confidence}, expected integer 0..100`,
     },
     {
+      ok: Number.isInteger(quality.confidence) && quality.confidence >= 35,
+      message: `reportQuality.confidence is ${quality.confidence}, expected at least 35 for a generated architecture report`,
+    },
+    {
       ok: Array.isArray(quality.evidenceChecks) && quality.evidenceChecks.length > 0,
       message: 'reportQuality.evidenceChecks is missing or empty',
     },
@@ -147,6 +158,10 @@ function qualityChecksFor(artifactType, data) {
     {
       ok: Array.isArray(quality.gaps) && quality.gaps.every((item) => typeof item === 'string' && item.trim().length > 0),
       message: 'reportQuality.gaps must be an array of non-empty strings',
+    },
+    {
+      ok: Array.isArray(quality.gaps) && quality.gaps.every((item) => !looksLikeRiskGap(item)),
+      message: 'reportQuality.gaps must describe evidence gaps, not project risk findings',
     },
     {
       ok: Array.isArray(quality.nextActions)
@@ -170,6 +185,13 @@ function qualityChecksFor(artifactType, data) {
     },
   )
   return checks
+}
+
+function looksLikeRiskGap(item) {
+  if (typeof item !== 'string') {
+    return false
+  }
+  return /高风险|风险项|risk/i.test(item)
 }
 
 function shouldValidateJson(record) {
@@ -280,6 +302,80 @@ function typeName(value) {
   if (value === null) return 'null'
   if (Array.isArray(value)) return 'array'
   return typeof value
+}
+
+function runSelfTest() {
+  const tempDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'sourcelens-artifact-quality-'))
+  try {
+    runValidatorCase(tempDir, 'valid-report', baseArchitectureReport(), 0)
+
+    const lowConfidence = clone(baseArchitectureReport())
+    lowConfidence.reportQuality.confidence = 5
+    runValidatorCase(tempDir, 'low-confidence-report', lowConfidence, 1, 'expected at least 35')
+
+    const riskAsGap = clone(baseArchitectureReport())
+    riskAsGap.reportQuality.gaps = ['存在高风险项']
+    runValidatorCase(tempDir, 'risk-gap-report', riskAsGap, 1, 'must describe evidence gaps')
+
+    console.log('Artifact quality self-test passed.')
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  }
+}
+
+function runValidatorCase(tempDir, name, artifact, expectedStatus, expectedOutput = '') {
+  const artifactPath = nodePath.join(tempDir, `${name}.json`)
+  const recordsPath = nodePath.join(tempDir, `${name}.tsv`)
+  fs.writeFileSync(artifactPath, JSON.stringify(artifact), 'utf8')
+  fs.writeFileSync(recordsPath, `ARCHITECTURE_REPORT\t${artifactPath}\tapplication/json\n`, 'utf8')
+
+  const result = spawnSync(process.execPath, [process.argv[1], recordsPath], {
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+  })
+  if (result.status !== expectedStatus) {
+    fail(`${name} exited ${result.status}, expected ${expectedStatus}\nstdout=${result.stdout}\nstderr=${result.stderr}`)
+  }
+  if (expectedOutput && !(result.stdout + result.stderr).includes(expectedOutput)) {
+    fail(`${name} did not include expected output: ${expectedOutput}`)
+  }
+}
+
+function baseArchitectureReport() {
+  const evidenceChecks = [
+    ['scan_scope', '扫描范围', 'READY', '120 files / 18000 lines', '已识别仓库规模'],
+    ['test_signal', '测试证据', 'READY', '3 test files', '测试文件可作为回归保护依据'],
+    ['module_map', '结构识别', 'READY', '4 modules', 'Controller 1 / Service 1 / Repository 1 / Entity 1'],
+    ['api_data_surface', '接口与数据面', 'READY', '1 APIs / 1 DB entities', '已识别外部交互面'],
+    ['fingerprint', '扫描指纹', 'READY', 'present', '可用于后续报告对比与漂移检测'],
+    ['risk_signal', '风险信号', 'RISK', '12 risks', 'HIGH 12 / MEDIUM 0'],
+  ].map(([key, label, status, value, detail]) => ({ key, label, status, value, detail }))
+
+  return {
+    title: '架构分析报告',
+    apiRoutes: [{ method: 'GET', path: '/demo' }],
+    dbEntities: [{ name: 'demo' }],
+    codeQuality: {
+      risks: [{ category: 'R1', severity: 'HIGH', message: 'risk' }],
+    },
+    technicalDebt: [],
+    reportQuality: {
+      readiness: 'RISK',
+      confidence: 74,
+      summary: '报告发现高风险证据，应优先处理风险与执行日志',
+      highRiskCount: 12,
+      mediumRiskCount: 0,
+      technicalDebtCount: 0,
+      suggestionCount: 1,
+      gaps: [],
+      nextActions: ['优先处理高风险项，再进入自动修复或重构计划'],
+      evidenceChecks,
+    },
+  }
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value))
 }
 
 function fail(message) {

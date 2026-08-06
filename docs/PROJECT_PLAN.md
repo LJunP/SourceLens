@@ -1,10 +1,18 @@
 # SourceLens 项目全程规划
 
+> AIOS v2.3 状态：`HISTORICAL / FROZEN`。本文保留旧产品愿景和候选技术输入，不再定义当前定位、Phase、技术栈或执行任务。当前权威为 `aios/truth/project_state.yaml`、`aios/STRATEGIC_CONSTITUTION.md` 和根目录 `ROADMAP.md`。
+
+> DEFAULT AGENT CONTEXT: `EXCLUDED`。只有当前 Task Contract 明确引用本文件时，才可读取指定章节作为历史证据。
+
 版本：v0.1  
-状态：开发总纲  
+状态：冻结的迁移前愿景与历史总纲；不得用于当前执行排期
 项目中文名：源鉴  
 项目英文名：SourceLens  
-最后更新：2026-06-08
+最后更新：2026-07-04
+
+> 注意：本文保留 SourceLens 的产品愿景、长期能力想象和早期路线。涉及当前落地阶段、技术取舍、生产化边界、release evidence、11+5 agent 团队制度和本地运行方式时，以当前治理文档为准。本文中出现的 Next.js、Temporal、Qdrant、Neo4j、Go、MCP 等内容属于长期候选方向，除非被 `PHASE_REQUIREMENTS.md` 和 release evidence 接收，否则不得视为当前必须引入的技术栈。
+>
+> 当前产品定位、前后台分层、目标用户优先级、角色权限、导航主流程和产品指标，以 `PRODUCT_POSITIONING_AND_ACCESS_MODEL.md` 为准。
 
 ## 1. 项目名称与精神内核
 

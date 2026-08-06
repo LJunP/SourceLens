@@ -34,8 +34,15 @@ public class ArchitectureRiskAnalyzer {
             risks.add(risk("TEST_COVERAGE", "MEDIUM", "测试文件占比低于 10%", "重要路径可能没有足够自动化验证"));
         }
 
-        if (fileTree.path("large_files").size() > 0) {
-            risks.add(risk("MAINTAINABILITY", "MEDIUM", "存在超过阈值的大文件", "文件职责可能过宽, 代码审查和变更定位成本上升"));
+        JsonNode largeFiles = fileTree.path("large_files");
+        if (largeFiles.size() > 0) {
+            risks.add(risk(
+                    "MAINTAINABILITY",
+                    "MEDIUM",
+                    "存在超过阈值的大文件",
+                    "文件职责可能过宽, 代码审查和变更定位成本上升",
+                    firstFilePath(largeFiles)
+            ));
         }
 
         double avgMethods = codeQuality.path("avg_methods_per_class").asDouble();
@@ -137,12 +144,32 @@ public class ArchitectureRiskAnalyzer {
     }
 
     private Map<String, Object> risk(String category, String severity, String message, String impact) {
+        return risk(category, severity, message, impact, null);
+    }
+
+    private Map<String, Object> risk(String category, String severity, String message, String impact, String filePath) {
         Map<String, Object> risk = new LinkedHashMap<>();
         risk.put("category", category);
         risk.put("severity", severity);
         risk.put("message", message);
         risk.put("impact", impact);
+        if (filePath != null && !filePath.isBlank()) {
+            risk.put("filePath", filePath);
+        }
         return risk;
+    }
+
+    private String firstFilePath(JsonNode files) {
+        if (!files.isArray()) {
+            return null;
+        }
+        for (JsonNode file : files) {
+            String path = file.path("file_path").asText(file.path("path").asText(""));
+            if (!path.isBlank()) {
+                return path;
+            }
+        }
+        return null;
     }
 
     private Map<String, Object> debt(String category, String severity, String detail) {

@@ -1,5 +1,7 @@
 # SourceLens 每日执行级成长计划：2026-06-15 至 2027-01 面试准备
 
+> AIOS v2.3 状态：`PERSONAL LEARNING PLAN / NOT PROJECT AUTHORITY`。日期和学习安排不控制 SourceLens AIOS 路线；项目只按证据 Gate 推进。
+
 版本：v1.0  
 当前日期：2026-06-14  
 明日开始：2026-06-15  
@@ -830,4 +832,3 @@ Agent/架构今日理解：
 ```text
 今天必须让 SourceLens 比昨天更像一个能进简历、能被面试官追问的真实项目。
 ```
-

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sourcelens.local/schemas/aios/system-configuration-v1.json",
+  "title": "SourceLens AIOS SystemConfiguration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "configuration_id", "adapter_id", "adapter_version", "model_ref", "prompt_ref", "policy_ref", "response_format_ref", "loop_limit", "enabled_tools", "feature_flags"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "configuration_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "adapter_id": { "enum": ["B0", "B1", "B2", "A0"] },
+    "adapter_version": { "type": "string", "minLength": 1 },
+    "model_ref": { "type": "string", "minLength": 1 },
+    "prompt_ref": { "type": "string", "minLength": 1 },
+    "policy_ref": { "type": "string", "minLength": 1 },
+    "response_format_ref": { "type": "string", "minLength": 1 },
+    "loop_limit": { "type": "integer", "minimum": 1 },
+    "enabled_tools": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "feature_flags": { "type": "object", "additionalProperties": { "type": ["boolean", "string", "number", "null"] } },
+    "random_seed": { "type": ["integer", "null"] }
+  }
+}

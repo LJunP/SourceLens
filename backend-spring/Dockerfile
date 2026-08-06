@@ -23,6 +23,10 @@ RUN cargo build --release --locked
 # Runtime (使用 Ubuntu 基础镜像以兼容 ARM64 / Apple Silicon)
 FROM eclipse-temurin:17-jre-jammy@sha256:47c73dc23524b031bed0a5030410c722af6a8b49d4b25898ea8f4615895065f0
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd -r app && useradd -r -g app -d /home/app -m app
 ENV HOME=/home/app
 

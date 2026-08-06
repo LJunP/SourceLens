@@ -59,6 +59,7 @@ sourcelens:
   analyzer:
     path: ${ANALYZER_PATH:sourcelens-analyzer}
     timeout-seconds: 300
+    max-stdout-bytes: ${SOURCELENS_ANALYZER_MAX_STDOUT_BYTES:67108864}
   workspace:
     base-path: ${SOURCELENS_WORKSPACE:/tmp/sourcelens/repos}
     sandbox-cleanup-enabled: ${SOURCELENS_WORKSPACE_SANDBOX_CLEANUP_ENABLED:false}

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Alert, Button, Card, Descriptions, Drawer, Empty, Input, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { Alert, Card, Descriptions, Drawer, Input, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import {
   ApiOutlined,
   BranchesOutlined,
@@ -18,7 +18,11 @@ import {
 } from '@ant-design/icons'
 import { artifactApi, ArtifactPreviewResponse, ArtifactRecord } from '../api/artifact'
 import { formatApiError, showApiError } from '../api/client'
+import ActionButton from '../components/ui/ActionButton'
+import IconActionButton from '../components/ui/IconActionButton'
+import StateBlock from '../components/ui/StateBlock'
 import ArtifactPreviewRenderer from '../components/ArtifactPreviewRenderer'
+import { createSelectableTableRowProps } from '../components/ui/selectableTableRow'
 
 const { Text } = Typography
 
@@ -66,6 +70,19 @@ interface ArtifactEvidenceSignal {
   }>
 }
 
+interface ArtifactCustodyStep {
+  key: string
+  icon: ReactNode
+  label: string
+  status: string
+  detail: string
+  tone: ArtifactSignalTone
+  actionLabel?: string
+  onAction?: () => void
+  disabled?: boolean
+  targetUrl?: string
+}
+
 interface Props {
   projectId: number
   initialFilters?: {
@@ -74,6 +91,13 @@ interface Props {
     ownerId?: number
   }
   initialArtifactId?: number
+}
+
+interface RawDownloadAuditTarget {
+  artifactId: number
+  artifactType: string
+  auditLogId?: number
+  auditUrl: string
 }
 
 export default function Artifacts({ projectId, initialFilters, initialArtifactId }: Props) {
@@ -90,6 +114,7 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
   const [loadError, setLoadError] = useState<string | null>(null)
   const [previewError, setPreviewError] = useState<string | null>(null)
   const [pendingArtifactId, setPendingArtifactId] = useState<number | undefined>(initialArtifactId)
+  const [rawDownloadAuditTarget, setRawDownloadAuditTarget] = useState<RawDownloadAuditTarget | null>(null)
 
   const loadArtifacts = useCallback(() => {
     setLoading(true)
@@ -98,8 +123,12 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
       .then(res => {
         setRecords(res.data.data || [])
         setLoadError(null)
+        setRawDownloadAuditTarget(null)
       })
-      .catch(error => setLoadError(formatApiError(error, '加载运行产物失败')))
+      .catch(error => {
+        setLoadError(formatApiError(error, '加载运行产物失败'))
+        showApiError(error, '加载运行产物失败')
+      })
       .finally(() => setLoading(false))
   }, [projectId, initialFilters?.repositoryId, initialFilters?.ownerType, initialFilters?.ownerId])
 
@@ -281,6 +310,91 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
     loadPreview(record)
   }, [loadPreview])
 
+  const custodySteps = useMemo<ArtifactCustodyStep[]>(() => {
+    const sourceReady = records.length > 0 && summary.sourceLinkedCount === records.length
+    const sourcePartial = summary.sourceLinkedCount > 0
+    const previewReady = summary.jsonCount > 0
+    const rawAuditReady = Boolean(rawDownloadAuditTarget)
+    const rawAuditUrl = rawDownloadAuditTarget?.auditUrl
+    const coreReady = Boolean(bestBundle && bestBundle.coreCount === CORE_EVIDENCE_TYPES.length)
+    const corePartial = Boolean(bestBundle && bestBundle.coreCount > 0)
+    return [
+      {
+        key: 'source-binding',
+        icon: <LinkOutlined />,
+        label: '来源绑定',
+        status: records.length > 0 ? `${summary.sourceLinkedCount}/${records.length}` : '等待产物',
+        detail: sourceReady
+          ? '所有产物都能回跳来源任务。'
+          : sourcePartial
+            ? '部分产物可回跳，剩余产物需补 owner 映射。'
+            : '需要扫描、修复或 Agent 任务生成可追溯产物。',
+        tone: sourceReady ? 'ready' : sourcePartial ? 'warning' : records.length > 0 ? 'danger' : 'idle',
+        actionLabel: '打开来源',
+        onAction: primaryRecord ? () => openArtifactSource(primaryRecord) : undefined,
+        disabled: !primaryRecord || !canOpenArtifactSource(primaryRecord),
+      },
+      {
+        key: 'display-redaction',
+        icon: <EyeOutlined />,
+        label: '显示脱敏',
+        status: previewReady ? `${summary.jsonCount} 个可预览` : '无可预览产物',
+        detail: previewReady
+          ? '智能预览走显示层脱敏，raw JSON 默认折叠。'
+          : '当前产物需要下载查看，发送给用户前必须确认边界。',
+        tone: previewReady ? 'ready' : records.length > 0 ? 'warning' : 'idle',
+        actionLabel: '打开预览',
+        onAction: primaryRecord ? () => previewArtifact(primaryRecord) : undefined,
+        disabled: !primaryRecord || !isTextPreviewable(primaryRecord),
+      },
+      {
+        key: 'raw-access-audit',
+        icon: <DownloadOutlined />,
+        label: 'Raw Access',
+        status: rawAuditReady
+          ? rawDownloadAuditTarget?.auditLogId
+            ? `receipt #${rawDownloadAuditTarget.auditLogId}`
+            : '按资源过滤'
+          : '确认后下载',
+        detail: rawAuditReady
+          ? '最近一次 raw download 已生成审计定位入口。'
+          : '原始产物下载必须二次确认，并携带 acknowledgement。',
+        tone: rawAuditReady ? 'ready' : records.length > 0 ? 'warning' : 'idle',
+        actionLabel: rawAuditReady ? '查看审计' : undefined,
+        onAction: rawAuditUrl ? () => navigate(rawAuditUrl) : undefined,
+        targetUrl: rawAuditUrl,
+      },
+      {
+        key: 'review-loop',
+        icon: <FileSearchOutlined />,
+        label: '复盘闭环',
+        status: bestBundle ? `${bestBundle.coreCount}/${CORE_EVIDENCE_TYPES.length}` : '等待证据包',
+        detail: coreReady
+          ? '核心产物链完整，可进入报告复盘、代码问答和修复决策。'
+          : corePartial
+            ? '证据包存在，但核心报告、API、DB 或图谱仍有缺口。'
+            : '下游报告体验需要至少一个完整证据包支撑。',
+        tone: coreReady ? 'ready' : corePartial ? 'warning' : records.length > 0 ? 'danger' : 'idle',
+        actionLabel: '筛选证据包',
+        onAction: bestBundle ? () => {
+          setOwnerScope(bestBundle.key)
+          setOwnerType('ALL')
+        } : undefined,
+        disabled: !bestBundle,
+      },
+    ]
+  }, [
+    bestBundle,
+    navigate,
+    openArtifactSource,
+    previewArtifact,
+    primaryRecord,
+    rawDownloadAuditTarget,
+    records.length,
+    summary.jsonCount,
+    summary.sourceLinkedCount,
+  ])
+
   useEffect(() => {
     if (!pendingArtifactId || loading || selected?.id === pendingArtifactId) return
     const record = records.find(item => item.id === pendingArtifactId)
@@ -292,19 +406,36 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
   }, [loading, pendingArtifactId, previewArtifact, records, selected?.id])
 
   const downloadArtifact = (record: ArtifactRecord) => {
-    artifactApi.download(projectId, record.id)
-      .then(res => {
-        const url = URL.createObjectURL(res.data)
-        const link = document.createElement('a')
-        link.href = url
-        link.download = parseDownloadFileName(res.headers['content-disposition']) || `artifact-${record.id}`
-        document.body.appendChild(link)
-        link.click()
-        link.remove()
-        URL.revokeObjectURL(url)
-      })
-      .catch(error => showApiError(error, '下载运行产物失败'))
+    Modal.confirm({
+      className: 'sl-artifact-raw-download-confirm',
+      title: '确认下载原始产物',
+      content: '下载会获取未经显示层脱敏处理的原始 artifact，系统会记录审计日志用于追踪。',
+      okText: '确认下载',
+      cancelText: '取消',
+      onOk: () => artifactApi.download(projectId, record.id, true)
+        .then(res => {
+          const url = URL.createObjectURL(res.data)
+          const link = document.createElement('a')
+          link.href = url
+          link.download = parseDownloadFileName(res.headers['content-disposition']) || `artifact-${record.id}`
+          document.body.appendChild(link)
+          link.click()
+          link.remove()
+          URL.revokeObjectURL(url)
+          const auditLogId = parseRawDownloadAuditLogId(res.headers)
+          setRawDownloadAuditTarget({
+            artifactId: record.id,
+            artifactType: record.artifactType,
+            auditLogId,
+            auditUrl: artifactRawDownloadAuditUrl(projectId, record.id, auditLogId),
+          })
+        })
+        .catch(error => showApiError(error, '下载运行产物失败')),
+    })
   }
+
+  const selectedDetailId = selected ? `artifact-detail-${selected.id}` : undefined
+  const selectedTitleId = selected ? `artifact-detail-title-${selected.id}` : undefined
 
   return (
     <div>
@@ -351,9 +482,7 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
               ]}
               onChange={setOwnerScope}
             />
-            <Button icon={<ReloadOutlined />} onClick={loadArtifacts}>
-              刷新
-            </Button>
+            <ActionButton aria-label="刷新运行产物" icon={<ReloadOutlined />} onClick={loadArtifacts} label="刷新" />
           </div>
         </section>
 
@@ -361,7 +490,7 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
           <div className="sl-artifact-focus-head">
             <div>
               <span>Primary evidence</span>
-              <strong>{primaryRecord ? artifactLabel(primaryRecord.artifactType) : '暂无产物'}</strong>
+              <strong>{primaryRecord ? artifactLabel(primaryRecord.artifactType) : loadError ? '运行产物加载失败' : '暂无产物'}</strong>
             </div>
             <CheckCircleOutlined />
           </div>
@@ -394,19 +523,17 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
                 </div>
               </div>
               <div className="sl-artifact-focus-actions">
-                <Button block icon={<EyeOutlined />} disabled={!isTextPreviewable(primaryRecord)} onClick={() => previewArtifact(primaryRecord)}>
-                  打开智能预览
-                </Button>
-                <Button block icon={<LinkOutlined />} disabled={!canOpenArtifactSource(primaryRecord)} onClick={() => openArtifactSource(primaryRecord)}>
-                  打开来源
-                </Button>
+                <ActionButton block icon={<EyeOutlined />} disabled={!isTextPreviewable(primaryRecord)} onClick={() => previewArtifact(primaryRecord)} label="打开智能预览" />
+                <ActionButton block icon={<LinkOutlined />} disabled={!canOpenArtifactSource(primaryRecord)} onClick={() => openArtifactSource(primaryRecord)} label="打开来源" />
               </div>
             </>
           ) : (
-            <div className="sl-artifact-empty-focus">当前范围暂无可用产物。</div>
+            <div className="sl-artifact-empty-focus">{loadError ? '产物列表加载失败，请重试。' : '当前范围暂无可用产物。'}</div>
           )}
         </section>
       </div>
+
+      <ArtifactCustodyChainPanel steps={custodySteps} />
 
       <div className="sl-artifact-evidence-grid" aria-label="核心产物证据状态">
         {evidenceStages.map(stage => (
@@ -429,14 +556,34 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
 
       <ArtifactEvidenceReadiness signal={evidenceSignal} />
 
+      {rawDownloadAuditTarget && (
+        <StateBlock
+          className="sl-artifact-download-audit-receipt"
+          compact
+          tone="success"
+          title={rawDownloadAuditTarget.auditLogId ? '原始产物下载已记录审计' : '原始产物下载审计定位入口已准备'}
+          description={rawDownloadAuditTarget.auditLogId
+            ? `${artifactLabel(rawDownloadAuditTarget.artifactType)} #${rawDownloadAuditTarget.artifactId} 的 raw download receipt #${rawDownloadAuditTarget.auditLogId} 可在审计日志中复核。`
+            : `${artifactLabel(rawDownloadAuditTarget.artifactType)} #${rawDownloadAuditTarget.artifactId} 未返回 receipt id，将按资源、动作和状态过滤审计日志。`}
+          action={(
+            <ActionButton
+              data-sl-target-url={rawDownloadAuditTarget.auditUrl}
+              icon={<SafetyDownloadAuditIcon />}
+              onClick={() => navigate(rawDownloadAuditTarget.auditUrl)}
+              label="查看下载审计"
+            />
+          )}
+        />
+      )}
+
       {loadError && (
-        <Alert
+        <StateBlock
           className="sl-artifact-source-error"
-          type="error"
-          showIcon
-          message={records.length > 0 ? '产物数据刷新失败，已保留上次成功数据' : '产物数据加载失败'}
+          compact
+          tone="error"
+          title={records.length > 0 ? '产物刷新失败，已保留上次成功数据' : '运行产物加载失败'}
           description={loadError}
-          action={<Button size="small" danger onClick={loadArtifacts}>重试加载</Button>}
+          action={<ActionButton size="small" icon={<ReloadOutlined />} loading={loading} onClick={loadArtifacts} label="重新加载产物" />}
         />
       )}
 
@@ -488,12 +635,32 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
         </div>
       )}
 
-      <Card className="sl-section-card sl-artifact-table-card">
+      <Card className="sl-section-card sl-artifact-table-card sl-selectable-table-card">
         <Table
           rowKey="id"
+          onRow={record => createSelectableTableRowProps({
+            record,
+            selected: selected?.id === record.id,
+            onSelect: openDetail,
+            controlsId: selectedDetailId,
+            label: `Artifact #${record.id} ${artifactLabel(record.artifactType)} ${selected?.id === record.id ? '已选中' : '查看详情'}`,
+            className: selected?.id === record.id ? 'sl-artifact-row-selected' : '',
+          })}
           dataSource={filtered}
           loading={loading}
-          locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无运行产物" /> }}
+          locale={{
+            emptyText: loadError ? (
+              <StateBlock
+                compact
+                tone="error"
+                title="运行产物加载失败"
+                description={loadError}
+                action={<ActionButton size="small" icon={<ReloadOutlined />} loading={loading} onClick={loadArtifacts} label="重新加载产物" />}
+              />
+            ) : (
+              <StateBlock compact title="暂无运行产物" description="完成仓库扫描或 Agent 任务后，报告、图谱和原始结果会沉淀到这里。" />
+            ),
+          }}
           pagination={{ pageSize: 20, showTotal: total => `共 ${total} 个产物` }}
           scroll={{ x: 980 }}
           columns={[
@@ -503,7 +670,7 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
               key: 'artifactType',
               width: 210,
               render: (value: string, record: ArtifactRecord) => (
-                <Space direction="vertical" size={2}>
+                <Space className="sl-artifact-table-type-cell" direction="vertical" size={2}>
                   <Tag color={ARTIFACT_COLORS[value] || 'blue'}>{artifactLabel(value)}</Tag>
                   <Text type="secondary" style={{ fontSize: 12 }}>{value}</Text>
                   <Text type="secondary" style={{ fontSize: 12 }}>{record.contentType || '-'}</Text>
@@ -515,8 +682,8 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
               key: 'owner',
               width: 150,
               render: (_: unknown, record: ArtifactRecord) => (
-                <Space direction="vertical" size={2}>
-                  <Space size="small">
+                <Space className="sl-artifact-table-owner-cell" direction="vertical" size={2}>
+                  <Space className="sl-artifact-table-owner-line" size="small">
                     <Tag>{record.ownerType}</Tag>
                     <Text>#{record.ownerId}</Text>
                   </Space>
@@ -564,41 +731,54 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
               key: 'actions',
               width: 120,
               render: (_: unknown, record: ArtifactRecord) => (
-                <Space size="small">
-                  <Tooltip title="详情">
-                    <Button
-                      aria-label={`查看 ${artifactLabel(record.artifactType)} #${record.id} 详情`}
-                      size="small"
-                      icon={<FileTextOutlined />}
-                      onClick={() => openDetail(record)}
-                    />
-                  </Tooltip>
-                  <Tooltip title="打开来源">
-                    <Button
-                      aria-label={`打开 ${artifactLabel(record.artifactType)} #${record.id} 来源`}
-                      size="small"
-                      icon={<LinkOutlined />}
-                      onClick={() => openArtifactSource(record)}
-                      disabled={!canOpenArtifactSource(record)}
-                    />
-                  </Tooltip>
-                  <Tooltip title="预览">
-                    <Button
-                      aria-label={`预览 ${artifactLabel(record.artifactType)} #${record.id}`}
-                      size="small"
-                      icon={<EyeOutlined />}
-                      onClick={() => previewArtifact(record)}
-                      disabled={!isTextPreviewable(record)}
-                    />
-                  </Tooltip>
-                  <Tooltip title="下载">
-                    <Button
-                      aria-label={`下载 ${artifactLabel(record.artifactType)} #${record.id}`}
-                      size="small"
-                      icon={<DownloadOutlined />}
-                      onClick={() => downloadArtifact(record)}
-                    />
-                  </Tooltip>
+                <Space
+                  size="small"
+                  onClick={event => event.stopPropagation()}
+                  onKeyDown={event => event.stopPropagation()}
+                >
+                  <IconActionButton
+                    label={`查看 ${artifactLabel(record.artifactType)} #${record.id} 详情`}
+                    tooltip="详情"
+                    size="small"
+                    className="sl-artifact-detail-action"
+                    icon={<FileTextOutlined />}
+                    onClick={event => {
+                      event.stopPropagation()
+                      openDetail(record)
+                    }}
+                  />
+                  <IconActionButton
+                    label={`打开 ${artifactLabel(record.artifactType)} #${record.id} 来源`}
+                    tooltip="打开来源"
+                    size="small"
+                    icon={<LinkOutlined />}
+                    onClick={event => {
+                      event.stopPropagation()
+                      openArtifactSource(record)
+                    }}
+                    disabled={!canOpenArtifactSource(record)}
+                  />
+                  <IconActionButton
+                    label={`预览 ${artifactLabel(record.artifactType)} #${record.id}`}
+                    tooltip="预览"
+                    size="small"
+                    icon={<EyeOutlined />}
+                    onClick={event => {
+                      event.stopPropagation()
+                      previewArtifact(record)
+                    }}
+                    disabled={!isTextPreviewable(record)}
+                  />
+                  <IconActionButton
+                    label={`下载 ${artifactLabel(record.artifactType)} #${record.id}`}
+                    tooltip="下载"
+                    size="small"
+                    icon={<DownloadOutlined />}
+                    onClick={event => {
+                      event.stopPropagation()
+                      downloadArtifact(record)
+                    }}
+                  />
                 </Space>
               ),
             },
@@ -608,44 +788,48 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
 
       <Drawer
         className="sl-artifact-drawer"
-        title={selected ? `${artifactLabel(selected.artifactType)} #${selected.id}` : '运行产物'}
+        title={selected ? <span id={selectedTitleId}>{artifactLabel(selected.artifactType)} #{selected.id}</span> : '运行产物'}
         open={Boolean(selected)}
-        width={preview ? 'min(1040px, 92vw)' : 720}
+        width={preview ? 'min(1040px, 92vw)' : 'min(720px, 92vw)'}
         onClose={() => {
           setSelected(null)
           setPreview(null)
         }}
         extra={selected && (
           <Space>
-            <Button
+            <ActionButton
               aria-label={`打开 ${artifactLabel(selected.artifactType)} #${selected.id} 来源`}
               icon={<LinkOutlined />}
               disabled={!canOpenArtifactSource(selected)}
               onClick={() => openArtifactSource(selected)}
-            >
-              来源
-            </Button>
-            <Button
+              label="来源"
+            />
+            <ActionButton
               aria-label={`预览 ${artifactLabel(selected.artifactType)} #${selected.id}`}
               icon={<EyeOutlined />}
               loading={previewLoading}
               disabled={!isTextPreviewable(selected)}
               onClick={() => previewArtifact(selected)}
-            >
-              预览
-            </Button>
-            <Button
+              label="预览"
+            />
+            <ActionButton
               aria-label={`下载 ${artifactLabel(selected.artifactType)} #${selected.id}`}
               icon={<DownloadOutlined />}
               onClick={() => downloadArtifact(selected)}
-            >
-              下载
-            </Button>
+              label="下载"
+            />
           </Space>
         )}
       >
         {selected && (
-          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+          <Space
+            id={selectedDetailId}
+            role="region"
+            aria-labelledby={selectedTitleId}
+            direction="vertical"
+            size={16}
+            style={{ width: '100%' }}
+          >
             <Descriptions column={1} size="small" bordered>
               <Descriptions.Item label="类型">
                 <Space wrap>
@@ -672,25 +856,25 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
             </Descriptions>
 
             {preview?.truncated && (
-              <Alert type="warning" showIcon message={`仅展示前 ${formatBytes(preview.previewBytes)}，完整内容请下载查看`} />
+              <Alert className="sl-artifact-drawer-status-alert" type="warning" showIcon message={`仅展示前 ${formatBytes(preview.previewBytes)}，完整内容请下载查看`} />
             )}
 
             {previewError && (
-              <Alert
-                type="error"
-                showIcon
-                message="智能预览加载失败"
+              <StateBlock
+                compact
+                tone="error"
+                title="智能预览加载失败"
                 description={previewError}
-                action={<Button size="small" danger onClick={() => loadPreview(selected)}>重试预览</Button>}
+                action={<ActionButton size="small" icon={<ReloadOutlined />} loading={previewLoading} onClick={() => loadPreview(selected)} label="重新加载预览" />}
               />
             )}
 
             {!preview && !previewError && !previewLoading && isTextPreviewable(selected) && (
-              <Alert type="info" showIcon message="可预览文本产物" action={<Button size="small" onClick={() => loadPreview(selected)}>加载预览</Button>} />
+              <Alert className="sl-artifact-drawer-status-alert" type="info" showIcon message="可预览文本产物" action={<ActionButton size="small" onClick={() => loadPreview(selected)} label="加载预览" />} />
             )}
 
             {!isTextPreviewable(selected) && (
-              <Alert type="warning" showIcon message="当前产物类型不支持文本预览，请下载查看" />
+              <Alert className="sl-artifact-drawer-status-alert" type="warning" showIcon message="当前产物类型不支持文本预览，请下载查看" />
             )}
 
             {preview && (
@@ -700,6 +884,49 @@ export default function Artifacts({ projectId, initialFilters, initialArtifactId
         )}
       </Drawer>
     </div>
+  )
+}
+
+function ArtifactCustodyChainPanel({ steps }: { steps: ArtifactCustodyStep[] }) {
+  return (
+    <section className="sl-artifact-custody-chain" aria-label="产物保管责任链">
+      <div className="sl-artifact-custody-head">
+        <div>
+          <span>Artifact Custody Chain</span>
+          <strong>产物保管责任链</strong>
+        </div>
+        <Tag>四段治理</Tag>
+      </div>
+      <div className="sl-artifact-custody-grid">
+        {steps.map((step, index) => (
+          <article
+            key={step.key}
+            className={`sl-artifact-custody-step sl-artifact-custody-step-${step.tone}`}
+            data-sl-custody-step={step.key}
+          >
+            <div className="sl-artifact-custody-step-head">
+              <div className="sl-artifact-custody-step-icon">{step.icon}</div>
+              <span>{String(index + 1).padStart(2, '0')}</span>
+            </div>
+            <div className="sl-artifact-custody-step-copy">
+              <span>{step.label}</span>
+              <strong>{step.status}</strong>
+              <p>{step.detail}</p>
+            </div>
+            {step.actionLabel && (
+              <ActionButton
+                size="small"
+                type="text"
+                disabled={step.disabled}
+                data-sl-target-url={step.targetUrl}
+                onClick={step.onAction}
+                label={step.actionLabel}
+              />
+            )}
+          </article>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -762,6 +989,39 @@ function ArtifactEvidenceReadiness({ signal }: { signal: ArtifactEvidenceSignal 
       </div>
     </section>
   )
+}
+
+function SafetyDownloadAuditIcon() {
+  return <FileSearchOutlined />
+}
+
+function artifactRawDownloadAuditUrl(projectId: number, artifactId: number, auditLogId?: number) {
+  const params = new URLSearchParams({
+    projectId: String(projectId),
+    resourceType: 'ARTIFACT',
+    resourceId: String(artifactId),
+    action: 'ARTIFACT_RAW_DOWNLOAD',
+    status: 'SUCCESS',
+  })
+  if (auditLogId && Number.isSafeInteger(auditLogId) && auditLogId > 0) {
+    params.set('auditLogId', String(auditLogId))
+  }
+  return `/audit-logs?${params.toString()}`
+}
+
+function parseRawDownloadAuditLogId(headers: unknown) {
+  const value = getHeaderValue(headers, 'x-sourcelens-audit-log-id')
+  if (!value) return undefined
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
+}
+
+function getHeaderValue(headers: unknown, name: string) {
+  if (!headers || typeof headers !== 'object') return undefined
+  const record = headers as Record<string, unknown>
+  const value = record[name] || record[name.toLowerCase()]
+  if (Array.isArray(value)) return value[0] == null ? undefined : String(value[0])
+  return value == null ? undefined : String(value)
 }
 
 function buildArtifactEvidenceSignal(records: ArtifactRecord[], hasSourceError = false): ArtifactEvidenceSignal {

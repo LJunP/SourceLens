@@ -93,6 +93,7 @@ class AnalysisArtifactBuilderTest {
         assertTrue(hasRisk(risks, "TEST_COVERAGE", "HIGH"));
         assertTrue(hasRisk(risks, "ARCHITECTURE_LAYERING", "HIGH"));
         assertTrue(hasRisk(risks, "API_REGRESSION", "HIGH"));
+        assertTrue(hasRiskFilePath(risks, "MAINTAINABILITY", "src/main/java/app/GodController.java"));
         assertTrue(hasDebt(debts, "分层缺失", "HIGH"));
         assertTrue(suggestions.contains("API 数量较多但缺少测试, 建议优先补充 Controller 集成测试和契约测试"));
         Map<?, ?> reportQuality = (Map<?, ?>) report.get("reportQuality");
@@ -123,6 +124,22 @@ class AnalysisArtifactBuilderTest {
         assertTrue(hasEvidenceCheck(evidenceChecks, "fingerprint", "READY"));
         assertTrue(hasEvidenceCheck(evidenceChecks, "risk_signal", "READY"));
         evidenceChecks.forEach(item -> assertCompleteEvidenceCheck((Map<?, ?>) item));
+    }
+
+    @Test
+    void buildArchitectureReport_shouldKeepEvidenceConfidenceUsefulWhenRiskVolumeIsHigh() throws Exception {
+        JsonNode scan = evidenceRichHighRiskScan();
+
+        Map<String, Object> report = builder.build("ARCHITECTURE_REPORT", scan);
+
+        Map<?, ?> reportQuality = (Map<?, ?>) report.get("reportQuality");
+        assertEquals("RISK", reportQuality.get("readiness"));
+        assertEquals(12L, reportQuality.get("highRiskCount"));
+        assertTrue((Integer) reportQuality.get("confidence") >= 70);
+        assertTrue(hasEvidenceCheck((List<?>) reportQuality.get("evidenceChecks"), "scan_scope", "READY"));
+        assertTrue(hasEvidenceCheck((List<?>) reportQuality.get("evidenceChecks"), "test_signal", "READY"));
+        assertTrue(hasEvidenceCheck((List<?>) reportQuality.get("evidenceChecks"), "fingerprint", "READY"));
+        assertTrue(((List<?>) reportQuality.get("gaps")).isEmpty());
     }
 
     private JsonNode sampleScan() throws Exception {
@@ -352,10 +369,112 @@ class AnalysisArtifactBuilderTest {
                 """);
     }
 
+    private JsonNode evidenceRichHighRiskScan() throws Exception {
+        return objectMapper.readTree("""
+                {
+                  "file_tree": {
+                    "total_files": 120,
+                    "total_dirs": 18,
+                    "total_lines": 18000,
+                    "repo_content_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "file_manifest": [
+                      {
+                        "path": "src/main/java/app/DemoController.java",
+                        "language": "Java",
+                        "size_bytes": 120,
+                        "line_count": 20,
+                        "content_hash_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                        "is_test": false,
+                        "is_generated": false,
+                        "is_config": false,
+                        "is_large": false,
+                        "is_binary": false
+                      },
+                      {
+                        "path": "src/test/java/app/DemoControllerTest.java",
+                        "language": "Java",
+                        "size_bytes": 80,
+                        "line_count": 18,
+                        "content_hash_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                        "is_test": true,
+                        "is_generated": false,
+                        "is_config": false,
+                        "is_large": false,
+                        "is_binary": false
+                      }
+                    ],
+                    "test_files": [
+                      {"path": "src/test/java/app/DemoControllerTest.java"},
+                      {"path": "src/test/java/app/DemoServiceTest.java"},
+                      {"path": "src/test/java/app/DemoRepositoryTest.java"}
+                    ],
+                    "large_files": [],
+                    "generated_files": []
+                  },
+                  "language_stats": {
+                    "Java": { "file_count": 120, "line_count": 18000 }
+                  },
+                  "framework": {
+                    "name": "Spring Boot",
+                    "version": "3",
+                    "evidence": ["pom.xml"]
+                  },
+                  "structure": {
+                    "directories": {
+                      "src_main": true,
+                      "src_test": true,
+                      "src_main_resources": true,
+                      "controller_dir": ["src/main/java/app/controller"],
+                      "service_dir": ["src/main/java/app/service"],
+                      "repository_dir": ["src/main/java/app/repository"],
+                      "mapper_dir": [],
+                      "entity_dir": ["src/main/java/app/entity"],
+                      "dto_dir": ["src/main/java/app/dto"],
+                      "config_dir": ["src/main/java/app/config"]
+                    },
+                    "controllers": [{"class_name": "DemoController"}],
+                    "services": [{"class_name": "DemoService"}],
+                    "repositories": [{"class_name": "DemoRepository"}],
+                    "entities": [{"class_name": "DemoEntity"}],
+                    "mappers": [],
+                    "configurations": [{"class_name": "DemoConfig"}],
+                    "db_entities": [{"name": "demo"}],
+                    "api_routes": [{"method": "GET", "path": "/demo"}],
+                    "entry_points": []
+                  },
+                  "code_quality": {
+                    "total_classes": 40,
+                    "total_methods": 360,
+                    "avg_methods_per_class": 9.0,
+                    "risks": [
+                      {"category": "R1", "severity": "HIGH", "message": "risk 1"},
+                      {"category": "R2", "severity": "HIGH", "message": "risk 2"},
+                      {"category": "R3", "severity": "HIGH", "message": "risk 3"},
+                      {"category": "R4", "severity": "HIGH", "message": "risk 4"},
+                      {"category": "R5", "severity": "HIGH", "message": "risk 5"},
+                      {"category": "R6", "severity": "HIGH", "message": "risk 6"},
+                      {"category": "R7", "severity": "HIGH", "message": "risk 7"},
+                      {"category": "R8", "severity": "HIGH", "message": "risk 8"},
+                      {"category": "R9", "severity": "HIGH", "message": "risk 9"},
+                      {"category": "R10", "severity": "HIGH", "message": "risk 10"},
+                      {"category": "R11", "severity": "HIGH", "message": "risk 11"},
+                      {"category": "R12", "severity": "HIGH", "message": "risk 12"}
+                    ]
+                  }
+                }
+                """);
+    }
+
     private boolean hasRisk(List<?> risks, String category, String severity) {
         return risks.stream().anyMatch(item -> item instanceof Map<?, ?> risk
                 && category.equals(risk.get("category"))
                 && severity.equals(risk.get("severity")));
+    }
+
+    private boolean hasRiskFilePath(List<?> risks, String category, String filePath) {
+        return risks.stream().anyMatch(item -> item instanceof Map<?, ?> risk
+                && category.equals(risk.get("category"))
+                && filePath.equals(risk.get("filePath")));
     }
 
     private boolean hasDebt(List<?> debts, String category, String severity) {

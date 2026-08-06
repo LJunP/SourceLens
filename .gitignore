@@ -27,6 +27,7 @@ Thumbs.db
 node_modules/
 web-console/dist/
 web-console/.vite/
+web-console/test-results/
 web-console/tsconfig*.tsbuildinfo
 
 .env
@@ -36,6 +37,7 @@ deploy/.env
 *.log
 logs/
 release-evidence/
+.sourcelens-runtime/
 
 out/
 bin/

@@ -27,7 +27,9 @@ public class AuditLogService {
     public Page<AuditLog> listByProject(Long projectId,
                                         int page,
                                         int pageSize,
+                                        Long auditLogId,
                                         String resourceType,
+                                        Long resourceId,
                                         String action,
                                         String status) {
         int safePage = Math.max(page, 1);
@@ -36,8 +38,14 @@ public class AuditLogService {
                 .eq(AuditLog::getProjectId, projectId)
                 .orderByDesc(AuditLog::getCreatedAt)
                 .orderByDesc(AuditLog::getId);
+        if (auditLogId != null) {
+            wrapper.eq(AuditLog::getId, auditLogId);
+        }
         if (hasText(resourceType)) {
             wrapper.eq(AuditLog::getResourceType, resourceType.trim());
+        }
+        if (resourceId != null) {
+            wrapper.eq(AuditLog::getResourceId, resourceId);
         }
         if (hasText(action)) {
             wrapper.eq(AuditLog::getAction, action.trim());
@@ -48,7 +56,7 @@ public class AuditLogService {
         return auditLogMapper.selectPage(new Page<>(safePage, safePageSize), wrapper);
     }
 
-    public void record(Long userId,
+    public Long record(Long userId,
                        Long projectId,
                        String resourceType,
                        Long resourceId,
@@ -72,9 +80,11 @@ public class AuditLogService {
                     .requestId(resolveRequestId(requestId))
                     .build();
             auditLogMapper.insert(logRecord);
+            return logRecord.getId();
         } catch (Exception e) {
             log.warn("保存审计日志失败: action={}, resourceType={}, resourceId={}, error={}",
                     action, resourceType, resourceId, e.getMessage());
+            return null;
         }
     }
 

@@ -15,7 +15,10 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 
 @ExtendWith(MockitoExtension.class)
@@ -28,7 +31,13 @@ class AuditLogServiceTest {
     void record_shouldSanitizeSensitiveInputAndPersistAuditLog() {
         AuditLogService auditLogService = new AuditLogService(auditLogMapper, new ObjectMapper());
 
-        auditLogService.record(
+        doAnswer(invocation -> {
+            AuditLog log = invocation.getArgument(0);
+            log.setId(88L);
+            return 1;
+        }).when(auditLogMapper).insert(org.mockito.ArgumentMatchers.any(AuditLog.class));
+
+        Long auditLogId = auditLogService.record(
                 1L,
                 10L,
                 "PROJECT",
@@ -44,6 +53,7 @@ class AuditLogServiceTest {
         verify(auditLogMapper).insert(captor.capture());
         AuditLog log = captor.getValue();
 
+        assertEquals(88L, auditLogId);
         assertEquals(1L, log.getUserId());
         assertEquals(10L, log.getProjectId());
         assertEquals("PROJECT_DELETE_CASCADE", log.getAction());
@@ -76,5 +86,27 @@ class AuditLogServiceTest {
         verify(auditLogMapper).insert(captor.capture());
 
         assertEquals("req-mdc-1", captor.getValue().getRequestId());
+    }
+
+    @Test
+    void record_shouldReturnNullWhenAuditInsertFails() {
+        AuditLogService auditLogService = new AuditLogService(auditLogMapper, new ObjectMapper());
+        doThrow(new RuntimeException("db unavailable"))
+                .when(auditLogMapper)
+                .insert(org.mockito.ArgumentMatchers.any(AuditLog.class));
+
+        Long auditLogId = auditLogService.record(
+                1L,
+                10L,
+                "ARTIFACT",
+                9L,
+                "ARTIFACT_RAW_DOWNLOAD",
+                "SUCCESS",
+                Map.of("artifactId", 9L),
+                "artifact raw download issued",
+                12L,
+                "req-1");
+
+        assertNull(auditLogId);
     }
 }

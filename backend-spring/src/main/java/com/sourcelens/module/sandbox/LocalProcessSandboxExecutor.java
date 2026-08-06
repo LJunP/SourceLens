@@ -41,7 +41,9 @@ public class LocalProcessSandboxExecutor implements SandboxExecutor {
             ProcessBuilder pb = new ProcessBuilder(command.getCommand());
             pb.directory(command.getWorkingDirectory().toFile());
             pb.redirectErrorStream(true);
-            pb.environment().putAll(command.getEnvironment());
+            pb.environment().clear();
+            pb.environment().putAll(SandboxCommandValidator.safeBaseEnvironment(System.getenv()));
+            pb.environment().putAll(SandboxCommandValidator.validateAndNormalizeEnvironment(command.getEnvironment()));
 
             Process process = pb.start();
             CompletableFuture<String> outputFuture = CompletableFuture.supplyAsync(() -> readLimitedOutput(process));

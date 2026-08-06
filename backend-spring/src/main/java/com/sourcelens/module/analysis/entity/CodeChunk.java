@@ -22,6 +22,10 @@ public class CodeChunk {
 
     private String filePath;
 
+    private String workspaceRoot;
+
+    private String moduleRoot;
+
     private String content;
 
     private Integer startLine;
@@ -31,6 +35,8 @@ public class CodeChunk {
     private String contentHash;
 
     private String embedding;
+
+    private String embeddingModel;
 
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createdAt;

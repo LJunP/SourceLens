@@ -1,0 +1,26 @@
+# SourceLens code ownership.
+# GitHub review ownership uses @LJunP as the repository owner until teams are formally created.
+
+* @LJunP
+
+# Product and governance
+/README.md @LJunP
+/CHAIRMAN_BRIEFING.md @LJunP
+/CONTRIBUTING.md @LJunP
+/SECURITY.md @LJunP
+/ROADMAP.md @LJunP
+/CHANGELOG.md @LJunP
+/SUPPORT.md @LJunP
+/docs/ @LJunP
+
+# Core implementation
+/backend-spring/ @LJunP
+/analyzer-rust/ @LJunP
+/web-console/ @LJunP
+
+# Operations and release evidence
+/.github/ @LJunP
+/deploy/ @LJunP
+/scripts/ @LJunP
+/Makefile @LJunP
+

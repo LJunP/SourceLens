@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${SOURCELENS_PREFLIGHT_ENV_FILE:-deploy/.env}"
 WARN_ONLY="${SOURCELENS_PREFLIGHT_WARN_ONLY:-false}"
 REQUIRE_GITHUB_APP="${SOURCELENS_PREFLIGHT_REQUIRE_GITHUB_APP:-false}"
+INCLUDE_STATIC_GATES="${SOURCELENS_PREFLIGHT_INCLUDE_STATIC_GATES:-true}"
 
 failures=0
 warnings=0
@@ -185,6 +186,7 @@ validate_bool_mode() {
 validate_startup_modes() {
   validate_bool_mode SOURCELENS_PREFLIGHT_WARN_ONLY "$WARN_ONLY"
   validate_bool_mode SOURCELENS_PREFLIGHT_REQUIRE_GITHUB_APP "$REQUIRE_GITHUB_APP"
+  validate_bool_mode SOURCELENS_PREFLIGHT_INCLUDE_STATIC_GATES "$INCLUDE_STATIC_GATES"
   validate_optional_bool_config SOURCELENS_AGENT_CREATE_PR_ENABLED
   validate_optional_bool_config SOURCELENS_AUTOREPAIR_SUBMIT_PR_ENABLED
 }
@@ -209,6 +211,20 @@ require_cmd() {
     record_ok "$command is available for $purpose"
   else
     record_fail "$command is required for $purpose"
+  fi
+}
+
+check_git_cli() {
+  if ! command -v git >/dev/null 2>&1; then
+    record_fail "git is required for GitService anonymous GitHub clone runtime dependency and public repo smoke"
+    return
+  fi
+  local version
+  version="$(git --version 2>/dev/null || true)"
+  if [[ -z "$version" ]]; then
+    record_fail "git is present but git --version failed; GitService anonymous GitHub clone cannot be preflighted"
+  else
+    record_ok "$version is available for GitService anonymous GitHub clone runtime dependency and public repo smoke"
   fi
 }
 
@@ -613,7 +629,7 @@ check_static_gates() {
 check_commands() {
   echo
   echo "== Local toolchain =="
-  require_cmd git "worktree inspection"
+  check_git_cli
   require_cmd curl "smoke test"
   require_cmd docker "Docker image, Compose and sandbox validation"
 
@@ -933,8 +949,15 @@ validate_startup_modes
 echo "SourceLens production preflight"
 echo "================================"
 echo "Mode: $(is_true "$WARN_ONLY" && echo warn-only || echo strict)"
+echo "Static gates: $(is_true "$INCLUDE_STATIC_GATES" && echo enabled || echo skipped)"
 
-check_static_gates
+if is_true "$INCLUDE_STATIC_GATES"; then
+  check_static_gates
+else
+  echo
+  echo "== Static release gates =="
+  record_warn "Static release gates skipped by SOURCELENS_PREFLIGHT_INCLUDE_STATIC_GATES=false; only use when an outer gate already ran make verify"
+fi
 check_commands
 check_env_file_permissions
 check_compose

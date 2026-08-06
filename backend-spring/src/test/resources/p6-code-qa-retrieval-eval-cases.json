@@ -1,0 +1,784 @@
+{
+  "version": 1,
+  "description": "P6 fixed offline retrieval evaluation corpus for CodeQaRetrievalService.",
+  "metrics": {
+    "evaluationScope": "fixed_golden_regression",
+    "benchmarkClaim": false,
+    "topK": 4,
+    "minCaseCount": 22,
+    "requiredCaseIds": [
+      "cn-interface-controller-over-docs",
+      "semantic-weak-keyword-beats-doc-noise",
+      "path-line-anchor-selects-covering-chunk",
+      "exact-anchor-keeps-cross-file-service-mapper",
+      "vite-source-url-line-anchor-over-same-name-decoy",
+      "raw-json-handler-class-method-over-same-controller-decoy",
+      "github-blob-source-url-line-anchor-over-same-name-decoy",
+      "github-raw-source-url-line-anchor-over-same-name-decoy",
+      "github-feature-branch-app-root-source-url-over-suffix-decoy",
+      "nested-kotlin-route-holder-controller-over-post-literal",
+      "handler-api-route-wording-over-route-constants-holder",
+      "github-app-root-archive-decoy-over-source-url-anchor",
+      "github-generated-suffix-decoy-over-source-url-anchor",
+      "github-root-relative-exact-source-url-over-package-suffix-decoy",
+      "github-fixture-mirror-source-url-decoy",
+      "github-testdata-mirror-source-url-decoy",
+      "github-branch-strong-root-decoy-over-root-relative-source-url",
+      "github-source-root-metadata-resolves-hosted-branch-strong-root-ambiguity",
+      "github-source-root-metadata-resolves-module-local-path",
+      "github-source-root-metadata-keeps-module-local-virtual-path-diversity",
+      "weak-operational-policy-service-over-config-docs",
+      "weak-data-loading-data-access-over-config-source"
+    ],
+    "minRecallAtK": 1.0,
+    "minMrrAtK": 1.0
+  },
+  "cases": [
+    {
+      "id": "cn-interface-controller-over-docs",
+      "question": "登录接口在哪里",
+      "expectedFirstPath": "src/main/java/app/controller/AuthController.java",
+      "expectedIncludedPaths": [
+        "src/main/java/app/controller/AuthController.java"
+      ],
+      "chunks": [
+        {
+          "path": "docs/api.md",
+          "content": "登录接口说明，包含请求字段和示例响应。"
+        },
+        {
+          "path": "web-console/src/pages/Login.tsx",
+          "content": "export function LoginPage() { return <LoginForm />; }"
+        },
+        {
+          "path": "src/main/java/app/controller/AuthController.java",
+          "content": "@RestController class AuthController { @PostMapping(\"/login\") public Token login(LoginRequest request) { return service.login(request); } }"
+        }
+      ]
+    },
+    {
+      "id": "semantic-weak-keyword-beats-doc-noise",
+      "question": "needle",
+      "embeddingModelKey": "OPENAI:text-embedding-3-small",
+      "queryEmbedding": [1.0, 0.0],
+      "expectedFirstPath": "src/main/java/app/order/OrderLifecycleService.java",
+      "expectedIncludedPaths": [
+        "src/main/java/app/order/OrderLifecycleService.java"
+      ],
+      "chunks": [
+        {
+          "path": "README.md",
+          "content": "needle",
+          "embedding": "[0.0, 0.0]",
+          "embeddingModel": "OPENAI:text-embedding-3-small"
+        },
+        {
+          "path": "src/main/java/app/order/OrderLifecycleService.java",
+          "content": "order lifecycle implementation",
+          "embedding": "[1.0, 0.0]",
+          "embeddingModel": "OPENAI:text-embedding-3-small"
+        }
+      ]
+    },
+    {
+      "id": "path-line-anchor-selects-covering-chunk",
+      "question": "pawn ticket detail service repository src/main/java/app/controller/PawnTicketController.java:85",
+      "expectedFirstPath": "src/main/java/app/controller/PawnTicketController.java",
+      "expectedFirstStartLine": 81,
+      "expectedIncludedPaths": [
+        "src/main/java/app/controller/PawnTicketController.java"
+      ],
+      "chunks": [
+        {
+          "path": "src/main/java/app/controller/PawnTicketController.java",
+          "content": "@RestController class PawnTicketController { }",
+          "startLine": 1,
+          "endLine": 50
+        },
+        {
+          "path": "src/main/java/app/controller/PawnTicketController.java",
+          "content": "public PawnTicketDto detail(Long id) { return service.detail(id); } pawn ticket detail service repository",
+          "startLine": 81,
+          "endLine": 130
+        },
+        {
+          "path": "src/main/java/app/service/PawnTicketService.java",
+          "content": "@Service class PawnTicketService { PawnTicketDto detail(Long id) { return repository.find(id); } }"
+        }
+      ]
+    },
+    {
+      "id": "exact-anchor-keeps-cross-file-service-mapper",
+      "question": "refund payment service mapper repository src/main/java/app/controller/PaymentController.java:85",
+      "expectedFirstPath": "src/main/java/app/controller/PaymentController.java",
+      "expectedIncludedPaths": [
+        "src/main/java/app/controller/PaymentController.java",
+        "src/main/java/app/service/PaymentService.java",
+        "src/main/java/app/mapper/PaymentMapper.java"
+      ],
+      "maxSelectedCountByPath": {
+        "src/main/java/app/controller/PaymentController.java": 2
+      },
+      "chunks": [
+        {
+          "path": "src/main/java/app/controller/PaymentController.java",
+          "content": "@RestController class PaymentController { refund payment controller service mapper repository; }",
+          "startLine": 1,
+          "endLine": 100
+        },
+        {
+          "path": "src/main/java/app/controller/PaymentController.java",
+          "content": "public PaymentDto refund(Long id) { return paymentService.refund(id); } refund payment controller service mapper repository",
+          "startLine": 40,
+          "endLine": 120
+        },
+        {
+          "path": "src/main/java/app/controller/PaymentController.java",
+          "content": "private void auditRefund() { audit.info(\"refund\"); } refund payment controller service mapper repository",
+          "startLine": 70,
+          "endLine": 130
+        },
+        {
+          "path": "src/main/java/app/controller/PaymentController.java",
+          "content": "private void emitRefundEvent() { publisher.publish(); } refund payment controller service mapper repository",
+          "startLine": 80,
+          "endLine": 160
+        },
+        {
+          "path": "src/main/java/app/service/PaymentService.java",
+          "content": "@Service class PaymentService { PaymentDto refund(Long id) { return mapper.find(id); } }",
+          "startLine": 1,
+          "endLine": 90
+        },
+        {
+          "path": "src/main/java/app/mapper/PaymentMapper.java",
+          "content": "@Mapper interface PaymentMapper { PaymentEntity find(Long id); }",
+          "startLine": 1,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "vite-source-url-line-anchor-over-same-name-decoy",
+      "question": "TypeError: failed to submit\n    at submitQa (http://localhost:5173/src/pages/ProjectDetail.tsx?t=1782991000000:245:19)",
+      "expectedFirstPath": "web-console/src/pages/ProjectDetail.tsx",
+      "expectedFirstStartLine": 241,
+      "expectedIncludedPaths": [
+        "web-console/src/pages/ProjectDetail.tsx"
+      ],
+      "chunks": [
+        {
+          "path": "web-console/src/legacy/ProjectDetail.tsx",
+          "content": "async function submitQa() { return legacyApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        },
+        {
+          "path": "web-console/src/pages/ProjectDetail.tsx",
+          "content": "async function submitQa() { return projectApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        },
+        {
+          "path": "web-console/src/pages/ProjectDetail.tsx",
+          "content": "export function ProjectDetail() { return <header />; }",
+          "startLine": 1,
+          "endLine": 40
+        },
+        {
+          "path": "web-console/src/pages/Dashboard.tsx",
+          "content": "async function submitQa() { return dashboardApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        }
+      ]
+    },
+    {
+      "id": "raw-json-handler-class-method-over-same-controller-decoy",
+      "question": "explain compact handler evidence risk ledger {\"handler_class\":\"com.acme.billing.controller.PaymentController\",\"handler_method\":\"createPayment\"}",
+      "expectedFirstPath": "src/main/java/com/acme/billing/controller/PaymentController.java",
+      "expectedFirstStartLine": 81,
+      "expectedIncludedPaths": [
+        "src/main/java/com/acme/billing/controller/PaymentController.java"
+      ],
+      "chunks": [
+        {
+          "path": "src/main/java/com/acme/user/controller/PaymentController.java",
+          "content": "compact handler evidence payment controller risk ledger public PaymentDto createPayment(CreatePaymentRequest request) { return userService.createPayment(request); }",
+          "startLine": 81,
+          "endLine": 130
+        },
+        {
+          "path": "src/main/java/com/acme/billing/controller/PaymentController.java",
+          "content": "public PaymentDto createPayment(CreatePaymentRequest request) { return billingService.createPayment(request); }",
+          "startLine": 81,
+          "endLine": 130
+        },
+        {
+          "path": "src/main/java/com/acme/billing/service/PaymentService.java",
+          "content": "@Service class PaymentService { PaymentDto createPayment(CreatePaymentRequest request) { return repository.save(request); } }",
+          "startLine": 1,
+          "endLine": 100
+        },
+        {
+          "path": "docs/payment-controller.md",
+          "content": "PaymentController createPayment handler evidence risk ledger historical notes."
+        }
+      ]
+    },
+    {
+      "id": "github-blob-source-url-line-anchor-over-same-name-decoy",
+      "question": "解释这个报告证据\nfilePath: https://github.com/acme/source-lens/blob/main/web-console/src/pages/ProjectDetail.tsx#L245",
+      "expectedFirstPath": "web-console/src/pages/ProjectDetail.tsx",
+      "expectedFirstStartLine": 241,
+      "expectedIncludedPaths": [
+        "web-console/src/pages/ProjectDetail.tsx"
+      ],
+      "chunks": [
+        {
+          "path": "web-console/src/legacy/ProjectDetail.tsx",
+          "content": "async function submitQa() { return legacyApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        },
+        {
+          "path": "web-console/src/pages/ProjectDetail.tsx",
+          "content": "async function submitQa() { return projectApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        },
+        {
+          "path": "docs/report.md",
+          "content": "报告证据 项目详情 GitHub URL 追问",
+          "startLine": 1,
+          "endLine": 20
+        },
+        {
+          "path": "web-console/src/pages/Dashboard.tsx",
+          "content": "async function submitQa() { return dashboardApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        }
+      ]
+    },
+    {
+      "id": "github-raw-source-url-line-anchor-over-same-name-decoy",
+      "question": "解释这个报告证据\nsourcePath: https://raw.githubusercontent.com/acme/source-lens/main/web-console/src/pages/ProjectDetail.tsx#L245",
+      "expectedFirstPath": "web-console/src/pages/ProjectDetail.tsx",
+      "expectedFirstStartLine": 241,
+      "expectedIncludedPaths": [
+        "web-console/src/pages/ProjectDetail.tsx"
+      ],
+      "chunks": [
+        {
+          "path": "web-console/src/legacy/ProjectDetail.tsx",
+          "content": "async function submitQa() { return legacyApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        },
+        {
+          "path": "web-console/src/pages/ProjectDetail.tsx",
+          "content": "async function submitQa() { return projectApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        },
+        {
+          "path": "docs/report.md",
+          "content": "报告证据 项目详情 raw URL 追问",
+          "startLine": 1,
+          "endLine": 20
+        },
+        {
+          "path": "web-console/src/pages/Dashboard.tsx",
+          "content": "async function submitQa() { return dashboardApi.qa(); }",
+          "startLine": 241,
+          "endLine": 260
+        }
+      ]
+    },
+    {
+      "id": "github-feature-branch-app-root-source-url-over-suffix-decoy",
+      "question": "解释这个报告证据\n{\"sourceUrl\":\"https://github.com/acme/source-lens/blob/feature/apps/client/src/pages/Login.tsx#L44\",\"lineNumber\":44}",
+      "expectedFirstPath": "apps/client/src/pages/Login.tsx",
+      "expectedFirstStartLine": 40,
+      "expectedIncludedPaths": [
+        "apps/client/src/pages/Login.tsx"
+      ],
+      "chunks": [
+        {
+          "path": "client/src/pages/Login.tsx",
+          "content": "export function Login() { return legacyLogin(); }",
+          "startLine": 40,
+          "endLine": 50
+        },
+        {
+          "path": "apps/client/src/pages/Login.tsx",
+          "workspaceRoot": "apps/client",
+          "moduleRoot": "apps/client",
+          "content": "export function Login() { return currentLogin(); }",
+          "startLine": 40,
+          "endLine": 50
+        },
+        {
+          "path": "docs/report.md",
+          "content": "报告证据 Login sourceUrl 追问",
+          "startLine": 1,
+          "endLine": 20
+        },
+        {
+          "path": "packages/admin/src/pages/Login.tsx",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "export function Login() { return adminLogin(); }",
+          "startLine": 40,
+          "endLine": 50
+        }
+      ]
+    },
+    {
+      "id": "nested-kotlin-route-holder-controller-over-post-literal",
+      "question": "GET /api/auth/login",
+      "expectedFirstPath": "src/main/kotlin/com/example/controller/AuthController.kt",
+      "expectedIncludedPaths": [
+        "src/main/kotlin/com/example/controller/AuthController.kt",
+        "src/main/kotlin/com/example/constants/ApiRoutes.kt"
+      ],
+      "chunks": [
+        {
+          "path": "docs/auth-api.md",
+          "content": "GET /api/auth/login historical login API notes"
+        },
+        {
+          "path": "src/main/kotlin/com/example/constants/ApiRoutes.kt",
+          "content": "object ApiRoutes {\n  object Auth {\n    const val LOGIN = \"/api/auth/login\"\n  }\n}",
+          "startLine": 1,
+          "endLine": 40
+        },
+        {
+          "path": "src/main/kotlin/com/example/controller/AuthController.kt",
+          "content": "@RestController class AuthController { @GetMapping(ApiRoutes.Auth.LOGIN) fun currentLoginState(): Token = service.currentLoginState() }",
+          "startLine": 1,
+          "endLine": 80
+        },
+        {
+          "path": "src/main/kotlin/com/example/controller/AuthPostController.kt",
+          "content": "@RestController class AuthPostController { @PostMapping(\"/api/auth/login\") fun login(request: LoginRequest): Token = service.login(request) }",
+          "startLine": 1,
+          "endLine": 80
+        }
+      ]
+    },
+    {
+      "id": "handler-api-route-wording-over-route-constants-holder",
+      "question": "Which API route handles GET /api/orders/close?",
+      "expectedFirstPath": "src/main/kotlin/com/example/controller/OrderController.kt",
+      "expectedIncludedPaths": [
+        "src/main/kotlin/com/example/controller/OrderController.kt",
+        "src/main/kotlin/com/example/constants/ApiRoutes.kt"
+      ],
+      "chunks": [
+        {
+          "path": "docs/api.md",
+          "content": "Historical API notes mention GET /api/orders/close."
+        },
+        {
+          "path": "src/main/kotlin/com/example/constants/ApiRoutes.kt",
+          "content": "object ApiRoutes {\n  object Orders {\n    const val CLOSE = \"/api/orders/close\"\n  }\n}",
+          "startLine": 1,
+          "endLine": 40
+        },
+        {
+          "path": "src/main/kotlin/com/example/controller/OrderController.kt",
+          "content": "@RestController class OrderController { @GetMapping(ApiRoutes.Orders.CLOSE) fun close(): Status = service.close() }",
+          "startLine": 1,
+          "endLine": 80
+        }
+      ]
+    },
+    {
+      "id": "github-app-root-archive-decoy-over-source-url-anchor",
+      "question": "explain report evidence sourceUrl=https://github.com/acme/source-lens/blob/main/apps/client/src/api/index.ts#L44",
+      "expectedFirstPath": "apps/client/src/api/index.ts",
+      "expectedFirstStartLine": 40,
+      "expectedIncludedPaths": [
+        "apps/client/src/api/index.ts"
+      ],
+      "chunks": [
+        {
+          "path": "archive/apps/client/src/api/index.ts",
+          "content": "legacy archived api client index sourceUrl report evidence fetch login login login login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "apps/client/src/api/index.ts",
+          "workspaceRoot": "apps/client",
+          "moduleRoot": "apps/client",
+          "content": "export function loginApi() { return request.post('/api/login'); }",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "packages/admin/src/api/index.ts",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "admin api index login report evidence",
+          "startLine": 40,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "github-generated-suffix-decoy-over-source-url-anchor",
+      "question": "explain report evidence sourceUrl=https://github.com/acme/source-lens/blob/main/packages/admin/src/pages/Login.tsx#L44",
+      "expectedFirstPath": "packages/admin/src/pages/Login.tsx",
+      "expectedFirstStartLine": 40,
+      "expectedIncludedPaths": [
+        "packages/admin/src/pages/Login.tsx"
+      ],
+      "chunks": [
+        {
+          "path": "generated/packages/admin/src/pages/Login.tsx",
+          "content": "generated source mirror Login sourceUrl report evidence login login login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "packages/admin/src/pages/Login.tsx",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "export function Login() { return <LoginForm />; }",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "apps/client/src/pages/Login.tsx",
+          "workspaceRoot": "apps/client",
+          "moduleRoot": "apps/client",
+          "content": "admin login page report evidence",
+          "startLine": 40,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "github-root-relative-exact-source-url-over-package-suffix-decoy",
+      "question": "explain report evidence sourceUrl=https://github.com/acme/source-lens/blob/main/src/pages/Login.tsx#L44",
+      "expectedFirstPath": "src/pages/Login.tsx",
+      "expectedFirstStartLine": 40,
+      "expectedIncludedPaths": [
+        "src/pages/Login.tsx"
+      ],
+      "chunks": [
+        {
+          "path": "packages/admin/src/pages/Login.tsx",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "admin login sourceUrl report evidence login login login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/pages/Login.tsx",
+          "content": "export function Login() { return <LoginForm />; }",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "apps/client/src/pages/Login.tsx",
+          "workspaceRoot": "apps/client",
+          "moduleRoot": "apps/client",
+          "content": "client login page report evidence",
+          "startLine": 40,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "github-fixture-mirror-source-url-decoy",
+      "question": "explain report evidence sourceUrl=https://github.com/acme/source-lens/blob/main/src/pages/Login.tsx#L44",
+      "expectedFirstPath": "src/pages/Login.tsx",
+      "expectedFirstStartLine": 40,
+      "expectedIncludedPaths": [
+        "src/pages/Login.tsx"
+      ],
+      "chunks": [
+        {
+          "path": "tests/fixtures/src/pages/Login.tsx",
+          "content": "fixture login sourceUrl report evidence login login login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/pages/Login.tsx",
+          "content": "export function Login() { return <LoginForm />; }",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "docs/login.md",
+          "content": "login report evidence notes",
+          "startLine": 1,
+          "endLine": 20
+        }
+      ]
+    },
+    {
+      "id": "github-testdata-mirror-source-url-decoy",
+      "question": "explain report evidence sourceUrl=https://github.com/acme/source-lens/blob/main/src/pages/Login.tsx#L44",
+      "expectedFirstPath": "src/pages/Login.tsx",
+      "expectedFirstStartLine": 40,
+      "expectedIncludedPaths": [
+        "src/pages/Login.tsx"
+      ],
+      "chunks": [
+        {
+          "path": "testdata/src/pages/Login.tsx",
+          "content": "test data login sourceUrl report evidence login login login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/pages/Login.tsx",
+          "content": "export function Login() { return <LoginForm />; }",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "docs/login.md",
+          "content": "login report evidence notes",
+          "startLine": 1,
+          "endLine": 20
+        }
+      ]
+    },
+    {
+      "id": "github-branch-strong-root-decoy-over-root-relative-source-url",
+      "question": "explain report evidence sourceUrl=https://github.com/acme/source-lens/blob/feature/web-console/src/index.ts#L44",
+      "expectedFirstPath": "src/index.ts",
+      "expectedFirstStartLine": 40,
+      "expectedIncludedPaths": [
+        "src/index.ts"
+      ],
+      "chunks": [
+        {
+          "path": "web-console/src/index.ts",
+          "workspaceRoot": "web-console",
+          "moduleRoot": "web-console",
+          "content": "export { login } from './web-login'; sourceUrl index login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/index.ts",
+          "content": "export { login } from './root-login';",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "packages/admin/src/index.ts",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "export { login } from './admin-login'; admin login",
+          "startLine": 40,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "github-source-root-metadata-resolves-hosted-branch-strong-root-ambiguity",
+      "question": "explain report evidence\nsourceRoot: web-console\nsourceUrl: https://github.com/acme/source-lens/blob/feature/web-console/src/index.ts#L44",
+      "expectedFirstPath": "web-console/src/index.ts",
+      "expectedFirstStartLine": 40,
+      "expectedIncludedPaths": [
+        "web-console/src/index.ts"
+      ],
+      "chunks": [
+        {
+          "path": "web-console/src/index.ts",
+          "workspaceRoot": "web-console",
+          "moduleRoot": "web-console",
+          "content": "export { login } from './web-login';",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/index.ts",
+          "content": "export { login } from './root-login'; sourceUrl index login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "packages/admin/src/index.ts",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "export { login } from './admin-login'; admin login",
+          "startLine": 40,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "github-source-root-metadata-resolves-module-local-path",
+      "question": "explain report evidence\nsourceRoot: web-console\nsourceUrl: https://github.com/acme/source-lens/blob/feature/web-console/src/index.ts#L44",
+      "expectedFirstPath": "src/index.ts",
+      "expectedFirstStartLine": 40,
+      "expectedFirstWorkspaceRoot": "web-console",
+      "expectedFirstModuleRoot": "web-console",
+      "expectedIncludedPaths": [
+        "src/index.ts"
+      ],
+      "maxSelectedCountByPath": {
+        "src/index.ts": 1
+      },
+      "chunks": [
+        {
+          "path": "src/index.ts",
+          "content": "export { login } from './root-login'; sourceUrl index login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/index.ts",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "export { login } from './admin-local-login'; admin local login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/index.ts",
+          "workspaceRoot": "web-console",
+          "moduleRoot": "web-console",
+          "content": "export { login } from './web-login';",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "packages/admin/src/index.ts",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "export { login } from './admin-login'; admin login",
+          "startLine": 40,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "github-source-root-metadata-keeps-module-local-virtual-path-diversity",
+      "question": "compare module-local report evidence\nsourceRoot: web-console\nmoduleRoot: packages/admin\nworkspaceRoot: apps/client\nsourceUrl: https://github.com/acme/source-lens/blob/feature/web-console/src/index.ts#L44",
+      "expectedFirstPath": "src/index.ts",
+      "expectedFirstStartLine": 40,
+      "expectedFirstWorkspaceRoot": "web-console",
+      "expectedIncludedPaths": [
+        "src/index.ts"
+      ],
+      "expectedIncludedWorkspaceRoots": [
+        "web-console",
+        "packages/admin",
+        "apps/client"
+      ],
+      "chunks": [
+        {
+          "path": "src/index.ts",
+          "workspaceRoot": "web-console",
+          "moduleRoot": "web-console",
+          "content": "export const login = 'web-console';",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/index.ts",
+          "workspaceRoot": "packages/admin",
+          "moduleRoot": "packages/admin",
+          "content": "export const login = 'packages-admin';",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/index.ts",
+          "workspaceRoot": "apps/client",
+          "moduleRoot": "apps/client",
+          "content": "export const login = 'apps-client';",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/index.ts",
+          "workspaceRoot": "packages/marketing",
+          "moduleRoot": "packages/marketing",
+          "content": "export const login = 'packages-marketing'; sourceUrl index login login login",
+          "startLine": 40,
+          "endLine": 60
+        },
+        {
+          "path": "src/main/java/app/AuthController.java",
+          "content": "@GetMapping(\"/api/login\") public String login() { return \"noise\"; } sourceUrl login login login",
+          "startLine": 1,
+          "endLine": 20
+        },
+        {
+          "path": "src/index.ts",
+          "content": "export const login = 'root'; sourceUrl index login login login",
+          "startLine": 40,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "weak-operational-policy-service-over-config-docs",
+      "question": "子任务可以使用哪些能力在哪里判断",
+      "expectedFirstPath": "src/main/java/com/sourcelens/module/agent/service/AgentToolPolicyService.java",
+      "expectedIncludedPaths": [
+        "src/main/java/com/sourcelens/module/agent/service/AgentToolPolicyService.java",
+        "src/main/resources/application.yml",
+        "src/main/java/com/sourcelens/module/agent/controller/AgentToolController.java"
+      ],
+      "chunks": [
+        {
+          "path": "docs/agent-tools.md",
+          "content": "子任务 可以 使用 哪些 能力 在哪里 判断 工具 能力 策略 说明 文档 文档 文档"
+        },
+        {
+          "path": "src/main/resources/application.yml",
+          "content": "agent:\n  tools:\n    allowed: [read, search]\n    policy: 子任务 工具 能力 配置"
+        },
+        {
+          "path": "src/main/java/com/sourcelens/module/agent/controller/AgentToolController.java",
+          "content": "@RestController class AgentToolController { boolean canUseTool(String tool) { return policyService.canUseTool(tool); } }"
+        },
+        {
+          "path": "src/main/java/com/sourcelens/module/agent/service/AgentToolPolicyService.java",
+          "content": "@Service class AgentToolPolicyService { boolean canUseTool(String toolName, AgentTask task) { return allowedTools.contains(toolName) && permissionPolicy.allows(task); } } 子任务 能力 工具 判断"
+        }
+      ]
+    },
+    {
+      "id": "weak-data-loading-data-access-over-config-source",
+      "question": "实验开关数据在哪里加载",
+      "expectedFirstPath": "src/main/java/com/sourcelens/module/experiment/mapper/ExperimentFlagMapper.java",
+      "expectedIncludedPaths": [
+        "src/main/java/com/sourcelens/module/experiment/mapper/ExperimentFlagMapper.java",
+        "src/main/java/com/sourcelens/module/experiment/service/ExperimentFlagService.java"
+      ],
+      "chunks": [
+        {
+          "path": "src/commands/config/index.ts",
+          "content": "export const experimentFlags = loadConfig(); 实验 开关 数据 加载 配置 config config config"
+        },
+        {
+          "path": "docs/experiment-flags.md",
+          "content": "实验 开关 数据 在哪里 加载 文档 说明 文档 文档 文档"
+        },
+        {
+          "path": "src/main/java/com/sourcelens/module/experiment/service/ExperimentFlagService.java",
+          "content": "@Service class ExperimentFlagService { List<ExperimentFlag> loadFlags() { return mapper.selectEnabledFlags(); } } 实验 开关 数据 加载"
+        },
+        {
+          "path": "src/main/java/com/sourcelens/module/experiment/mapper/ExperimentFlagMapper.java",
+          "content": "@Mapper interface ExperimentFlagMapper { List<ExperimentFlag> selectEnabledFlags(); } 实验 开关 数据 加载 查询 数据库"
+        }
+      ]
+    }
+  ]
+}

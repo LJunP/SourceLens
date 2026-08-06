@@ -14,6 +14,7 @@ public class AgentToolCallService extends ServiceImpl<AgentToolCallMapper, Agent
                                              int page,
                                              int pageSize,
                                              String toolName,
+                                             Long conversationId,
                                              Long scanTaskId,
                                              Boolean success) {
         int safePage = Math.max(page, 1);
@@ -24,6 +25,9 @@ public class AgentToolCallService extends ServiceImpl<AgentToolCallMapper, Agent
                 .orderByDesc(AgentToolCall::getId);
         if (toolName != null && !toolName.isBlank()) {
             wrapper.eq(AgentToolCall::getToolName, toolName.trim());
+        }
+        if (conversationId != null) {
+            wrapper.eq(AgentToolCall::getConversationId, conversationId);
         }
         if (scanTaskId != null) {
             wrapper.eq(AgentToolCall::getScanTaskId, scanTaskId);

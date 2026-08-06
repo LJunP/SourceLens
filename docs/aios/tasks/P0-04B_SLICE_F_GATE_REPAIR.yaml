@@ -1,0 +1,55 @@
+schema_version: 1
+record_type: sourcelens_aios_task_contract
+
+task_id: AIOS-P0-004B
+phase: P0
+title: Repair the inherited AgentChat responsive regression gate
+objective: Restore the declared first-viewport thread and full-composer responsive contract without changing AgentChat features or execution authority.
+why_now: The inherited frontend UI regression failure was an explicit P0 Gate blocker assigned to Slice F, and the Human Founder requested the safest complete remediation of current contradictions and blockers.
+task_spec_ref: docs/aios/P0_GATE.md#2-gate-blockers
+owner_role: Engineering Manager Agent
+worker_role: Frontend Worker
+
+write_scope:
+  - web-console/src/styles/app.css AgentChat media-query height declarations only
+read_context:
+  - docs/aios/P0_GATE.md
+  - docs/aios/truth/project_state.yaml
+  - scripts/validate-frontend-ui.mjs
+dependencies:
+  - The failing inherited make verify result remains recorded separately from the repaired current result.
+
+risk_level: low
+baseline_ref: docs/aios/truth/project_state.yaml#inherited_full_verification
+acceptance_criteria:
+  - At widths up to 1200px the AgentChat thread panel reserves the declared first-viewport height.
+  - At widths up to 720px the complete composer row remains inside the declared viewport contract.
+  - No AgentChat feature, API, permission, tool, execution or egress behavior changes.
+  - Frontend static regression, TypeScript and production build pass.
+  - Current make verify passes while the historical inherited failure remains retained.
+required_evidence:
+  - exact CSS diff
+  - frontend UI regression output
+  - frontend production build output
+  - current make verify output
+
+changed_path_inventory:
+  authority:
+    - docs/aios/tasks/P0-04B_SLICE_F_GATE_REPAIR.yaml
+  implementation:
+    - web-console/src/styles/app.css
+
+independent_reviewer: Quality and Evaluation Agent
+additional_reviewers:
+  - CTO Agent
+  - Security Agent to confirm no execution authority changed
+stop_conditions:
+  - The repair requires component behavior, API or feature changes.
+  - The repair weakens an existing responsive assertion.
+  - A relevant frontend or full local gate fails.
+forbidden_actions:
+  - broad CSS refactoring or unrelated visual changes
+  - changing Agent runtime, tools, permissions, network, PR or LLM behavior
+  - claiming production readiness or P0 completion
+
+status: accepted

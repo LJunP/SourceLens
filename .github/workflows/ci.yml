@@ -15,20 +15,42 @@ concurrency:
 
 jobs:
   security:
-    name: Security Regression Checks
+    name: Security Regression Checks (${{ matrix.suite }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - static
+          - llm-provider
+          - release-evidence-profile
+          - release-verifier-public-repo-marker
+          - release-verifier-public-repo-ui-marker
+          - release-verifier-autorepair-ui-marker
+          - release-verifier-dashboard-ui-marker
+          - release-verifier-report-evidence-marker
+          - release-verifier-scan-governance-marker
+          - release-verifier-agent-chat-marker
+          - release-verifier-artifacts-marker
+          - release-verifier-integrity
+          - integration-drill
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
       - name: Run security regression checks
-        run: ./scripts/security-regression-check.sh
+        run: SOURCELENS_SECURITY_REGRESSION_SUITE="${{ matrix.suite }}" ./scripts/security-regression-check.sh
 
   supply-chain:
     name: Dependency Regression Checks
@@ -45,6 +67,59 @@ jobs:
 
       - name: Run dependency regression checks
         run: ./scripts/dependency-regression-check.sh
+
+  release-evidence-ci:
+    name: Release Evidence CI Profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SOURCELENS_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/release-evidence
+      SOURCELENS_RELEASE_EVIDENCE_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      SOURCELENS_RELEASE_EVIDENCE_ENV_FILE: deploy/.env.example
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+
+      - name: Generate CI release evidence
+        run: make release-evidence-ci
+
+      - name: Verify CI release evidence
+        env:
+          RUN_DIR: ${{ env.SOURCELENS_RELEASE_EVIDENCE_DIR }}/${{ env.SOURCELENS_RELEASE_EVIDENCE_RUN_ID }}
+        run: make verify-release-evidence DIR="${RUN_DIR}"
+
+      - name: Assert CI release evidence profile
+        env:
+          RUN_DIR: ${{ env.SOURCELENS_RELEASE_EVIDENCE_DIR }}/${{ env.SOURCELENS_RELEASE_EVIDENCE_RUN_ID }}
+        run: |
+          grep -Fx "release_evidence_profile_schema: 3" "${RUN_DIR}/manifest.txt"
+          grep -Fx "release_evidence_profile: ci" "${RUN_DIR}/manifest.txt"
+          grep -Fx "release_evidence_profile_source: env" "${RUN_DIR}/manifest.txt"
+          grep -Fx "include_verify: false" "${RUN_DIR}/manifest.txt"
+          grep -Fx "include_preflight: false" "${RUN_DIR}/manifest.txt"
+          grep -Fx "include_smoke: false" "${RUN_DIR}/manifest.txt"
+          grep -Fx "include_public_repo_smoke: false" "${RUN_DIR}/manifest.txt"
+          grep -Fx "include_autorepair_patch_smoke: false" "${RUN_DIR}/manifest.txt"
+          grep -Fx "include_patch_ready_ui_smoke: false" "${RUN_DIR}/manifest.txt"
+          grep -Fx "include_agent_chat_closure_rail_ui_smoke: false" "${RUN_DIR}/manifest.txt"
+          grep -Fx "include_audit_workbench_smoke: false" "${RUN_DIR}/manifest.txt"
+          grep -Fx -- '- required_failures: `0`' "${RUN_DIR}/summary.md"
+          grep -Fx -- '- optional_warnings: `0`' "${RUN_DIR}/summary.md"
+
+      - name: Upload CI release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-evidence-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.SOURCELENS_RELEASE_EVIDENCE_DIR }}/${{ env.SOURCELENS_RELEASE_EVIDENCE_RUN_ID }}
+          if-no-files-found: error
+          retention-days: 7
 
   backend:
     name: Backend Spring

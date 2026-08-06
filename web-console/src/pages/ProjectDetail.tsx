@@ -1,24 +1,27 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
-import { Tabs, Table, Button, Modal, Form, Input, InputNumber, Space, Popconfirm, Tag, message, Typography, Card, Empty, Spin, Progress, Tooltip } from 'antd'
+import { Alert, Tabs, Table, Modal, Form, Input, InputNumber, Space, Popconfirm, Tag, message, Typography, Card, Progress } from 'antd'
 import {
   BranchesOutlined,
   CheckCircleOutlined,
   CodeOutlined,
+  CopyOutlined,
   DatabaseOutlined,
   DeleteOutlined,
   FileOutlined,
   FileTextOutlined,
   FolderOutlined,
+  LinkOutlined,
   PlusOutlined,
   ReloadOutlined,
+  RobotOutlined,
   SafetyCertificateOutlined,
   ScheduleOutlined,
   SearchOutlined,
   SendOutlined,
   StopOutlined,
 } from '@ant-design/icons'
-import { projectApi, Project } from '../api/project'
+import { projectApi, Project, type CodeQaCitation, type CodeQaCitationCoverage, type CodeQaClaimCitationCoverage, type CodeQaEvidenceRef } from '../api/project'
 import { repositoryApi, Repository } from '../api/repository'
 import { scanTaskApi, ScanTask } from '../api/scanTask'
 import { artifactApi, ArtifactRecord } from '../api/artifact'
@@ -27,6 +30,10 @@ import { codeChunkApi } from '../api/codeChunk'
 import type { CodeChunkEvidenceProfile, CodeChunkSearchItem, CodeChunkSearchResponse } from '../api/codeChunk'
 import { formatApiError, showApiError } from '../api/client'
 import ArtifactLinkButton from '../components/ArtifactLinkButton'
+import ActionButton from '../components/ui/ActionButton'
+import IconActionButton from '../components/ui/IconActionButton'
+import StateBlock from '../components/ui/StateBlock'
+import { redactSensitiveText } from '../utils/displayRedaction'
 import DependencyGraphView from './DependencyGraph'
 
 interface LanguageStat {
@@ -85,16 +92,212 @@ interface ProjectCodeKnowledgeStatus {
   retrievalMode: string | null
 }
 
+type ProjectWorkspaceActionKey =
+  | 'STALE_REFRESH'
+  | 'ADD_REPOSITORY'
+  | 'START_SCAN'
+  | 'WATCH_SCAN'
+  | 'REVIEW_FAILED_SCAN'
+  | 'OPEN_ARTIFACTS'
+  | 'OPEN_QA'
+
+type ProjectWorkspaceViewState = 'INITIAL_LOADING' | 'FATAL_LOAD' | 'STALE_REFRESH' | 'READY'
+
+interface ProjectWorkspaceLoadOptions {
+  silent?: boolean
+  includeDetails?: boolean
+}
+
+interface ProjectWorkspaceNextAction {
+  key: ProjectWorkspaceActionKey
+  tone: AnalysisReadinessTone
+  title: string
+  summary: string
+  blocker: string
+  evidenceMaturity: string
+  primaryLabel: string
+  primaryIcon: React.ReactNode
+  primaryDisabled?: boolean
+  secondaryLabel?: string
+  secondaryIcon?: React.ReactNode
+  secondaryDisabled?: boolean
+  checks: Array<{ label: string; value: string; ready: boolean }>
+}
+
+interface ProjectTrustedLoopStep {
+  key: string
+  index: string
+  title: string
+  owner: string
+  value: string
+  description: string
+  tone: 'ready' | 'attention' | 'idle'
+  actionLabel: string
+  onAction: () => void
+}
+
 interface QaMessage {
   role: 'user' | 'assistant'
   content: string
   chunks?: CodeChunkSearchItem[]
+  answerCitations?: CodeQaCitation[]
   scanTaskId?: number | null
   retrievalMode?: string | null
+  groundingStatus?: string | null
+  citationEnforcementStatus?: string | null
+  citationEnforcementReason?: string | null
+  citationEnforcementNote?: string | null
+  citationCoverage?: CodeQaCitationCoverage
+  claimCitationCoverage?: CodeQaClaimCitationCoverage
+  sourceEvidenceRef?: CodeQaEvidenceRef | null
+  sourceEvidenceMatched?: boolean | null
+  sourceEvidenceMatchType?: string | null
   evidenceProfile?: CodeChunkEvidenceProfile
 }
 
 type QaSignalTone = 'ready' | 'warning' | 'idle'
+
+type RepairEvidenceGateStatus = 'READY' | 'REVIEW' | 'BLOCKED'
+
+interface RepairEvidenceGate {
+  status: RepairEvidenceGateStatus
+  label: string
+  color: string
+  summary: string
+  checks: string[]
+}
+
+interface CitationCoverageAudit {
+  tone: 'ready' | 'warning' | 'blocked'
+  title: string
+  summary: string
+  metrics: Array<{ label: string; value: string }>
+  checks: Array<{ label: string; ok: boolean }>
+  roleDistribution?: {
+    status: string
+    roles: string[]
+    files: string[]
+  }
+}
+
+interface ClaimCitationAudit {
+  tone: 'ready' | 'warning' | 'blocked'
+  title: string
+  summary: string
+  metrics: Array<{ label: string; value: string }>
+  roleDistribution?: {
+    status: string
+    primaryBound: number
+    contextOnly: number
+    unknownOnly: number
+    requiredClaims: number
+    primaryFiles: number
+    contextFiles: number
+    roles: string[]
+    files: string[]
+  }
+  problemClaims: Array<{ id: string; status: string; text: string; labels: string }>
+}
+
+interface QaTrustSummary {
+  tone: 'ready' | 'warning' | 'blocked'
+  title: string
+  summary: string
+  nextAction: string
+  metrics: Array<{ label: string; value: string }>
+  checks: Array<{ label: string; ok: boolean }>
+}
+
+interface QaCrossFileCitationSummary {
+  tone: 'ready' | 'warning' | 'blocked'
+  status: string
+  title: string
+  summary: string
+  metrics: Array<{ label: string; value: string }>
+  checks: Array<{ label: string; ok: boolean }>
+  contextGap: {
+    evidence: number
+    files: number
+    visible: boolean
+  }
+}
+
+interface QaSourceLocationConfidence {
+  tone: 'ready' | 'warning' | 'blocked'
+  title: string
+  summary: string
+  metrics: Array<{ label: string; value: string }>
+  checks: Array<{ label: string; ok: boolean }>
+}
+
+interface QaAnswerSourceEvidenceReceipt {
+  title: string
+  source: string
+  category: string
+  fileReference: string
+  lineKindLabel: string
+  scanLabel: string
+  matchLabel: string
+  matchType: string
+  matched: boolean
+  locationConfidence: QaSourceLocationConfidence
+}
+
+interface QaSourceFileMatchRelease {
+  tone: 'ready' | 'warning' | 'blocked'
+  title: string
+  summary: string
+  targetReference: string
+  citedReference: string
+  matchLabel: string
+  riskLabel: string
+  nextAction: string
+  checks: Array<{ label: string; ok: boolean; detail: string }>
+}
+
+interface QaReadableEvidenceViewModel {
+  repairEvidenceGate: RepairEvidenceGate | null
+  citationAudit: CitationCoverageAudit | null
+  claimAudit: ClaimCitationAudit | null
+  trustSummary: QaTrustSummary | null
+  crossFileSummary: QaCrossFileCitationSummary | null
+  sourceEvidenceReceipt: QaAnswerSourceEvidenceReceipt | null
+  sourceFileRelease: QaSourceFileMatchRelease | null
+}
+
+interface QaNextActionRailProps {
+  summary: QaTrustSummary
+  previousUserQuestion: string
+  primaryRepairUrl: string
+  primaryCitation?: CodeQaCitation
+  loading: boolean
+  hasSourceScan: boolean
+  onRetryQuestion: (question: string) => void
+  onPrepareQuestion: (question: string) => void
+  onRefreshEvidence: (question: string) => void
+  onCopyCitation: (citation: CodeQaCitation) => void
+  onOpenRepair: (url: string) => void
+}
+
+interface QaReadableEvidenceSectionProps {
+  evidence: QaReadableEvidenceViewModel
+  previousUserQuestion: string
+  primaryRepairUrl: string
+  primaryCitation?: CodeQaCitation
+  loading: boolean
+  hasSourceScan: boolean
+  onRetryQuestion: (question: string) => void
+  onPrepareQuestion: (question: string) => void
+  onRefreshEvidence: (question: string) => void
+  onCopyCitation: (citation: CodeQaCitation) => void
+  onOpenRepair: (url: string) => void
+}
+
+interface QaDetailedEvidenceAuditSectionProps {
+  citationAudit: CitationCoverageAudit | null
+  claimAudit: ClaimCitationAudit | null
+  repairEvidenceGate: RepairEvidenceGate | null
+}
 
 interface RagQualitySignal {
   label: string
@@ -125,13 +328,49 @@ interface ChunkEvidenceProfile {
   uniqueFiles: number
 }
 
+interface ChunkEvidenceCombination {
+  tone: QaSignalTone
+  label: string
+  summary: string
+  nextAction: string
+  primaryCount: number
+  contextCount: number
+  uniqueFiles: number
+  embeddedCount: number
+  topSourceLabel: string
+  topReference: string
+  fileCoverage: string[]
+  rolePath: string[]
+  nextQuestions: string[]
+}
+
+type CodeUnderstandingQueryKind = 'IDLE' | 'FILE_LINE' | 'METHOD_ANCHOR' | 'STACK_TRACE' | 'GENERAL'
+
+interface CodeUnderstandingQuerySignal {
+  kind: CodeUnderstandingQueryKind
+  label: string
+  title: string
+  hint: string
+}
+
 const DEFAULT_QA_STARTERS = [
   '请解释本项目核心 Controller Service Repository 调用链，并列出关键文件证据',
   '本项目最核心的数据模型和持久化路径是什么？',
   '请找出前端入口、API 调用和后端接口之间的对应关系',
+  '请根据我粘贴的 file:line、Class#method 或浏览器 stack trace 定位对应代码，并说明上下文风险',
 ]
 
 const PROJECT_TAB_KEYS = new Set(['overview', 'repos', 'scans', 'qa', 'graph'])
+const REPORT_EVIDENCE_QUERY_PARAMS = [
+  'evidenceCategory',
+  'evidenceSource',
+  'evidenceTitle',
+  'evidenceSummary',
+  'evidenceFile',
+  'evidenceLine',
+  'evidenceStartLine',
+  'evidenceEndLine',
+]
 
 const CORE_ARTIFACT_TYPES = [
   'RAW_SCAN_RESULT',
@@ -153,8 +392,14 @@ export default function ProjectDetail() {
   const [repos, setRepos] = useState<Repository[]>([])
   const [scans, setScans] = useState<ScanTask[]>([])
   const [scanExecutions, setScanExecutions] = useState<Record<number, ExecutionTask>>({})
+  const [workspacePhase, setWorkspacePhase] = useState<ProjectWorkspaceViewState>('INITIAL_LOADING')
+  const [workspaceSyncing, setWorkspaceSyncing] = useState(false)
+  const [trustedSnapshotProjectId, setTrustedSnapshotProjectId] = useState<number | null>(null)
+  const [projectError, setProjectError] = useState<string | null>(null)
   const [loadingRepos, setLoadingRepos] = useState(true)
   const [loadingScans, setLoadingScans] = useState(true)
+  const [repoError, setRepoError] = useState<string | null>(null)
+  const [scanError, setScanError] = useState<string | null>(null)
   const [repoModalOpen, setRepoModalOpen] = useState(false)
   const [githubAppModalOpen, setGithubAppModalOpen] = useState(false)
   const [selectedRepo, setSelectedRepo] = useState<Repository | null>(null)
@@ -179,216 +424,475 @@ export default function ProjectDetail() {
   const [codeKnowledge, setCodeKnowledge] = useState<CodeChunkSearchResponse | null>(null)
   const [codeKnowledgeLoading, setCodeKnowledgeLoading] = useState(false)
   const [codeKnowledgeError, setCodeKnowledgeError] = useState<string | null>(null)
+  const activeProjectIdRef = useRef(projectId)
+  const projectGenerationRef = useRef(0)
+  const coreRequestSeqRef = useRef(0)
+  const detailRequestSeqRef = useRef(0)
+  const fullRefreshOwnerRef = useRef<number | null>(null)
+  const workspaceSyncOwnerRef = useRef<string | null>(null)
+  const trustedSnapshotProjectIdRef = useRef<number | null>(null)
+  const detailScanTaskIdRef = useRef<number | null>(null)
+  activeProjectIdRef.current = projectId
 
-  useEffect(() => {
-    projectApi.detail(projectId).then((res) => setProject(res.data.data))
-  }, [projectId])
+  const loadWorkspace = useCallback(async ({ silent = false, includeDetails = true }: ProjectWorkspaceLoadOptions = {}) => {
+    const ownerProjectId = projectId
+    const projectGeneration = projectGenerationRef.current
+    const coreSeq = coreRequestSeqRef.current + 1
+    coreRequestSeqRef.current = coreSeq
+    const fullRefresh = !silent && includeDetails
+    const coreSyncToken = `${projectGeneration}:core:${coreSeq}`
+    const hadTrustedSnapshot = trustedSnapshotProjectIdRef.current === ownerProjectId
+    const isCurrentCore = () => (
+      activeProjectIdRef.current === ownerProjectId
+      && projectGenerationRef.current === projectGeneration
+      && coreRequestSeqRef.current === coreSeq
+    )
+    const finishWorkspaceSync = (token: string | null) => {
+      if (token && workspaceSyncOwnerRef.current === token) {
+        workspaceSyncOwnerRef.current = null
+        setWorkspaceSyncing(false)
+      }
+    }
+    const finishFullRefresh = () => {
+      if (fullRefresh && fullRefreshOwnerRef.current === coreSeq) {
+        fullRefreshOwnerRef.current = null
+      }
+    }
 
-  const loadRepos = () => {
-    setLoadingRepos(true)
-    repositoryApi.list(projectId).then((res) => setRepos(res.data.data)).finally(() => setLoadingRepos(false))
-  }
+    if (fullRefresh) {
+      fullRefreshOwnerRef.current = coreSeq
+      workspaceSyncOwnerRef.current = coreSyncToken
+      setWorkspaceSyncing(true)
+    }
 
-  const loadScans = useCallback((silent = false) => {
-    if (!silent) setLoadingScans(true)
-    Promise.all([
-      scanTaskApi.list(projectId),
-      executionTaskApi.list(projectId, 1, 100).catch(() => null),
-    ]).then(([scanRes, executionRes]) => {
-      const items = scanRes.data.data.items || []
-      const executions = executionRes?.data.data.items || []
-      const executionByScanId: Record<number, ExecutionTask> = {}
-      executions.forEach((task: ExecutionTask) => {
-        if (task.sourceType === 'SCAN_TASK' && task.sourceId) {
-          executionByScanId[task.sourceId] = task
+    if (!Number.isInteger(ownerProjectId) || ownerProjectId <= 0) {
+      if (isCurrentCore()) {
+        setProjectError('项目 ID 无效，无法加载项目工作台。')
+        setRepoError(null)
+        setScanError(null)
+        setWorkspacePhase(hadTrustedSnapshot ? 'STALE_REFRESH' : 'FATAL_LOAD')
+        setLoadingRepos(false)
+        setLoadingScans(false)
+      }
+      finishWorkspaceSync(fullRefresh ? coreSyncToken : null)
+      finishFullRefresh()
+      return
+    }
+
+    if (!hadTrustedSnapshot) {
+      setWorkspacePhase('INITIAL_LOADING')
+    }
+    if (!silent || !hadTrustedSnapshot) {
+      setLoadingRepos(true)
+      setLoadingScans(true)
+    }
+
+    const [projectResult, reposResult, scansResult, executionsResult] = await Promise.allSettled([
+      projectApi.detail(ownerProjectId),
+      repositoryApi.list(ownerProjectId),
+      scanTaskApi.list(ownerProjectId),
+      executionTaskApi.list(ownerProjectId, 1, 100),
+    ])
+    if (!isCurrentCore()) {
+      finishWorkspaceSync(fullRefresh ? coreSyncToken : null)
+      finishFullRefresh()
+      return
+    }
+
+    const nextProject = projectResult.status === 'fulfilled' ? projectResult.value.data.data : null
+    const nextRepos: Repository[] = reposResult.status === 'fulfilled' ? (reposResult.value.data.data || []) : []
+    const nextScans: ScanTask[] = scansResult.status === 'fulfilled' ? (scansResult.value.data.data.items || []) : []
+    let nextProjectError = projectResult.status === 'rejected'
+      ? formatApiError(projectResult.reason, '加载项目详情失败')
+      : null
+    let nextRepoError = reposResult.status === 'rejected'
+      ? formatApiError(reposResult.reason, '加载仓库列表失败')
+      : null
+    let nextScanError = scansResult.status === 'rejected'
+      ? formatApiError(scansResult.reason, '加载扫描任务失败')
+      : null
+
+    if (!nextProjectError && (!nextProject || Number(nextProject.id) !== ownerProjectId)) {
+      nextProjectError = '项目详情归属校验失败，已拒绝应用响应。'
+    }
+    if (!nextRepoError && !nextRepos.every(repo => Number(repo.projectId) === ownerProjectId)) {
+      nextRepoError = '仓库列表归属校验失败，已拒绝应用响应。'
+    }
+    if (!nextScanError && !nextScans.every(scan => Number(scan.projectId) === ownerProjectId)) {
+      nextScanError = '扫描列表归属校验失败，已拒绝应用响应。'
+    }
+
+    if (nextProjectError || nextRepoError || nextScanError) {
+      setProjectError(nextProjectError)
+      setRepoError(nextRepoError)
+      setScanError(nextScanError)
+      setWorkspacePhase(hadTrustedSnapshot ? 'STALE_REFRESH' : 'FATAL_LOAD')
+      setLoadingRepos(false)
+      setLoadingScans(false)
+      finishWorkspaceSync(fullRefresh ? coreSyncToken : null)
+      finishFullRefresh()
+      return
+    }
+
+    const nextExecutionByScanId: Record<number, ExecutionTask> = {}
+    if (executionsResult.status === 'fulfilled') {
+      const executions = executionsResult.value.data.data.items || []
+      const executionResponseOwned = executions.every(task => Number(task.projectId) === ownerProjectId)
+      if (executionResponseOwned) {
+        const scanIds = new Set(nextScans.map(scan => scan.id))
+        executions.forEach((task: ExecutionTask) => {
+          if (task.sourceType === 'SCAN_TASK' && task.sourceId && scanIds.has(task.sourceId)) {
+            nextExecutionByScanId[task.sourceId] = task
+          }
+        })
+      }
+    }
+
+    const latestSuccess = nextScans.find(scan => scan.status === 'SUCCESS') || null
+    setProject(nextProject)
+    setRepos(nextRepos)
+    setScans(nextScans)
+    setScanExecutions(nextExecutionByScanId)
+    setLatestScanTaskId(latestSuccess?.id || null)
+    setProjectError(null)
+    setRepoError(null)
+    setScanError(null)
+    setLoadingRepos(false)
+    setLoadingScans(false)
+    trustedSnapshotProjectIdRef.current = ownerProjectId
+    setTrustedSnapshotProjectId(ownerProjectId)
+    setWorkspacePhase('READY')
+
+    const nextDetailScanTaskId = latestSuccess?.id || null
+    const scanDetailsChanged = detailScanTaskIdRef.current !== nextDetailScanTaskId
+    // Same-scan polling only advances core state; it must never starve an in-flight detail request.
+    const shouldStartDetails = Boolean(latestSuccess && (includeDetails || scanDetailsChanged))
+    const detailSeq = includeDetails || scanDetailsChanged
+      ? detailRequestSeqRef.current + 1
+      : detailRequestSeqRef.current
+    if (includeDetails || scanDetailsChanged) {
+      detailRequestSeqRef.current = detailSeq
+    }
+    const detailSyncToken = fullRefresh && shouldStartDetails
+      ? `${projectGeneration}:detail:${detailSeq}`
+      : null
+    if (detailSyncToken && workspaceSyncOwnerRef.current === coreSyncToken) {
+      workspaceSyncOwnerRef.current = detailSyncToken
+    }
+
+    if (!latestSuccess) {
+      detailScanTaskIdRef.current = null
+      setOverview(null)
+      setFileTree(null)
+      setLatestArtifacts([])
+      setReportQuality(null)
+      setCodeKnowledge(null)
+      setOverviewError('暂无成功的扫描结果')
+      setCodeKnowledgeError(null)
+      setOverviewLoading(false)
+      setCodeKnowledgeLoading(false)
+      finishWorkspaceSync(fullRefresh ? coreSyncToken : null)
+      finishFullRefresh()
+      return
+    }
+
+    if (!shouldStartDetails) {
+      finishWorkspaceSync(fullRefresh ? coreSyncToken : null)
+      finishFullRefresh()
+      return
+    }
+
+    if (scanDetailsChanged) {
+      detailScanTaskIdRef.current = latestSuccess.id
+      setOverview(null)
+      setFileTree(null)
+      setLatestArtifacts([])
+      setReportQuality(null)
+      setCodeKnowledge(null)
+    }
+    const isCurrentDetail = () => (
+      activeProjectIdRef.current === ownerProjectId
+      && projectGenerationRef.current === projectGeneration
+      && detailRequestSeqRef.current === detailSeq
+      && detailScanTaskIdRef.current === latestSuccess.id
+    )
+    setOverviewLoading(true)
+    setOverviewError(null)
+    setCodeKnowledgeLoading(true)
+    setCodeKnowledgeError(null)
+
+    const [artifactsResult, codeKnowledgeResult] = await Promise.allSettled([
+      artifactApi.list(ownerProjectId, {
+        ownerType: 'SCAN_TASK',
+        ownerId: latestSuccess.id,
+      }),
+      codeChunkApi.status(ownerProjectId, { scanTaskId: latestSuccess.id, limit: 1 }),
+    ])
+    if (!isCurrentDetail()) return
+
+    let nextCodeKnowledge: CodeChunkSearchResponse | undefined
+    let nextCodeKnowledgeError: string | null = null
+    if (codeKnowledgeResult.status === 'fulfilled') {
+      const response = codeKnowledgeResult.value.data.data
+      if (isCodeKnowledgeOwnedByScan(response, latestSuccess.id)) {
+        nextCodeKnowledge = response
+      } else {
+        nextCodeKnowledgeError = 'code_chunks 归属校验失败，已拒绝应用响应。'
+      }
+    } else {
+      nextCodeKnowledgeError = formatApiError(codeKnowledgeResult.reason, '加载 code_chunks 状态失败')
+    }
+
+    let nextArtifacts: ArtifactRecord[] | undefined
+    let nextReportQuality: ReportQualityData | null | undefined
+    let nextOverview: OverviewData | null | undefined
+    let nextFileTree: any
+    let commitOverview = false
+    let nextOverviewError: string | null = null
+
+    if (artifactsResult.status === 'rejected') {
+      nextOverviewError = formatApiError(artifactsResult.reason, '加载总览数据失败')
+    } else {
+      const artifacts: ArtifactRecord[] = artifactsResult.value.data.data || []
+      if (!artifacts.every(artifact => isArtifactOwnedByScan(artifact, ownerProjectId, latestSuccess.id))) {
+        nextOverviewError = '扫描产物归属校验失败，已拒绝应用响应。'
+      } else {
+        nextArtifacts = artifacts
+        const reportArtifact = artifacts.find(artifact => artifact.artifactType === 'ARCHITECTURE_REPORT')
+        const overviewArtifact = artifacts.find(artifact => artifact.artifactType === 'ARCHITECTURE_OVERVIEW')
+        const [reportPreviewResult, overviewPreviewResult] = await Promise.allSettled([
+          reportArtifact ? artifactApi.preview(ownerProjectId, reportArtifact.id) : Promise.resolve(null),
+          overviewArtifact ? artifactApi.preview(ownerProjectId, overviewArtifact.id) : Promise.resolve(null),
+        ])
+        if (!isCurrentDetail()) return
+
+        if (!reportArtifact) {
+          nextReportQuality = null
+        } else if (
+          reportPreviewResult.status === 'fulfilled'
+          && reportPreviewResult.value
+          && isArtifactPreviewOwnedByScan(reportPreviewResult.value.data.data.record, reportArtifact, ownerProjectId, latestSuccess.id)
+        ) {
+          try {
+            const reportData = JSON.parse(reportPreviewResult.value.data.data.text)
+            nextReportQuality = normalizeReportQuality(reportData.reportQuality)
+          } catch {
+            nextReportQuality = null
+          }
+        } else {
+          nextReportQuality = null
         }
-      })
-      setScans(items)
-      setScanExecutions(executionByScanId)
-      const latest = items.find((t: ScanTask) => t.status === 'SUCCESS')
-      setLatestScanTaskId(latest ? latest.id : null)
-    }).finally(() => {
-      if (!silent) setLoadingScans(false)
-    })
+
+        if (!overviewArtifact) {
+          nextOverviewError = '未找到架构概览数据'
+          nextOverview = null
+          nextFileTree = null
+          commitOverview = true
+        } else if (overviewPreviewResult.status === 'rejected') {
+          nextOverviewError = formatApiError(overviewPreviewResult.reason, '加载总览数据失败')
+        } else if (
+          !overviewPreviewResult.value
+          || !isArtifactPreviewOwnedByScan(overviewPreviewResult.value.data.data.record, overviewArtifact, ownerProjectId, latestSuccess.id)
+        ) {
+          nextOverviewError = '架构概览归属校验失败，已拒绝应用响应。'
+        } else {
+          try {
+            const data = JSON.parse(overviewPreviewResult.value.data.data.text)
+            const normalizedOverview = normalizeProjectOverview(data)
+            nextOverview = normalizedOverview.overview
+            nextFileTree = normalizedOverview.fileTree
+            commitOverview = true
+          } catch (error) {
+            nextOverviewError = formatApiError(error, '加载总览数据失败')
+          }
+        }
+      }
+    }
+
+    if (!isCurrentDetail()) return
+    if (nextCodeKnowledge !== undefined) setCodeKnowledge(nextCodeKnowledge)
+    setCodeKnowledgeError(nextCodeKnowledgeError)
+    if (nextArtifacts !== undefined) setLatestArtifacts(nextArtifacts)
+    if (nextReportQuality !== undefined) setReportQuality(nextReportQuality)
+    if (commitOverview) {
+      setOverview(nextOverview ?? null)
+      setFileTree(nextFileTree ?? null)
+    }
+    setOverviewError(nextOverviewError)
+    setCodeKnowledgeLoading(false)
+    setOverviewLoading(false)
+    finishWorkspaceSync(detailSyncToken)
+    finishFullRefresh()
   }, [projectId])
+
+  const loadRepos = useCallback(() => loadWorkspace(), [loadWorkspace])
+  const loadScans = useCallback((silent = false) => loadWorkspace({ silent, includeDetails: !silent }), [loadWorkspace])
+  const loadOverview = useCallback(() => loadWorkspace({ includeDetails: true }), [loadWorkspace])
 
   const handleWorkspaceTabChange = (key: string) => {
     const nextParams = new URLSearchParams(searchParams)
     if (key === 'overview') {
       nextParams.delete('tab')
       nextParams.delete('question')
-      nextParams.delete('scanTaskId')
       loadOverview()
     } else {
       nextParams.set('tab', key)
       if (key !== 'qa') {
         nextParams.delete('question')
-        nextParams.delete('scanTaskId')
       }
+    }
+    if (key !== 'qa') {
+      REPORT_EVIDENCE_QUERY_PARAMS.forEach(param => nextParams.delete(param))
     }
     setSearchParams(nextParams, { replace: true })
   }
 
   useEffect(() => {
+    const routeGeneration = projectGenerationRef.current + 1
+    projectGenerationRef.current = routeGeneration
+    coreRequestSeqRef.current += 1
+    detailRequestSeqRef.current += 1
+    fullRefreshOwnerRef.current = null
+    workspaceSyncOwnerRef.current = null
+    trustedSnapshotProjectIdRef.current = null
+    detailScanTaskIdRef.current = null
+    setTrustedSnapshotProjectId(null)
+    setWorkspacePhase('INITIAL_LOADING')
+    setWorkspaceSyncing(false)
+    setProject(null)
+    setRepos([])
+    setScans([])
+    setScanExecutions({})
+    setProjectError(null)
+    setRepoError(null)
+    setScanError(null)
+    setLoadingRepos(true)
+    setLoadingScans(true)
     setLatestScanTaskId(null)
+    setOverview(null)
+    setFileTree(null)
+    setOverviewError(null)
+    setLatestArtifacts([])
+    setReportQuality(null)
     setCodeKnowledge(null)
+    setCodeKnowledgeLoading(false)
     setCodeKnowledgeError(null)
-    loadRepos()
-    loadScans()
-    loadOverview()
-  }, [projectId, loadScans])
-
-  useEffect(() => {
-    let cancelled = false
-    if (!knowledgeScanTaskId) {
-      setCodeKnowledge(null)
-      setCodeKnowledgeLoading(false)
-      setCodeKnowledgeError(null)
-      return undefined
-    }
-
-    setCodeKnowledgeLoading(true)
-    setCodeKnowledgeError(null)
-    codeChunkApi.search(projectId, { scanTaskId: knowledgeScanTaskId, limit: 1 })
-      .then((res) => {
-        if (!cancelled) {
-          setCodeKnowledge(res.data.data)
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setCodeKnowledge(null)
-          setCodeKnowledgeError(formatApiError(error, '加载 code_chunks 状态失败'))
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setCodeKnowledgeLoading(false)
-        }
-      })
+    setOverviewLoading(false)
+    setRepoModalOpen(false)
+    setGithubAppModalOpen(false)
+    setSelectedRepo(null)
+    setCreatingScan(null)
+    setCancellingScan(null)
+    repoForm.resetFields()
+    githubAppForm.resetFields()
+    void loadWorkspace()
 
     return () => {
-      cancelled = true
+      if (projectGenerationRef.current === routeGeneration) {
+        projectGenerationRef.current += 1
+      }
+      coreRequestSeqRef.current += 1
+      detailRequestSeqRef.current += 1
+      fullRefreshOwnerRef.current = null
+      workspaceSyncOwnerRef.current = null
     }
-  }, [projectId, knowledgeScanTaskId])
+  }, [githubAppForm, loadWorkspace, projectId, repoForm])
 
   const activeScanCount = scans.filter(scan => scan.status === 'RUNNING' || scan.status === 'PENDING').length
 
   useEffect(() => {
     if (activeScanCount <= 0) return undefined
-    const timer = window.setTimeout(() => loadScans(true), 3000)
-    return () => window.clearTimeout(timer)
+    let cancelled = false
+    let timer: number | undefined
+    const schedule = () => {
+      if (!cancelled) timer = window.setTimeout(poll, 3000)
+    }
+    const poll = async () => {
+      if (cancelled) return
+      if (fullRefreshOwnerRef.current !== null) {
+        schedule()
+        return
+      }
+      try {
+        await loadScans(true)
+      } finally {
+        schedule()
+      }
+    }
+    schedule()
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
   }, [activeScanCount, loadScans])
 
-  // 加载最新扫描的总览数据
-  const loadOverview = async () => {
-    setOverviewLoading(true)
-    setOverviewError(null)
-    try {
-      const scansRes = await scanTaskApi.list(projectId)
-      const tasks: ScanTask[] = scansRes.data.data.items || []
-      const latestSuccess = tasks.find((t: ScanTask) => t.status === 'SUCCESS')
-      if (!latestSuccess) {
-        setOverviewError('暂无成功的扫描结果')
-        setOverview(null)
-        setFileTree(null)
-        setLatestArtifacts([])
-        setReportQuality(null)
-        return
-      }
-      setLatestScanTaskId(latestSuccess.id)
-      const artifactsRes = await artifactApi.list(projectId, {
-        ownerType: 'SCAN_TASK',
-        ownerId: latestSuccess.id,
-      })
-      const artifacts: ArtifactRecord[] = artifactsRes.data.data || []
-      setLatestArtifacts(artifacts)
-      const reportArt = artifacts.find((a: ArtifactRecord) => a.artifactType === 'ARCHITECTURE_REPORT')
-      if (reportArt) {
-        try {
-          const reportPreview = await artifactApi.preview(projectId, reportArt.id)
-          const reportData = JSON.parse(reportPreview.data.data.text)
-          setReportQuality(normalizeReportQuality(reportData.reportQuality))
-        } catch {
-          setReportQuality(null)
-        }
-      } else {
-        setReportQuality(null)
-      }
-      const archArt = artifacts.find((a: ArtifactRecord) => a.artifactType === 'ARCHITECTURE_OVERVIEW')
-      if (!archArt) {
-        setOverviewError('未找到架构概览数据')
-        setOverview(null)
-        setFileTree(null)
-        return
-      }
-      const previewRes = await artifactApi.preview(projectId, archArt.id)
-      const data = JSON.parse(previewRes.data.data.text)
-      // 后端 languages 返回对象格式 {"Java":{"file_count":10,"line_count":5000}}，需转为数组
-      const rawLangs = data.languages
-      const languages: LanguageStat[] = Array.isArray(rawLangs)
-        ? rawLangs
-        : rawLangs && typeof rawLangs === 'object'
-          ? Object.entries(rawLangs).map(([name, val]: [string, any]) => ({
-              name,
-              file_count: val?.file_count ?? 0,
-              line_count: val?.line_count ?? 0,
-            }))
-          : []
-      setOverview({
-        languages,
-        framework: data.framework || null,
-        totalFiles: data.totalFiles || 0,
-        totalDirs: data.totalDirs || 0,
-        totalLines: data.totalLines || 0,
-        controllers: data.controllers || 0,
-        services: data.services || 0,
-        repositories: data.repositories || 0,
-        entities: data.entities || 0,
-      })
-      setFileTree(data.entryPoints || null)
-    } catch (error) {
-      setOverviewError(formatApiError(error, '加载总览数据失败'))
-      setOverview(null)
-      setFileTree(null)
-      setLatestArtifacts([])
-      setReportQuality(null)
-    } finally {
-      setOverviewLoading(false)
-    }
-  }
+  const isProjectOperationCurrent = (ownerProjectId: number, generation: number) => (
+    activeProjectIdRef.current === ownerProjectId
+    && projectGenerationRef.current === generation
+  )
 
   const handleAddRepo = async () => {
+    const ownerProjectId = projectId
+    const generation = projectGenerationRef.current
     try {
       const values = await repoForm.validateFields()
-      await repositoryApi.add(projectId, values)
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
+      const response = await repositoryApi.add(ownerProjectId, values)
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
+      if (Number(response.data.data?.projectId) !== ownerProjectId) {
+        message.error('仓库响应归属校验失败，未应用页面更新')
+        return
+      }
       message.success('仓库添加成功')
       setRepoModalOpen(false)
       repoForm.resetFields()
-      loadRepos()
+      void loadRepos()
     } catch (error: any) {
       if (error?.errorFields) return
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
       showApiError(error, '仓库添加失败')
     }
   }
 
   const handleDeleteRepo = async (repoId: number) => {
+    const ownerProjectId = projectId
+    const generation = projectGenerationRef.current
+    const ownedRepository = repos.find(repo => repo.id === repoId && Number(repo.projectId) === ownerProjectId)
+    if (
+      trustedSnapshotProjectIdRef.current !== ownerProjectId
+      || !ownedRepository
+      || !isProjectOperationCurrent(ownerProjectId, generation)
+    ) {
+      message.error('仓库不属于当前可信项目快照，已阻止删除')
+      return
+    }
     try {
       await repositoryApi.delete(repoId)
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
       message.success('仓库已删除')
-      loadRepos()
+      void loadRepos()
     } catch (error) {
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
       showApiError(error, '仓库删除失败')
     }
   }
 
   const openGitHubAppModal = async (repo: Repository) => {
+    const ownerProjectId = projectId
+    const generation = projectGenerationRef.current
+    if (Number(repo.projectId) !== ownerProjectId) return
     setSelectedRepo(repo)
     githubAppForm.resetFields()
     if (repo.authType === 'GITHUB_APP') {
       try {
         const res = await repositoryApi.getGitHubAppInstallation(repo.id)
+        if (!isProjectOperationCurrent(ownerProjectId, generation)) return
         const installation = res.data.data
+        if (Number(installation?.projectId) !== ownerProjectId || Number(installation?.repositoryId) !== repo.id) {
+          message.error('GitHub App installation 归属校验失败')
+          setSelectedRepo(null)
+          return
+        }
         githubAppForm.setFieldsValue({
           installationId: installation.installationId,
           accountLogin: installation.accountLogin,
@@ -397,69 +901,162 @@ export default function ProjectDetail() {
           permissionsJson: installation.permissionsJson,
         })
       } catch (error) {
+        if (!isProjectOperationCurrent(ownerProjectId, generation)) return
         showApiError(error, '加载 GitHub App installation 失败')
         githubAppForm.setFieldsValue({ accountLogin: repo.owner })
       }
     } else {
       githubAppForm.setFieldsValue({ accountLogin: repo.owner, accountType: 'Organization', repositorySelection: 'selected' })
     }
+    if (!isProjectOperationCurrent(ownerProjectId, generation)) return
     setGithubAppModalOpen(true)
   }
 
   const handleBindGitHubApp = async () => {
-    if (!selectedRepo) return
+    if (!selectedRepo || Number(selectedRepo.projectId) !== projectId) return
+    const ownerProjectId = projectId
+    const generation = projectGenerationRef.current
+    const repositoryId = selectedRepo.id
     try {
       const values = await githubAppForm.validateFields()
-      await repositoryApi.bindGitHubAppInstallation(selectedRepo.id, values)
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
+      const response = await repositoryApi.bindGitHubAppInstallation(repositoryId, values)
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
+      const installation = response.data.data
+      if (Number(installation?.projectId) !== ownerProjectId || Number(installation?.repositoryId) !== repositoryId) {
+        message.error('GitHub App installation 归属校验失败')
+        return
+      }
       message.success('GitHub App installation 已绑定')
       setGithubAppModalOpen(false)
       setSelectedRepo(null)
       githubAppForm.resetFields()
-      loadRepos()
+      void loadRepos()
     } catch (error: any) {
       if (error?.errorFields) return
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
       showApiError(error, '绑定 GitHub App installation 失败')
     }
   }
 
   const handleDisableGitHubApp = async () => {
-    if (!selectedRepo) return
+    if (!selectedRepo || Number(selectedRepo.projectId) !== projectId) return
+    const ownerProjectId = projectId
+    const generation = projectGenerationRef.current
     try {
       await repositoryApi.disableGitHubAppInstallation(selectedRepo.id)
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
       message.success('GitHub App installation 已禁用')
       setGithubAppModalOpen(false)
       setSelectedRepo(null)
       githubAppForm.resetFields()
-      loadRepos()
+      void loadRepos()
     } catch (error) {
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
       showApiError(error, '禁用 GitHub App installation 失败')
     }
   }
 
   const handleCreateScan = async (repo: Repository) => {
+    const ownerProjectId = projectId
+    const generation = projectGenerationRef.current
+    if (Number(repo.projectId) !== ownerProjectId) return
     setCreatingScan(repo.id)
     try {
-      await scanTaskApi.create(repo.id, { projectId })
+      const response = await scanTaskApi.create(repo.id, { projectId: ownerProjectId })
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
+      const createdScan = response.data.data
+      if (Number(createdScan?.projectId) !== ownerProjectId || Number(createdScan?.repositoryId) !== repo.id) {
+        message.error('扫描任务归属校验失败，未应用页面更新')
+        return
+      }
       message.success('扫描任务已创建')
-      loadScans()
+      void loadScans()
     } catch (error) {
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
       showApiError(error, '创建扫描任务失败')
     } finally {
-      setCreatingScan(null)
+      if (isProjectOperationCurrent(ownerProjectId, generation)) setCreatingScan(null)
     }
   }
 
   const handleCancelScan = async (scanTaskId: number) => {
+    const ownerProjectId = projectId
+    const generation = projectGenerationRef.current
+    const ownedScan = scans.find(scan => scan.id === scanTaskId && Number(scan.projectId) === ownerProjectId)
+    if (
+      trustedSnapshotProjectIdRef.current !== ownerProjectId
+      || !ownedScan
+      || !isProjectOperationCurrent(ownerProjectId, generation)
+    ) {
+      message.error('扫描任务不属于当前可信项目快照，已阻止取消')
+      return
+    }
     setCancellingScan(scanTaskId)
     try {
-      await scanTaskApi.cancel(scanTaskId)
+      const response = await scanTaskApi.cancel(scanTaskId)
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
+      if (Number(response.data.data?.projectId) !== ownerProjectId || Number(response.data.data?.id) !== scanTaskId) {
+        message.error('扫描任务归属校验失败，未应用页面更新')
+        return
+      }
       message.success('扫描任务已取消')
-      loadScans()
+      void loadScans()
     } catch (error) {
+      if (!isProjectOperationCurrent(ownerProjectId, generation)) return
       showApiError(error, '取消扫描任务失败')
     } finally {
-      setCancellingScan(null)
+      if (isProjectOperationCurrent(ownerProjectId, generation)) setCancellingScan(null)
     }
+  }
+
+  const hasTrustedSnapshot = trustedSnapshotProjectId === projectId && Number(project?.id) === projectId
+  const workspaceViewState: ProjectWorkspaceViewState = hasTrustedSnapshot
+    ? workspacePhase === 'STALE_REFRESH' ? 'STALE_REFRESH' : 'READY'
+    : workspacePhase === 'FATAL_LOAD' ? 'FATAL_LOAD' : 'INITIAL_LOADING'
+  const coreErrorSummary = [projectError, repoError, scanError].filter(Boolean).join('；')
+
+  if (workspaceViewState === 'INITIAL_LOADING') {
+    return (
+      <div
+        className="sl-project-first-viewport-state"
+        data-sl-project-state="INITIAL_LOADING"
+        data-sl-project-id={projectId}
+        aria-busy="true"
+      >
+        <StateBlock
+          tone="loading"
+          title="正在确认项目工作区"
+          description="正在读取项目、仓库和扫描三个核心数据源；全部确认前不会展示业务动作或 0 数据结论。"
+        />
+      </div>
+    )
+  }
+
+  if (workspaceViewState === 'FATAL_LOAD') {
+    return (
+      <div
+        className="sl-project-first-viewport-state"
+        data-sl-project-state="FATAL_LOAD"
+        data-sl-project-id={projectId}
+        aria-busy={workspaceSyncing}
+      >
+        <StateBlock
+          tone="error"
+          title="项目工作区加载失败"
+          description={coreErrorSummary || '项目核心数据源不可用，当前没有可继续使用的可信快照。'}
+          action={(
+            <ActionButton
+              type="primary"
+              icon={<ReloadOutlined />}
+              loading={workspaceSyncing}
+              onClick={() => void loadWorkspace({ includeDetails: true })}
+              label="重新加载项目工作区"
+            />
+          )}
+        />
+      </div>
+    )
   }
 
   const statusColor: Record<string, string> = {
@@ -494,7 +1091,7 @@ export default function ProjectDetail() {
     ? reportAgentFlowReady
       ? '报告、图谱、RAG 可用'
       : analysisReadiness.nextAction
-    : '等待产物生成'
+      : '等待产物生成'
 
   const handlePrimaryScan = () => {
     if (primaryRepo) {
@@ -504,10 +1101,146 @@ export default function ProjectDetail() {
       setRepoModalOpen(true)
     }
   }
+  const workspaceNextAction = buildProjectWorkspaceNextAction({
+    activeScanCount,
+    analysisReadiness,
+    codeKnowledgeStatus,
+    latestScan,
+    latestSuccessScan,
+    primaryRepo,
+    repos,
+    scans,
+    staleRefreshError: workspaceViewState === 'STALE_REFRESH' ? coreErrorSummary : null,
+  })
+  const workspacePrimaryLoading = workspaceNextAction.key === 'STALE_REFRESH'
+    ? workspaceSyncing
+    : workspaceNextAction.key === 'START_SCAN' && primaryRepo
+      ? creatingScan === primaryRepo.id
+      : false
+  const projectTrustedLoop: ProjectTrustedLoopStep[] = [
+    {
+      key: 'f1-analysis',
+      index: 'F1',
+      title: '首次可信仓库分析',
+      owner: 'Developer Workbench',
+      value: latestSuccessScan ? `Scan #${latestSuccessScan.id}` : repositoryReadyCount > 0 ? '待扫描' : '待接入',
+      description: latestSuccessScan
+        ? '仓库、扫描和报告入口已形成，可进入报告复盘或 QA。'
+        : repositoryReadyCount > 0
+          ? '已有仓库，下一步应触发扫描形成报告证据。'
+          : '还没有可扫描仓库，主链路尚未启动。',
+      tone: latestSuccessScan ? 'ready' : repositoryReadyCount > 0 ? 'attention' : 'idle',
+      actionLabel: latestSuccessScan ? '打开报告' : repositoryReadyCount > 0 ? '触发扫描' : '接入仓库',
+      onAction: () => {
+        if (latestSuccessScan) navigate(`/scan-tasks/${latestSuccessScan.id}`)
+        else if (repositoryReadyCount > 0) handlePrimaryScan()
+        else {
+          repoForm.resetFields()
+          setRepoModalOpen(true)
+        }
+      },
+    },
+    {
+      key: 'f2-code-understanding',
+      index: 'F2',
+      title: '源码级理解',
+      owner: 'Developer Workbench',
+      value: codeKnowledgeStatus.totalChunks > 0 ? `${codeKnowledgeStatus.value} chunks` : codeKnowledgeStatus.value,
+      description: codeKnowledgeStatus.totalChunks > 0
+        ? 'code_chunks 已可用于带引用的代码问答和跨文件检索。'
+        : '代码问答仍缺稳定切片证据，先检查扫描产物和 chunk_code 阶段。',
+      tone: codeKnowledgeStatus.totalChunks > 0 ? 'ready' : latestSuccessScan ? 'attention' : 'idle',
+      actionLabel: codeKnowledgeStatus.totalChunks > 0 ? '进入 QA' : '检查证据',
+      onAction: () => {
+        if (codeKnowledgeStatus.totalChunks > 0) handleWorkspaceTabChange('qa')
+        else if (latestSuccessScan) navigate(`/scan-tasks/${latestSuccessScan.id}`)
+        else handleWorkspaceTabChange('scans')
+      },
+    },
+    {
+      key: 'f4-repair-candidate',
+      index: 'F4',
+      title: 'Issue 到修复候选',
+      owner: 'Developer Workbench',
+      value: reportAgentFlowReady ? '可进入' : latestSuccessScan ? '需复核' : '未就绪',
+      description: reportAgentFlowReady
+        ? '报告、核心产物和代码知识库已具备修复候选前置证据。'
+        : '修复候选必须绑定成功扫描、报告证据和 code_chunks，不能直接跳过复核。',
+      tone: reportAgentFlowReady ? 'ready' : latestSuccessScan ? 'attention' : 'idle',
+      actionLabel: reportAgentFlowReady ? '查看修复候选' : '打开报告',
+      onAction: () => {
+        if (reportAgentFlowReady) navigate(`/auto-repairs?projectId=${projectId}`)
+        else if (latestSuccessScan) navigate(`/scan-tasks/${latestSuccessScan.id}`)
+        else handleWorkspaceTabChange('scans')
+      },
+    },
+    {
+      key: 'f5-audit',
+      index: 'F5',
+      title: '安全与审计',
+      owner: 'Admin & Security',
+      value: latestSuccessScan ? '可追踪' : '等待证据',
+      description: latestSuccessScan
+        ? '当前项目已有扫描上下文，可进入审计日志复核关键操作和工具调用。'
+        : '审计链路需要先产生仓库、扫描或自动化操作记录。',
+      tone: latestSuccessScan ? 'ready' : 'idle',
+      actionLabel: '打开审计',
+      onAction: () => navigate(`/audit-logs?projectId=${projectId}`),
+    },
+  ]
+
+  const handleWorkspacePrimaryAction = () => {
+    if (workspaceNextAction.key === 'STALE_REFRESH') {
+      void loadWorkspace({ includeDetails: true })
+      return
+    }
+    if (workspaceNextAction.key === 'ADD_REPOSITORY') {
+      repoForm.resetFields()
+      setRepoModalOpen(true)
+      return
+    }
+    if (workspaceNextAction.key === 'START_SCAN') {
+      handlePrimaryScan()
+      return
+    }
+    if (workspaceNextAction.key === 'WATCH_SCAN' || workspaceNextAction.key === 'REVIEW_FAILED_SCAN') {
+      if (latestScan) navigate(`/scan-tasks/${latestScan.id}`)
+      return
+    }
+    if (workspaceNextAction.key === 'OPEN_ARTIFACTS') {
+      if (latestScanTaskId) navigate(`/artifacts?projectId=${projectId}&ownerType=SCAN_TASK&ownerId=${latestScanTaskId}`)
+      return
+    }
+    if (workspaceNextAction.key === 'OPEN_QA') {
+      handleWorkspaceTabChange('qa')
+    }
+  }
+
+  const handleWorkspaceSecondaryAction = () => {
+    if (workspaceNextAction.key === 'ADD_REPOSITORY' || workspaceNextAction.key === 'START_SCAN') {
+      handleWorkspaceTabChange('repos')
+      return
+    }
+    if (workspaceNextAction.key === 'WATCH_SCAN') {
+      handleWorkspaceTabChange('scans')
+      return
+    }
+    if (workspaceNextAction.key === 'REVIEW_FAILED_SCAN') {
+      handlePrimaryScan()
+      return
+    }
+    if (workspaceNextAction.key === 'OPEN_ARTIFACTS') {
+      if (latestSuccessScan) navigate(`/scan-tasks/${latestSuccessScan.id}`)
+      return
+    }
+    if (workspaceNextAction.key === 'OPEN_QA') {
+      if (latestSuccessScan) navigate(`/scan-tasks/${latestSuccessScan.id}`)
+    }
+  }
 
   return (
-    <div>
-      <div className="sl-project-cockpit">
+    <div data-sl-project-state={workspaceViewState} data-sl-project-id={projectId}>
+      <div className="sl-project-cockpit" aria-busy={workspaceSyncing}>
         <section className="sl-project-cockpit-main">
           <div className="sl-kicker">Project Workspace</div>
           <h1 className="sl-project-cockpit-title">{project?.name || '加载中...'}</h1>
@@ -521,32 +1254,12 @@ export default function ProjectDetail() {
             <span>{scans.length} scans</span>
             {latestScanTaskId && <span>knowledge source #{latestScanTaskId}</span>}
           </div>
-          <div className="sl-project-cockpit-actions">
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => { repoForm.resetFields(); setRepoModalOpen(true) }}>
-              添加仓库
-            </Button>
-            <Button
-              icon={<SearchOutlined />}
-              loading={primaryRepo ? creatingScan === primaryRepo.id : false}
-              onClick={handlePrimaryScan}
-            >
-              {primaryRepo ? '触发扫描' : '先接入仓库'}
-            </Button>
-            <Button
-              icon={<FileTextOutlined />}
-              disabled={!latestSuccessScan}
-              onClick={() => latestSuccessScan && navigate(`/scan-tasks/${latestSuccessScan.id}`)}
-            >
-              最新报告
-            </Button>
-            <Button
-              icon={<DatabaseOutlined />}
-              disabled={!latestScanTaskId}
-              onClick={() => latestScanTaskId && navigate(`/artifacts?projectId=${projectId}&ownerType=SCAN_TASK&ownerId=${latestScanTaskId}`)}
-            >
-              产物库
-            </Button>
-          </div>
+          <ProjectWorkspaceNextActionRail
+            action={workspaceNextAction}
+            primaryLoading={workspacePrimaryLoading}
+            onPrimary={handleWorkspacePrimaryAction}
+            onSecondary={handleWorkspaceSecondaryAction}
+          />
         </section>
 
         <section className="sl-project-cockpit-side">
@@ -555,10 +1268,21 @@ export default function ProjectDetail() {
               <span>Latest analysis</span>
               <strong>{latestScan ? `Scan #${latestScan.id}` : '暂无扫描'}</strong>
             </div>
-            <Tooltip title="刷新项目、仓库、扫描和总览数据">
-              <Button icon={<ReloadOutlined />} onClick={() => { loadRepos(); loadScans(); loadOverview() }} />
-            </Tooltip>
+            <IconActionButton
+              label="刷新项目、仓库、扫描和总览数据"
+              tooltip="刷新全部"
+              icon={<ReloadOutlined spin={workspaceSyncing} />}
+              onClick={() => void loadWorkspace({ includeDetails: true })}
+            />
           </div>
+          {workspaceViewState === 'STALE_REFRESH' && (
+            <Alert
+              type="error"
+              showIcon
+              message="项目数据同步失败，正在使用上次可信快照"
+              description={coreErrorSummary}
+            />
+          )}
           {latestScan ? (
             <>
               <Progress
@@ -583,9 +1307,7 @@ export default function ProjectDetail() {
                   <strong>{formatStepLabel(latestExecution?.currentStep)}</strong>
                 </div>
               </div>
-              <Button block icon={<FileTextOutlined />} onClick={() => navigate(`/scan-tasks/${latestScan.id}`)}>
-                打开扫描详情
-              </Button>
+              <ActionButton block icon={<FileTextOutlined />} onClick={() => navigate(`/scan-tasks/${latestScan.id}`)} label="打开扫描详情" />
             </>
           ) : (
             <div className="sl-project-empty-state">接入公开仓库后即可触发第一次逆向分析。</div>
@@ -599,6 +1321,8 @@ export default function ProjectDetail() {
         <ProjectFlowStage icon={<CodeOutlined />} label="code_chunks" value={codeKnowledgeStatus.value} meta={codeKnowledgeStatus.meta} tone={codeKnowledgeStatus.flowTone} />
         <ProjectFlowStage icon={<FileTextOutlined />} label="报告/Agent" value={reportAgentFlowValue} meta={reportAgentFlowMeta} tone={reportAgentFlowReady ? 'ready' : latestSuccessScan ? 'attention' : 'idle'} />
       </div>
+
+      <ProjectTrustedLoopPanel steps={projectTrustedLoop} />
 
       <AnalysisReadinessPanel
         signal={analysisReadiness}
@@ -615,9 +1339,14 @@ export default function ProjectDetail() {
           children: (
             <div>
               {overviewLoading ? (
-                <div style={{ textAlign: 'center', padding: 60 }}><Spin size="large" /></div>
+                <StateBlock tone="loading" title="正在加载项目总览" description="系统正在读取最新架构概览和报告质量信息。" />
               ) : overviewError ? (
-                <Empty description={overviewError} />
+                <StateBlock
+                  tone="error"
+                  title="项目总览加载失败"
+                  description={overviewError}
+                  action={<ActionButton icon={<ReloadOutlined />} onClick={loadOverview} label="重新加载总览" />}
+                />
               ) : overview ? (
                 <>
                   <div className="sl-insight-grid">
@@ -677,21 +1406,42 @@ export default function ProjectDetail() {
                   <h2>仓库接入与扫描入口</h2>
                   <p>公开仓库可以直接接入并触发扫描；GitHub App 和私有仓库能力保留为高级集成层，不阻塞当前主链路。</p>
                 </div>
-                <Button
+                <ActionButton
                   aria-label="添加公开仓库"
                   type="primary"
                   icon={<PlusOutlined />}
                   onClick={() => { repoForm.resetFields(); setRepoModalOpen(true) }}
-                >
-                  添加仓库
-                </Button>
+                  label="添加仓库"
+                />
               </div>
+              {repoError && (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message={repos.length > 0 ? '仓库列表刷新失败' : '仓库列表加载失败'}
+                  description={repoError}
+                  action={<ActionButton size="small" icon={<ReloadOutlined />} onClick={loadRepos} label="重新加载仓库" />}
+                />
+              )}
               <Table
-                className="sl-workflow-table"
+                className="sl-workflow-table sl-project-repository-table"
                 dataSource={repos}
                 rowKey="id"
                 loading={loadingRepos}
-                locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无仓库，请先接入一个公开 GitHub 仓库" /> }}
+                locale={{
+                  emptyText: repoError ? (
+                    <StateBlock
+                      compact
+                      tone="error"
+                      title={repos.length > 0 ? '仓库列表刷新失败，已保留上次成功数据' : '仓库列表加载失败'}
+                      description={repoError}
+                      action={<ActionButton size="small" icon={<ReloadOutlined />} onClick={loadRepos} label="重新加载仓库" />}
+                    />
+                  ) : (
+                    <StateBlock compact title="暂无仓库" description="请先接入一个公开 GitHub 仓库。" />
+                  ),
+                }}
                 pagination={{ pageSize: 8, showTotal: total => `共 ${total} 个仓库` }}
                 scroll={{ x: 900 }}
                 columns={[
@@ -737,27 +1487,23 @@ export default function ProjectDetail() {
                     title: '操作', key: 'action', width: 210,
                     render: (_: any, r: Repository) => (
                       <Space size="small">
-                        <Tooltip title="触发扫描">
-                          <Button
-                            aria-label={`扫描仓库 ${r.owner}/${r.name}`}
-                            size="small"
-                            icon={<SearchOutlined />}
-                            loading={creatingScan === r.id}
-                            onClick={() => handleCreateScan(r)}
-                          />
-                        </Tooltip>
-                        <Tooltip title="GitHub App 高级集成">
-                          <Button
-                            aria-label={`配置 ${r.owner}/${r.name} 的 GitHub App`}
-                            size="small"
-                            icon={<SafetyCertificateOutlined />}
-                            onClick={() => openGitHubAppModal(r)}
-                          />
-                        </Tooltip>
+                        <IconActionButton
+                          label={`扫描仓库 ${r.owner}/${r.name}`}
+                          tooltip="触发扫描"
+                          size="small"
+                          icon={<SearchOutlined />}
+                          loading={creatingScan === r.id}
+                          onClick={() => handleCreateScan(r)}
+                        />
+                        <IconActionButton
+                          label={`配置 ${r.owner}/${r.name} 的 GitHub App`}
+                          tooltip="GitHub App 高级集成"
+                          size="small"
+                          icon={<SafetyCertificateOutlined />}
+                          onClick={() => openGitHubAppModal(r)}
+                        />
                         <Popconfirm title="确认删除此仓库？" onConfirm={() => handleDeleteRepo(r.id)}>
-                          <Tooltip title="删除仓库">
-                            <Button aria-label={`删除仓库 ${r.owner}/${r.name}`} size="small" danger icon={<DeleteOutlined />} />
-                          </Tooltip>
+                          <IconActionButton label={`删除仓库 ${r.owner}/${r.name}`} tooltip="删除仓库" size="small" danger icon={<DeleteOutlined />} />
                         </Popconfirm>
                       </Space>
                     )
@@ -779,10 +1525,20 @@ export default function ProjectDetail() {
                   <p>从扫描任务进入执行详情、架构报告和产物库，形成可追踪的逆向分析链路。</p>
                 </div>
                 <Space wrap>
-                  <Button aria-label="刷新扫描任务" icon={<ReloadOutlined />} onClick={() => loadScans()}>刷新</Button>
+                  <ActionButton aria-label="刷新扫描任务" icon={<ReloadOutlined />} onClick={() => loadScans()} label="刷新" />
                   {activeScanCount > 0 && <Tag color="processing">自动刷新中</Tag>}
                 </Space>
               </div>
+              {scanError && (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message={scans.length > 0 ? '扫描任务刷新失败' : '扫描任务加载失败'}
+                  description={scanError}
+                  action={<ActionButton size="small" icon={<ReloadOutlined />} onClick={() => loadScans()} label="重新加载扫描任务" />}
+                />
+              )}
               <div className="sl-scan-summary-grid">
                 <ScanSummary label="扫描总数" value={scans.length} />
                 <ScanSummary label="成功扫描" value={successScanCount} />
@@ -790,11 +1546,23 @@ export default function ProjectDetail() {
                 <ScanSummary label="活跃扫描" value={activeScanCount} />
               </div>
               <Table
-                className="sl-workflow-table"
+                className="sl-workflow-table sl-project-scan-table"
                 dataSource={scans}
                 rowKey="id"
                 loading={loadingScans}
-                locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无扫描任务，请先在仓库管理中触发扫描" /> }}
+                locale={{
+                  emptyText: scanError ? (
+                    <StateBlock
+                      compact
+                      tone="error"
+                      title={scans.length > 0 ? '扫描任务刷新失败，已保留上次成功数据' : '扫描任务加载失败'}
+                      description={scanError}
+                      action={<ActionButton size="small" icon={<ReloadOutlined />} onClick={() => loadScans()} label="重新加载扫描任务" />}
+                    />
+                  ) : (
+                    <StateBlock compact title="暂无扫描任务" description="请先在仓库管理中触发扫描。" />
+                  ),
+                }}
                 pagination={{ pageSize: 10, showTotal: total => `共 ${total} 次扫描` }}
                 scroll={{ x: 920 }}
                 columns={[
@@ -804,14 +1572,13 @@ export default function ProjectDetail() {
                     width: 180,
                     render: (_: any, r: ScanTask) => (
                       <Space direction="vertical" size={4}>
-                        <Button
+                        <ActionButton
                           aria-label={`查看扫描 #${r.id} 报告`}
                           type="link"
                           className="sl-inline-link"
                           onClick={() => navigate(`/scan-tasks/${r.id}`)}
-                        >
-                          扫描 #{r.id}
-                        </Button>
+                          label={`扫描 #${r.id}`}
+                        />
                         <Typography.Text type="secondary" className="sl-table-subtext">
                           {r.triggerType || 'MANUAL'} · {r.branch || '-'}
                         </Typography.Text>
@@ -855,23 +1622,21 @@ export default function ProjectDetail() {
                       const execution = scanExecutions[r.id]
                       return (
                         <Space size="small">
-                          <Tooltip title="查看报告">
-                            <Button
-                              aria-label={`查看扫描 #${r.id} 报告`}
-                              size="small"
-                              icon={<FileTextOutlined />}
-                              onClick={() => navigate(`/scan-tasks/${r.id}`)}
-                            />
-                          </Tooltip>
+                          <IconActionButton
+                            label={`查看扫描 #${r.id} 报告`}
+                            tooltip="查看报告"
+                            size="small"
+                            icon={<FileTextOutlined />}
+                            onClick={() => navigate(`/scan-tasks/${r.id}`)}
+                          />
                           {execution && (
-                            <Tooltip title="执行详情">
-                              <Button
-                                aria-label={`查看扫描 #${r.id} 的执行详情`}
-                                size="small"
-                                icon={<ScheduleOutlined />}
-                                onClick={() => navigate(`/execution-tasks?projectId=${projectId}&taskId=${execution.id}`)}
-                              />
-                            </Tooltip>
+                            <IconActionButton
+                              label={`查看扫描 #${r.id} 的执行详情`}
+                              tooltip="执行详情"
+                              size="small"
+                              icon={<ScheduleOutlined />}
+                              onClick={() => navigate(`/execution-tasks?projectId=${projectId}&taskId=${execution.id}`)}
+                            />
                           )}
                           {r.status === 'SUCCESS' && (
                             <ArtifactLinkButton
@@ -888,15 +1653,14 @@ export default function ProjectDetail() {
                               cancelText="返回"
                               onConfirm={() => handleCancelScan(r.id)}
                             >
-                              <Tooltip title="取消扫描">
-                                <Button
-                                  aria-label={`取消扫描 #${r.id}`}
-                                  size="small"
-                                  danger
-                                  icon={<StopOutlined />}
-                                  loading={cancellingScan === r.id}
-                                />
-                              </Tooltip>
+                              <IconActionButton
+                                label={`取消扫描 #${r.id}`}
+                                tooltip="取消扫描"
+                                size="small"
+                                danger
+                                icon={<StopOutlined />}
+                                loading={cancellingScan === r.id}
+                              />
                             </Popconfirm>
                           )}
                         </Space>
@@ -914,6 +1678,8 @@ export default function ProjectDetail() {
           children: (
             <CodeQaTab
               projectId={projectId}
+              repositories={repos}
+              scanTasks={scans}
               scanTaskId={knowledgeScanTaskId}
               knowledgeStatus={codeKnowledge}
               knowledgeLoading={codeKnowledgeLoading}
@@ -925,10 +1691,10 @@ export default function ProjectDetail() {
         {
           key: 'graph',
           label: '依赖图谱',
-          children: latestScanTaskId ? (
-            <DependencyGraphView scanTaskId={latestScanTaskId} />
+          children: knowledgeScanTaskId ? (
+            <DependencyGraphView scanTaskId={knowledgeScanTaskId} />
           ) : (
-            <Empty description="暂无成功的扫描任务，请先执行扫描以生成依赖图谱" />
+            <StateBlock title="暂无依赖图谱" description="请先完成一次成功扫描以生成依赖图谱。" />
           ),
         },
       ]} />
@@ -966,7 +1732,7 @@ export default function ProjectDetail() {
           <Space>
             {selectedRepo?.authType === 'GITHUB_APP' && (
               <Popconfirm title="禁用 GitHub App installation？" onConfirm={handleDisableGitHubApp}>
-                <Button danger>禁用</Button>
+                <ActionButton danger label="禁用" />
               </Popconfirm>
             )}
             <CancelBtn />
@@ -994,6 +1760,56 @@ export default function ProjectDetail() {
       </Modal>
     </div>
   )
+}
+
+function isCodeKnowledgeOwnedByScan(response: CodeChunkSearchResponse | null | undefined, scanTaskId: number): response is CodeChunkSearchResponse {
+  if (!response) return false
+  if (Number(response.scanTaskId) !== scanTaskId) return false
+  return (response.items || []).every(item => Number(item.scanTaskId) === scanTaskId)
+}
+
+function isArtifactOwnedByScan(artifact: ArtifactRecord, projectId: number, scanTaskId: number): boolean {
+  return Number(artifact.projectId) === projectId
+    && artifact.ownerType === 'SCAN_TASK'
+    && Number(artifact.ownerId) === scanTaskId
+}
+
+function isArtifactPreviewOwnedByScan(
+  previewRecord: ArtifactRecord,
+  expectedRecord: ArtifactRecord,
+  projectId: number,
+  scanTaskId: number,
+): boolean {
+  return Number(previewRecord.id) === Number(expectedRecord.id)
+    && isArtifactOwnedByScan(previewRecord, projectId, scanTaskId)
+}
+
+function normalizeProjectOverview(data: any): { overview: OverviewData; fileTree: any } {
+  const rawLanguages = data?.languages
+  const languages: LanguageStat[] = Array.isArray(rawLanguages)
+    ? rawLanguages
+    : rawLanguages && typeof rawLanguages === 'object'
+      ? Object.entries(rawLanguages).map(([name, value]: [string, any]) => ({
+          name,
+          file_count: value?.file_count ?? 0,
+          line_count: value?.line_count ?? 0,
+        }))
+      : []
+
+  return {
+    overview: {
+      languages,
+      framework: data?.framework || null,
+      totalFiles: data?.totalFiles || 0,
+      totalDirs: data?.totalDirs || 0,
+      totalLines: data?.totalLines || 0,
+      controllers: data?.controllers || 0,
+      services: data?.services || 0,
+      repositories: data?.repositories || 0,
+      entities: data?.entities || 0,
+    },
+    fileTree: data?.entryPoints || null,
+  }
 }
 
 function getLangColor(name: string): string {
@@ -1391,6 +2207,13 @@ function buildQaStarterPrompts({
       tone: embeddingCoverage >= 60 ? 'ready' : 'idle',
     },
     {
+      key: 'stack-frame',
+      label: '栈帧定位',
+      prompt: DEFAULT_QA_STARTERS[3],
+      reason: '可直接粘贴 file:line、Class#method 或浏览器 stack trace',
+      tone: totalChunks > 0 ? 'ready' : 'idle',
+    },
+    {
       key: 'frontend-backend',
       label: '前后端映射',
       prompt: DEFAULT_QA_STARTERS[2],
@@ -1418,6 +2241,122 @@ function parsePositiveInt(value?: string | null): number | null {
   return parsed
 }
 
+function normalizeEvidenceRef(ref: CodeQaEvidenceRef): CodeQaEvidenceRef | null {
+  const normalized = Object.fromEntries(
+    Object.entries(ref)
+      .map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])
+      .filter(([, value]) =>
+        (typeof value === 'string' && value.length > 0)
+        || (typeof value === 'number' && Number.isFinite(value) && value > 0)
+      )
+  ) as CodeQaEvidenceRef
+  return Object.keys(normalized).length > 0 ? normalized : null
+}
+
+function evidenceLineLabel(evidenceRef?: CodeQaEvidenceRef | null): string {
+  return evidenceLineInfo(evidenceRef).label
+}
+
+function evidenceLineInfo(evidenceRef?: CodeQaEvidenceRef | null): {
+  label: string
+  kind: 'range' | 'single' | 'legacy' | 'none'
+  metricLabel: string
+  tagLabel: string
+} {
+  if (!evidenceRef) {
+    return {
+      label: '',
+      kind: 'none',
+      metricLabel: '行号',
+      tagLabel: '行号缺失',
+    }
+  }
+  const startLine = evidenceRef.startLine && evidenceRef.startLine > 0 ? evidenceRef.startLine : null
+  const endLine = evidenceRef.endLine && evidenceRef.endLine > 0 ? evidenceRef.endLine : null
+  if (startLine) {
+    if (endLine && endLine > startLine) {
+      return {
+        label: `${startLine}-${endLine}`,
+        kind: 'range',
+        metricLabel: '行范围',
+        tagLabel: `范围 ${startLine}-${endLine}`,
+      }
+    }
+    return {
+      label: String(startLine),
+      kind: 'single',
+      metricLabel: '行号',
+      tagLabel: `行 ${startLine}`,
+    }
+  }
+  if (evidenceRef.lineNumber) {
+    return {
+      label: evidenceRef.lineNumber,
+      kind: 'legacy',
+      metricLabel: '兼容行号',
+      tagLabel: `兼容行 ${evidenceRef.lineNumber}`,
+    }
+  }
+  return {
+    label: '',
+    kind: 'none',
+    metricLabel: '行号',
+    tagLabel: '行号缺失',
+  }
+}
+
+function buildEvidenceBridgeSearchQuery(evidenceRef: CodeQaEvidenceRef | null, fallbackQuery: string): string {
+  const safeEvidence = evidenceRef ? redactedEvidenceRefForOutput(evidenceRef) : null
+  const lineLabel = evidenceLineLabel(safeEvidence)
+  const fileAnchor = safeEvidence?.filePath
+    ? lineLabel
+      ? `${safeEvidence.filePath}:${lineLabel}`
+      : safeEvidence.filePath
+    : ''
+  return [
+    fileAnchor,
+    safeEvidence?.title,
+    safeEvidence?.source,
+    safeEvidence?.category,
+    safeEvidence?.summary,
+    redactSensitiveText(fallbackQuery),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 900)
+}
+
+function buildEvidenceBridgeCopyText(scanTaskId: number | null | undefined, evidenceRef: CodeQaEvidenceRef): string {
+  const safeEvidence = redactedEvidenceRefForOutput(evidenceRef)
+  const lineLabel = evidenceLineLabel(safeEvidence)
+  return [
+    `scanTaskId: ${scanTaskId ?? '-'}`,
+    `category: ${safeEvidence.category || '-'}`,
+    `source: ${safeEvidence.source || '-'}`,
+    `title: ${safeEvidence.title || '-'}`,
+    `filePath: ${safeEvidence.filePath || '-'}`,
+    `lineNumber: ${lineLabel || '-'}`,
+    `startLine: ${safeEvidence.startLine ?? '-'}`,
+    `endLine: ${safeEvidence.endLine ?? '-'}`,
+    `summary: ${safeEvidence.summary || '-'}`,
+  ].join('\n')
+}
+
+function redactedEvidenceRefForOutput(evidenceRef: CodeQaEvidenceRef): CodeQaEvidenceRef {
+  return {
+    category: evidenceRef.category ? redactSensitiveText(evidenceRef.category) : evidenceRef.category,
+    source: evidenceRef.source ? redactSensitiveText(evidenceRef.source) : evidenceRef.source,
+    title: evidenceRef.title ? redactSensitiveText(evidenceRef.title) : evidenceRef.title,
+    summary: evidenceRef.summary ? redactSensitiveText(evidenceRef.summary) : evidenceRef.summary,
+    filePath: evidenceRef.filePath ? redactSensitiveText(evidenceRef.filePath) : evidenceRef.filePath,
+    lineNumber: evidenceRef.lineNumber ? redactSensitiveText(evidenceRef.lineNumber) : evidenceRef.lineNumber,
+    startLine: evidenceRef.startLine,
+    endLine: evidenceRef.endLine,
+  }
+}
+
 function toChunkEvidenceProfile(profile: CodeChunkEvidenceProfile): ChunkEvidenceProfile {
   return {
     avgScore: profile.averageScore ?? 0,
@@ -1434,13 +2373,87 @@ function toChunkEvidenceProfile(profile: CodeChunkEvidenceProfile): ChunkEvidenc
 
 function evidenceReason(chunk: CodeChunkSearchItem): string {
   const contextSuffix = isContextChunk(chunk) ? ' · 上下文补充' : ''
-  if (chunk.evidenceReason) return `${chunk.evidenceReason}${contextSuffix}`
+  if (chunk.evidenceReason) return `${redactSensitiveText(chunk.evidenceReason)}${contextSuffix}`
   const score = chunk.relevanceScore ?? 0
   const scoreText = score >= 80 ? '高相关' : score >= 45 ? '中相关' : score > 0 ? '弱相关' : '结构匹配'
   const terms = (chunk.matchedTerms || []).filter(Boolean)
   const termText = terms.length > 0 ? `命中 ${terms.slice(0, 4).join(' / ')}` : '通过路径、类型或结构信号命中'
   const vectorText = chunk.hasEmbedding ? '含向量证据' : '关键词证据'
-  return `${scoreText} · ${evidenceLabel(chunk.evidenceType)} · ${termText} · ${vectorText}${contextSuffix}`
+  return redactSensitiveText(`${scoreText} · ${evidenceLabel(chunk.evidenceType)} · ${termText} · ${vectorText}${contextSuffix}`)
+}
+
+function chunkLineReference(chunk: CodeChunkSearchItem): string {
+  const startLine = chunk.startLine || 1
+  const endLine = chunk.endLine && chunk.endLine >= startLine ? chunk.endLine : startLine
+  return `${chunk.filePath}:${startLine}-${endLine}`
+}
+
+function buildChunkFollowupQuestion(chunk: CodeChunkSearchItem): string {
+  return `请基于 ${chunkLineReference(chunk)} 解释这段代码的职责、关键逻辑和潜在风险。`
+}
+
+function buildChunkDeepLink(projectId: number, chunk: CodeChunkSearchItem, questionText = chunkLineReference(chunk)): string {
+  const params = new URLSearchParams()
+  params.set('tab', 'qa')
+  if (chunk.scanTaskId) params.set('scanTaskId', String(chunk.scanTaskId))
+  params.set('question', questionText)
+  return `${window.location.origin}/projects/${projectId}?${params.toString()}`
+}
+
+function buildCodeUnderstandingAgentHandoffUrl(
+  projectId: number,
+  chunk: CodeChunkSearchItem,
+  querySignal: CodeUnderstandingQuerySignal,
+  activeSourceScanTaskId?: number | null,
+): string {
+  const sourceScanTaskId = chunk.scanTaskId || activeSourceScanTaskId || null
+  const safeFilePath = redactSensitiveText(chunk.filePath)
+  const safeLineRef = redactSensitiveText(chunkLineReference(chunk))
+  const safeSourceLabel = redactSensitiveText(chunk.sourceLabel || 'C1')
+  const params = new URLSearchParams()
+  params.set('projectId', String(projectId))
+  params.set('handoff', 'code-understanding')
+  params.set('source', 'PROJECT_QA_CODE_UNDERSTANDING_LENS')
+  params.set('inputKind', querySignal.kind)
+  params.set('inputLabel', redactSensitiveText(querySignal.label))
+  params.set('sourceLabel', safeSourceLabel)
+  params.set('filePath', safeFilePath)
+  params.set('lineRef', safeLineRef)
+  params.set('contextRole', chunk.contextRole || (isContextChunk(chunk) ? 'ADJACENT_CONTEXT' : 'PRIMARY'))
+  if (chunk.evidenceType) params.set('evidenceType', chunk.evidenceType)
+  if (typeof chunk.relevanceScore === 'number') params.set('relevanceScore', String(chunk.relevanceScore))
+  if (sourceScanTaskId) params.set('scanTaskId', String(sourceScanTaskId))
+  return `/agent-chat?${params.toString()}`
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return
+    }
+  } catch {
+    // Fall back for browser contexts where Clipboard API is blocked.
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'true')
+  textarea.style.position = 'fixed'
+  textarea.style.top = '-1000px'
+  textarea.style.left = '-1000px'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  document.body.removeChild(textarea)
+  if (!copied) {
+    throw new Error('clipboard copy failed')
+  }
+}
+
+function redactedChunkPreview(chunk: CodeChunkSearchItem): string {
+  return redactSensitiveText(chunk.contentPreview || chunk.content || '')
 }
 
 function isContextChunk(chunk: CodeChunkSearchItem): boolean {
@@ -1456,6 +2469,964 @@ function contextRoleLabel(chunk: CodeChunkSearchItem): string {
 
 function contextRoleColor(chunk: CodeChunkSearchItem): string {
   return isContextChunk(chunk) ? 'default' : 'green'
+}
+
+function groundingStatusLabel(status?: string | null): string {
+  if (status === 'VERIFIED') return '引用已验证'
+  if (status === 'PARTIAL') return '引用需复核'
+  if (status === 'UNVERIFIED') return '回答未引用证据'
+  if (status === 'NO_EVIDENCE') return '无代码证据'
+  return '证据待确认'
+}
+
+function groundingStatusColor(status?: string | null): string {
+  if (status === 'VERIFIED') return 'green'
+  if (status === 'PARTIAL') return 'gold'
+  if (status === 'UNVERIFIED' || status === 'NO_EVIDENCE') return 'red'
+  return 'default'
+}
+
+function citationEnforcementLabel(status?: string | null): string {
+  if (status === 'DIRECT_VERIFIED') return '首次引用已验证'
+  if (status === 'RETRY_VERIFIED') return '引用已修正'
+  if (status === 'FALLBACK_CITED') return '检索证据引用'
+  if (status === 'RETRY_FAILED') return '引用需人工复核'
+  if (status === 'UNVERIFIED') return '引用未验证'
+  if (status === 'NO_EVIDENCE') return '无可用引用'
+  return '引用策略记录'
+}
+
+function citationEnforcementColor(status?: string | null): string {
+  if (status === 'DIRECT_VERIFIED' || status === 'RETRY_VERIFIED' || status === 'FALLBACK_CITED') return 'green'
+  if (status === 'RETRY_FAILED' || status === 'UNVERIFIED' || status === 'NO_EVIDENCE') return 'red'
+  return 'default'
+}
+
+function citationEnforcementReasonLabel(reason?: string | null): string {
+  if (reason === 'DIRECT_VERIFIED') return '首次引用已验证'
+  if (reason === 'RETRY_VERIFIED') return '重试后引用已验证'
+  if (reason === 'FALLBACK_PRIMARY_CITED') return '检索主证据引用'
+  if (reason === 'NO_EVIDENCE') return '无检索证据'
+  if (reason === 'RETRY_CALL_FAILED') return '重试调用失败'
+  if (reason === 'INVALID_LABEL') return '引用标签无效'
+  if (reason === 'NO_AUDITABLE_CLAIM') return '无可审计主张'
+  if (reason === 'CONTEXT_ONLY_CLAIM') return '仅上下文证据'
+  if (reason === 'UNKNOWN_ONLY_CLAIM') return '未知证据角色'
+  if (reason === 'UNCITED_REQUIRED_CLAIM') return '必需主张未引用'
+  if (reason === 'NO_VALID_CITATION_LABEL') return '无有效引用标签'
+  if (reason === 'NO_PRIMARY_CITATION') return '缺少主证据引用'
+  if (reason === 'PRIMARY_BOUND_INCOMPLETE') return '主证据绑定不完整'
+  if (reason === 'NOT_APPLICABLE') return '无需引用强制'
+  return reason || '原因未返回'
+}
+
+function citationEnforcementReasonColor(reason?: string | null): string {
+  if (reason === 'DIRECT_VERIFIED' || reason === 'RETRY_VERIFIED' || reason === 'FALLBACK_PRIMARY_CITED' || reason === 'NOT_APPLICABLE') return 'green'
+  if (!reason) return 'default'
+  return 'red'
+}
+
+function citationCoverageLabel(coverage?: CodeQaCitationCoverage): string {
+  const total = coverage?.totalEvidenceCount ?? 0
+  const cited = coverage?.citedEvidenceCount ?? 0
+  const percent = coverage?.coveragePercent ?? 0
+  const required = coverage?.requiredEvidenceCount ?? 0
+  const citedRequired = coverage?.citedRequiredEvidenceCount ?? 0
+  const requiredPercent = coverage?.requiredEvidenceCoveragePercent ?? 0
+  if (required > 0 && (required !== total || requiredPercent !== percent)) {
+    return `必需证据覆盖 ${citedRequired}/${required} (${requiredPercent}%)`
+  }
+  return `引用覆盖 ${cited}/${total} (${percent}%)`
+}
+
+function citationCoverageColor(coverage?: CodeQaCitationCoverage): string {
+  if (!coverage || coverage.status === 'NO_EVIDENCE' || coverage.status === 'NONE') return 'red'
+  if (coverage.status === 'FULL' || coverage.status === 'REQUIRED_FULL') return 'green'
+  if (coverage.status === 'PARTIAL') return 'gold'
+  return 'default'
+}
+
+function citationRepairCandidateLabel(coverage?: CodeQaCitationCoverage): string {
+  return `可修复证据 ${coverage?.repairCandidateCount ?? 0}`
+}
+
+function successfulCitationEnforcement(status?: string | null): boolean {
+  return status === 'DIRECT_VERIFIED' || status === 'RETRY_VERIFIED' || status === 'FALLBACK_CITED'
+}
+
+function sourceEvidenceMatchLabel(matchType?: string | null): string {
+  if (matchType === 'REPORT_LINE_ANCHOR') return '行级锚点'
+  if (matchType === 'REPORT_FILE_ANCHOR') return '文件锚点'
+  if (matchType === 'NONE') return '未闭环'
+  return '未闭环'
+}
+
+function normalizeSourceLocationPath(value?: string | null): string {
+  if (!value) return ''
+  return String(value)
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\/+/i, '')
+    .replace(/^webpack:\/\/\/?/i, '')
+    .replace(/^file:\/\/\/?/i, '')
+    .replace(/[?#].*$/, '')
+    .replace(/:(\d+)(?::\d+)?$/, '')
+    .replace(/^\/+/, '')
+    .replace(/^\.\//, '')
+}
+
+function sourceLocationPathsMatch(sourcePath?: string | null, candidatePath?: string | null): boolean {
+  const source = normalizeSourceLocationPath(sourcePath)
+  const candidate = normalizeSourceLocationPath(candidatePath)
+  if (!source || !candidate) return false
+  return source === candidate || source.endsWith(`/${candidate}`) || candidate.endsWith(`/${source}`)
+}
+
+function sourceLocationFileName(value?: string | null): string {
+  const normalized = normalizeSourceLocationPath(value)
+  if (!normalized) return ''
+  const parts = normalized.split('/').filter(Boolean)
+  return parts[parts.length - 1] || normalized
+}
+
+function sourceLocationFileNameMatches(sourcePath?: string | null, candidatePath?: string | null): boolean {
+  const source = sourceLocationFileName(sourcePath)
+  const candidate = sourceLocationFileName(candidatePath)
+  return Boolean(source && candidate && source === candidate)
+}
+
+function firstRelevantSourceCitation(msg: QaMessage, ref?: CodeQaEvidenceRef | null): CodeQaCitation | undefined {
+  const citations = msg.answerCitations || []
+  const cited = citations.filter(citation => citation.citedByAnswer === true && citation.filePath)
+  return cited.find(citation => citation.contextRole !== 'ADJACENT_CONTEXT' && sourceLocationPathsMatch(ref?.filePath, citation.filePath))
+    || cited.find(citation => sourceLocationPathsMatch(ref?.filePath, citation.filePath))
+    || cited.find(citation => citation.contextRole !== 'ADJACENT_CONTEXT')
+    || cited[0]
+    || citations.find(citation => citation.filePath && sourceLocationPathsMatch(ref?.filePath, citation.filePath))
+    || citations.find(citation => citation.filePath)
+}
+
+function qaSourceLocationConfidence(msg: QaMessage, ref: CodeQaEvidenceRef): QaSourceLocationConfidence {
+  const hasFile = Boolean(ref.filePath)
+  const lineInfo = evidenceLineInfo(ref)
+  const lineLabel = lineInfo.label
+  const hasLine = Boolean(lineLabel)
+  const matched = msg.sourceEvidenceMatched === true
+  const lineAnchored = msg.sourceEvidenceMatchType === 'REPORT_LINE_ANCHOR'
+  const fileAnchored = msg.sourceEvidenceMatchType === 'REPORT_FILE_ANCHOR'
+  const citedSourceFile = matched && Boolean(ref.filePath) && (msg.answerCitations || [])
+    .some(citation => citation.citedByAnswer === true && sourceLocationPathsMatch(ref.filePath, citation.filePath))
+  const candidateSourceFile = Boolean(ref.filePath) && (msg.answerCitations || [])
+    .some(citation => sourceLocationPathsMatch(ref.filePath, citation.filePath))
+  const coverage = msg.citationCoverage
+  const requiredFileCount = Number(coverage?.requiredEvidenceFileCount || 0)
+  const citedRequiredFileCount = Number(coverage?.citedRequiredEvidenceFileCount || 0)
+  const requiredCoveragePercent = coverage?.requiredEvidenceCoveragePercent ?? coverage?.coveragePercent
+  const requiredFileCoverage = requiredFileCount > 0 && citedRequiredFileCount >= requiredFileCount
+  const ready = matched && lineAnchored && hasFile && hasLine && citedSourceFile
+  const blocked = !hasFile || !matched || msg.sourceEvidenceMatchType === 'NONE'
+  const tone: QaSourceLocationConfidence['tone'] = ready ? 'ready' : blocked ? 'blocked' : 'warning'
+  const title = ready
+    ? '来源定位可信'
+    : blocked ? '来源定位未闭环' : '来源定位需复核'
+  const summary = ready
+    ? '报告证据文件、行号和回答引用已对齐，路径后缀已绑定；该信号只证明来源定位，不证明 LLM 事实语义正确。'
+    : blocked
+      ? '报告证据没有形成可用的代码位置锚点，不能把该回答直接用于修复或报告结论。'
+      : fileAnchored
+        ? '报告证据已匹配到文件，但缺少行级锚点；同名文件或 source URL 场景仍需人工确认具体行。'
+        : '报告证据已有部分来源信号，但回答引用、行号或路径后缀还没有完全闭环。'
+
+  return {
+    tone,
+    title,
+    summary,
+    metrics: [
+      { label: '锚点', value: msg.sourceEvidenceMatchType || 'UNKNOWN' },
+      { label: lineInfo.metricLabel, value: hasLine ? `第 ${lineLabel} 行` : '缺失' },
+      { label: '引用文件', value: citedSourceFile ? '已绑定' : candidateSourceFile ? '候选' : '缺失' },
+      { label: '必需覆盖', value: typeof requiredCoveragePercent === 'number' ? `${requiredCoveragePercent}%` : '-' },
+    ],
+    checks: [
+      { label: '报告文件已回显', ok: hasFile },
+      { label: hasLine ? '报告行号已回显' : '报告行号缺失', ok: hasLine },
+      { label: `来源锚点 ${sourceEvidenceMatchLabel(msg.sourceEvidenceMatchType)}`, ok: lineAnchored },
+      { label: '回答引用覆盖来源文件', ok: citedSourceFile },
+      { label: requiredFileCount > 0 ? `必需文件 ${citedRequiredFileCount}/${requiredFileCount}` : '必需文件覆盖未提供', ok: requiredFileCount === 0 || requiredFileCoverage },
+      { label: '定位不证明事实正确', ok: true },
+    ],
+  }
+}
+
+function qaSummaryTagText(tone: 'ready' | 'warning' | 'blocked'): string {
+  if (tone === 'ready') return '可采信'
+  if (tone === 'warning') return '需复核'
+  return '已阻断'
+}
+
+function qaBindingTagText(tone: 'ready' | 'warning' | 'blocked'): string {
+  if (tone === 'ready') return '已绑定'
+  if (tone === 'warning') return '需复核'
+  return '已阻断'
+}
+
+function qaCheckText(ok: boolean): string {
+  return ok ? '通过' : '复核'
+}
+
+function qaAuditTagText(tone: 'ready' | 'warning' | 'blocked'): string {
+  if (tone === 'ready') return '就绪'
+  if (tone === 'warning') return '需复核'
+  return '已阻断'
+}
+
+function repairGateStatusText(status?: string | null): string {
+  if (status === 'READY') return '就绪（READY）'
+  if (status === 'REVIEW') return '需复核（REVIEW）'
+  if (status === 'BLOCKED') return '已阻断（BLOCKED）'
+  return status ? `待确认（${status}）` : '待确认'
+}
+
+function coverageScopeText(scope?: string | null): string {
+  if (scope === 'ALL') return '全部（ALL）'
+  if (scope === 'REQUIRED') return '必需证据（REQUIRED）'
+  if (scope === 'PRIMARY') return '主证据（PRIMARY）'
+  if (scope === 'NONE') return '无覆盖（NONE）'
+  return scope ? `待确认（${scope}）` : '待确认'
+}
+
+function evidenceRoleStatusText(status?: string | null): string {
+  if (status === 'PRIMARY_BOUND') return '主证据已绑定（PRIMARY_BOUND）'
+  if (status === 'PRIMARY_SINGLE_FILE') return '单文件主证据（PRIMARY_SINGLE_FILE）'
+  if (status === 'PRIMARY_CROSS_FILE') return '跨文件主证据（PRIMARY_CROSS_FILE）'
+  if (status === 'MIXED_PRIMARY_CONTEXT') return '主证据与上下文混合（MIXED_PRIMARY_CONTEXT）'
+  if (status === 'CONTEXT_ONLY') return '仅上下文（CONTEXT_ONLY）'
+  if (status === 'REVIEW_UNCITED') return '未引用需复核（REVIEW_UNCITED）'
+  if (status === 'UNBACKED') return '未绑定（UNBACKED）'
+  if (status === 'NO_EVIDENCE') return '无证据（NO_EVIDENCE）'
+  if (status === 'UNKNOWN') return '未知（UNKNOWN）'
+  return status ? `待确认（${status}）` : '待确认'
+}
+
+function claimProblemStatusText(status?: string | null): string {
+  if (status === 'INVALID') return '无效引用'
+  if (status === 'UNCITED') return '未引用'
+  if (status === 'REVIEW') return '需复核'
+  return status ? `待确认（${status}）` : '待确认'
+}
+
+function qaAnswerSourceEvidenceReceipt(msg: QaMessage): QaAnswerSourceEvidenceReceipt | null {
+  const ref = msg.sourceEvidenceRef
+  if (!ref || !ref.filePath) return null
+  const safeRef = redactedEvidenceRefForOutput(ref)
+  const lineInfo = evidenceLineInfo(safeRef)
+  const lineLabel = lineInfo.label
+  const lineSuffix = lineLabel ? `:${lineLabel}` : ''
+  const fallbackFile = safeRef.filePath || redactSensitiveText(ref.filePath)
+  return {
+    title: safeRef.title || fallbackFile,
+    source: safeRef.source || 'Unknown Source',
+    category: safeRef.category || '未分类',
+    fileReference: `${fallbackFile}${lineSuffix}`,
+    lineKindLabel: lineInfo.tagLabel,
+    scanLabel: msg.scanTaskId ? `Scan #${msg.scanTaskId}` : 'Scan -',
+    matchLabel: sourceEvidenceMatchLabel(msg.sourceEvidenceMatchType),
+    matchType: msg.sourceEvidenceMatchType || 'UNKNOWN',
+    matched: msg.sourceEvidenceMatched === true,
+    locationConfidence: qaSourceLocationConfidence(msg, ref),
+  }
+}
+
+function qaSourceFileMatchRelease(msg: QaMessage, repairGate: RepairEvidenceGate): QaSourceFileMatchRelease | null {
+  const ref = msg.sourceEvidenceRef
+  if (!ref?.filePath) return null
+
+  const safeRef = redactedEvidenceRefForOutput(ref)
+  const citation = firstRelevantSourceCitation(msg, ref)
+  const targetLineLabel = evidenceLineLabel(safeRef)
+  const targetLine = targetLineLabel ? `:${targetLineLabel}` : ''
+  const targetReference = `${safeRef.filePath || redactSensitiveText(ref.filePath)}${targetLine}`
+  const citedReference = citation?.filePath
+    ? redactSensitiveText(citationLineReference(citation))
+    : '未找到已引用代码切片'
+  const hasTargetFile = Boolean(ref.filePath)
+  const hasTargetLine = Boolean(evidenceLineLabel(ref))
+  const sourceMatched = msg.sourceEvidenceMatched === true
+  const lineAnchored = sourceMatched && msg.sourceEvidenceMatchType === 'REPORT_LINE_ANCHOR' && hasTargetLine
+  const fileAnchored = sourceMatched && msg.sourceEvidenceMatchType === 'REPORT_FILE_ANCHOR'
+  const pathMatched = Boolean(citation?.filePath && sourceLocationPathsMatch(ref.filePath, citation.filePath))
+  const fileNameMatched = Boolean(citation?.filePath && sourceLocationFileNameMatches(ref.filePath, citation.filePath))
+  const fileNameOnly = fileNameMatched && !pathMatched
+  const untrustedShortPathCandidate = fileNameMatched && !sourceMatched
+  const trustedPathMatched = sourceMatched && pathMatched && !fileNameOnly
+  const requiredEvidenceCount = msg.citationCoverage?.requiredEvidenceCount ?? msg.citationCoverage?.totalEvidenceCount ?? 0
+  const citedRequiredEvidenceCount = msg.citationCoverage?.citedRequiredEvidenceCount ?? msg.citationCoverage?.citedEvidenceCount ?? 0
+  const requiredCoveragePercent = msg.citationCoverage?.requiredEvidenceCoveragePercent ?? msg.citationCoverage?.coveragePercent ?? 0
+  const requiredEvidenceReady = requiredEvidenceCount > 0 && requiredCoveragePercent >= 100 && citedRequiredEvidenceCount >= requiredEvidenceCount
+  const claimCoverage = msg.claimCitationCoverage
+  const claimRoleDistribution = claimCoverage?.roleDistribution
+  const requiredClaimCount = Number(claimCoverage?.requiredClaimCount || claimRoleDistribution?.requiredClaimCount || 0)
+  const primaryBoundClaimCount = Number(claimRoleDistribution?.requiredPrimaryBoundClaimCount || 0)
+  const claimRoleReady = claimCitationCoverageReadyForRepair(claimCoverage)
+  const matchLabel = lineAnchored && pathMatched
+    ? '行级锚点'
+    : sourceMatched && pathMatched
+      ? '路径后缀一致'
+      : fileNameOnly || untrustedShortPathCandidate
+        ? '仅文件名一致，需复核'
+        : '未形成来源闭环'
+  const riskLabel = lineAnchored && pathMatched
+    ? '低风险：报告目标文件、行号和已引用代码切片已对齐'
+    : fileNameOnly || untrustedShortPathCandidate
+      ? '同名文件风险：只看到候选路径信号，后端没有确认来源闭环'
+      : fileAnchored
+        ? '行号风险：来源锚点仍是文件锚点，需确认具体行号'
+        : '闭环缺口：来源文件、回答引用或报告锚点缺失'
+  const checks = [
+    {
+      label: '报告证据已回显',
+      ok: hasTargetFile,
+      detail: targetReference,
+    },
+    {
+      label: '来源文件匹配',
+      ok: trustedPathMatched,
+      detail: matchLabel,
+    },
+    {
+      label: '行级锚点',
+      ok: lineAnchored && pathMatched,
+      detail: lineAnchored
+        ? '报告证据行号已进入 QA 响应'
+        : fileAnchored
+          ? '来源锚点仍是文件锚点，需确认具体行号'
+          : '未形成行级来源锚点',
+    },
+    {
+      label: '必需证据覆盖',
+      ok: requiredEvidenceReady,
+      detail: `必需证据 ${citedRequiredEvidenceCount}/${requiredEvidenceCount || '-'}`,
+    },
+    {
+      label: '主张 PRIMARY 绑定',
+      ok: claimRoleReady,
+      detail: claimRoleDistribution
+        ? `主张 PRIMARY 绑定 ${primaryBoundClaimCount}/${requiredClaimCount || '-'}`
+        : '主张角色分布缺失，不能生成修复候选',
+    },
+    {
+      label: '修复门禁',
+      ok: repairGate.status === 'READY',
+      detail: repairGateStatusText(repairGate.status),
+    },
+  ]
+  const tone: QaSourceFileMatchRelease['tone'] = repairGate.status === 'READY'
+    ? 'ready'
+    : repairGate.status === 'REVIEW' || sourceMatched || untrustedShortPathCandidate
+      ? 'warning'
+      : 'blocked'
+  const title = repairGate.status === 'READY'
+    ? '满足修复候选放行'
+    : repairGate.status === 'REVIEW'
+      ? '修复候选需复核'
+      : '修复候选已阻断'
+  const summary = repairGate.status === 'READY'
+    ? '来源文件、行级锚点、必需证据和主张 PRIMARY 绑定已形成闭环。该说明只证明证据绑定成熟，不证明 LLM 事实语义正确。'
+    : fileAnchored
+      ? '回答已绑定到报告目标文件，但来源仍停留在文件锚点，生成修复候选前必须确认具体行。'
+      : fileNameOnly
+        ? '当前只看到同名文件信号，目录后缀没有闭合，不能把该回答直接作为修复依据。'
+        : '当前回答没有形成完整来源文件闭环，不能直接进入修复候选。'
+  const nextAction = repairGate.status === 'READY'
+    ? '下一步：可进入修复候选复核。'
+    : fileAnchored
+      ? '下一步：确认报告证据行号后重试此问题。'
+      : !claimRoleDistribution
+        ? '下一步：重新生成回答或补充引用，让主张绑定 PRIMARY 主证据。'
+        : '下一步：重新检索证据或换用更具体的问题。'
+
+  return {
+    tone,
+    title,
+    summary,
+    targetReference,
+    citedReference,
+    matchLabel,
+    riskLabel,
+    nextAction,
+    checks,
+  }
+}
+
+function claimCitationCoverageReadyForRepair(coverage?: CodeQaClaimCitationCoverage): boolean {
+  if (!coverage) return false
+  if (coverage.status !== 'READY') return false
+  if (typeof coverage.readyForRepair === 'boolean'
+    && (coverage.readyForRepair !== true || coverage.readinessReason !== 'PRIMARY_BOUND_READY')) return false
+  const roleDistribution = coverage.roleDistribution
+  if (!roleDistribution || roleDistribution.status !== 'PRIMARY_BOUND') return false
+  const requiredClaimCount = Number(coverage.requiredClaimCount || 0)
+  const citedRequiredClaimCount = Number(coverage.citedRequiredClaimCount || 0)
+  const uncitedRequiredClaimCount = Number(coverage.uncitedRequiredClaimCount || 0)
+  const invalidCitationClaimCount = Number(coverage.invalidCitationClaimCount || 0)
+  const requiredPrimaryBoundClaimCount = Number(roleDistribution.requiredPrimaryBoundClaimCount || 0)
+  const requiredPrimaryFileCount = Number(roleDistribution.requiredPrimaryFileCount || 0)
+  const validCitationFileCount = Number(coverage.validCitationFileCount || 0)
+  const requiredClaimCitationFileCount = Number(coverage.requiredClaimCitationFileCount || 0)
+  return requiredClaimCount > 0
+    && Number(roleDistribution.requiredClaimCount || 0) === requiredClaimCount
+    && citedRequiredClaimCount === requiredClaimCount
+    && uncitedRequiredClaimCount === 0
+    && invalidCitationClaimCount === 0
+    && requiredPrimaryBoundClaimCount === requiredClaimCount
+    && Number(roleDistribution.requiredContextOnlyClaimCount || 0) === 0
+    && Number(roleDistribution.requiredUnknownOnlyClaimCount || 0) === 0
+    && Number(roleDistribution.unbackedRequiredClaimCount || 0) === 0
+    && Number(roleDistribution.invalidRequiredClaimCount || 0) === 0
+    && validCitationFileCount > 0
+    && requiredClaimCitationFileCount > 0
+    && Number(roleDistribution.validCitationFileCount || 0) === validCitationFileCount
+    && Number(roleDistribution.requiredClaimCitationFileCount || 0) === requiredClaimCitationFileCount
+    && requiredPrimaryFileCount > 0
+}
+
+function qaRepairEvidenceGate(msg: QaMessage): RepairEvidenceGate {
+  const coverage = msg.citationCoverage
+  const total = coverage?.requiredEvidenceCount ?? coverage?.totalEvidenceCount ?? msg.answerCitations?.length ?? 0
+  const cited = coverage?.citedRequiredEvidenceCount ?? coverage?.citedEvidenceCount ?? msg.answerCitations?.filter(citation => citation.citedByAnswer).length ?? 0
+  const requiredCoveragePercent = coverage?.requiredEvidenceCoveragePercent ?? coverage?.coveragePercent ?? (total ? Math.round((cited * 100) / total) : 0)
+  const repairCandidates = coverage?.repairCandidateCount ?? 0
+  const verified = msg.groundingStatus === 'VERIFIED'
+  const citationGate = successfulCitationEnforcement(msg.citationEnforcementStatus)
+  const responseBound = Boolean(msg.sourceEvidenceRef?.filePath)
+  const sourceMatched = msg.sourceEvidenceMatched === true
+  const lineAnchored = msg.sourceEvidenceMatchType === 'REPORT_LINE_ANCHOR'
+  const claimCoverage = msg.claimCitationCoverage
+  const claimRoleDistribution = claimCoverage?.roleDistribution
+  const requiredClaimCount = Number(claimCoverage?.requiredClaimCount || 0)
+  const citedRequiredClaimCount = Number(claimCoverage?.citedRequiredClaimCount || 0)
+  const requiredPrimaryBoundClaimCount = Number(claimRoleDistribution?.requiredPrimaryBoundClaimCount || 0)
+  const requiredPrimaryFileCount = Number(claimRoleDistribution?.requiredPrimaryFileCount || 0)
+  const claimCoverageReady = claimCitationCoverageReadyForRepair(claimCoverage)
+  const checks = [
+    `必需证据 ${cited}/${total}`,
+    `必需覆盖 ${requiredCoveragePercent}%`,
+    `主张引用 ${claimCoverage?.status || 'MISSING'} ${citedRequiredClaimCount}/${requiredClaimCount || '-'}`,
+    `主张角色 ${claimRoleDistribution?.status || 'MISSING'} ${requiredPrimaryBoundClaimCount}/${requiredClaimCount || '-'}`,
+    `主张主文件 ${requiredPrimaryFileCount}`,
+    `修复候选 ${repairCandidates}`,
+    `报告证据 ${responseBound ? '已回显' : '缺失'}`,
+    `来源锚点 ${sourceEvidenceMatchLabel(msg.sourceEvidenceMatchType)}`,
+  ]
+
+  if (msg.claimCitationCoverage?.status === 'BLOCKED') {
+    return {
+      status: 'BLOCKED',
+      label: 'BLOCKED',
+      color: 'red',
+      summary: '回答中存在无效引用标签，不能作为自动修复依据。',
+      checks,
+    }
+  }
+
+  if (verified && citationGate && requiredCoveragePercent >= 100 && repairCandidates > 0 && responseBound && sourceMatched && lineAnchored && claimCoverageReady) {
+    return {
+      status: 'READY',
+      label: 'READY',
+      color: 'green',
+      summary: '回答引用、报告证据和代码位置已形成可修复闭环。',
+      checks,
+    }
+  }
+
+  if (!verified || !citationGate || requiredCoveragePercent < 100 || repairCandidates === 0) {
+    return {
+      status: 'BLOCKED',
+      label: 'BLOCKED',
+      color: 'red',
+      summary: '当前回答还不能直接进入自动修复，需要先完成引用验证或补足可修复证据。',
+      checks,
+    }
+  }
+
+  return {
+    status: 'REVIEW',
+    label: 'REVIEW',
+    color: 'gold',
+    summary: '代码引用可用，但报告证据回显或来源锚点仍需复核。',
+    checks,
+  }
+}
+
+function citationCoverageAudit(msg: QaMessage): CitationCoverageAudit | null {
+  if (!msg.citationCoverage && !msg.answerCitations?.length && !msg.groundingStatus) {
+    return null
+  }
+  const coverage = msg.citationCoverage
+  const total = coverage?.totalEvidenceCount ?? msg.answerCitations?.length ?? 0
+  const cited = coverage?.citedEvidenceCount ?? msg.answerCitations?.filter(citation => citation.citedByAnswer).length ?? 0
+  const uncited = coverage?.uncitedCandidateCount ?? Math.max(total - cited, 0)
+  const repairCandidates = coverage?.repairCandidateCount ?? 0
+  const coveragePercent = coverage?.coveragePercent ?? (total ? Math.round((cited * 100) / total) : 0)
+  const required = coverage?.requiredEvidenceCount ?? total
+  const citedRequired = coverage?.citedRequiredEvidenceCount ?? cited
+  const requiredFiles = coverage?.requiredEvidenceFileCount ?? coverage?.uniqueEvidenceFileCount ?? 0
+  const citedRequiredFiles = coverage?.citedRequiredEvidenceFileCount ?? coverage?.citedEvidenceFileCount ?? 0
+  const requiredCoveragePercent = coverage?.requiredEvidenceCoveragePercent ?? coveragePercent
+  const coverageScope = coverage?.coverageScope || 'ALL'
+  const roleDistribution = coverage?.evidenceRoleDistribution
+  const roleDistributionAudit = roleDistribution
+    ? {
+        status: roleDistribution.status || 'UNKNOWN',
+        roles: (roleDistribution.roles || []).map(role => {
+          const name = role.role || 'UNKNOWN'
+          const citedEvidence = role.citedEvidenceCount ?? 0
+          const evidence = role.evidenceCount ?? 0
+          const citedFiles = role.citedFileCount ?? 0
+          const files = role.fileCount ?? 0
+          return `${evidenceRoleStatusText(name)} ${citedEvidence}/${evidence} 证据 · ${citedFiles}/${files} 文件`
+        }),
+        files: (roleDistribution.files || []).map(file => {
+          const primary = `${file.citedPrimaryEvidenceCount ?? 0}/${file.primaryEvidenceCount ?? 0}`
+          const context = `${file.citedContextEvidenceCount ?? 0}/${file.contextEvidenceCount ?? 0}`
+          return `${file.filePath || '-'} · P ${primary} · C ${context}`
+        }),
+      }
+    : undefined
+  const primaryCount = coverage?.primaryEvidenceCount ?? 0
+  const contextCount = coverage?.contextEvidenceCount ?? Math.max(total - primaryCount, 0)
+  const uncitedContextCount = Number(coverage?.uncitedContextEvidenceCount ?? Math.max(contextCount - (coverage?.citedContextEvidenceCount ?? 0), 0))
+  const uncitedContextFiles = Number(coverage?.uncitedContextEvidenceFileCount ?? Math.max((coverage?.contextEvidenceFileCount ?? 0) - (coverage?.citedContextEvidenceFileCount ?? 0), 0))
+  const verified = msg.groundingStatus === 'VERIFIED'
+  const citationGate = successfulCitationEnforcement(msg.citationEnforcementStatus)
+  const sourceBound = Boolean(msg.sourceEvidenceRef?.filePath)
+  const sourceMatched = msg.sourceEvidenceMatched === true
+  const lineAnchored = msg.sourceEvidenceMatchType === 'REPORT_LINE_ANCHOR'
+  const requiredCoverageSatisfied = required > 0 && requiredCoveragePercent >= 100 && (requiredFiles === 0 || citedRequiredFiles >= requiredFiles)
+  const ready = verified && citationGate && requiredCoverageSatisfied && repairCandidates > 0 && sourceBound && sourceMatched
+  const checks = [
+    { label: `必需证据 ${citedRequired}/${required}`, ok: required > 0 && requiredCoveragePercent >= 100 },
+    { label: `必需文件 ${citedRequiredFiles}/${requiredFiles}`, ok: requiredFiles === 0 || citedRequiredFiles >= requiredFiles },
+    { label: `主证据 ${coverage?.citedPrimaryEvidenceCount ?? 0}/${primaryCount}`, ok: primaryCount === 0 || (coverage?.citedPrimaryEvidenceCount ?? 0) >= primaryCount },
+    { label: `主证据文件 ${coverage?.citedPrimaryEvidenceFileCount ?? 0}/${coverage?.primaryEvidenceFileCount ?? 0}`, ok: (coverage?.primaryEvidenceFileCount ?? 0) === 0 || (coverage?.citedPrimaryEvidenceFileCount ?? 0) >= (coverage?.primaryEvidenceFileCount ?? 0) },
+    { label: `角色分布 ${roleDistributionAudit?.status || 'UNKNOWN'}`, ok: Boolean(roleDistributionAudit) },
+    { label: `上下文 ${coverage?.citedContextEvidenceCount ?? 0}/${contextCount}`, ok: true },
+    { label: `未引用上下文 ${uncitedContextCount} 条 / ${uncitedContextFiles} 文件`, ok: true },
+    { label: `未引用候选 ${uncited}`, ok: coverage?.status === 'REQUIRED_FULL' || uncited === 0 },
+    { label: `可修复证据 ${repairCandidates}`, ok: repairCandidates > 0 },
+    { label: `报告证据${sourceBound ? '已回显' : '未回显'}`, ok: sourceBound },
+    { label: sourceEvidenceMatchLabel(msg.sourceEvidenceMatchType), ok: sourceMatched },
+  ]
+
+  if (ready) {
+    return {
+      tone: lineAnchored ? 'ready' : 'warning',
+      title: lineAnchored ? '引用覆盖可进入修复' : '引用覆盖可复核',
+      summary: lineAnchored
+        ? '必需证据、报告来源和行级锚点已形成闭环，可以进入修复候选复核；未引用上下文作为补充复核信号展示。'
+        : '必需证据和报告来源已绑定，但缺少行级锚点，生成修复候选前需要人工确认具体位置。',
+      metrics: [
+        { label: '必需覆盖', value: `${requiredCoveragePercent}%` },
+        { label: '必需文件', value: `${citedRequiredFiles}/${requiredFiles}` },
+        { label: '角色', value: evidenceRoleStatusText(roleDistributionAudit?.status) },
+        { label: '范围', value: coverageScopeText(coverageScope) },
+        { label: '上下文缺口', value: `${uncitedContextCount}/${contextCount}` },
+        { label: '可修复', value: String(repairCandidates) },
+      ],
+      checks,
+      roleDistribution: roleDistributionAudit,
+    }
+  }
+
+  return {
+    tone: verified || cited > 0 ? 'warning' : 'blocked',
+    title: verified || cited > 0 ? '引用覆盖需要复核' : '引用覆盖不足',
+    summary: '当前回答还不能直接作为自动修复依据，需要补充可引用证据、重新检索或调整问题后再次确认。',
+    metrics: [
+      { label: '必需覆盖', value: `${requiredCoveragePercent}%` },
+      { label: '必需文件', value: `${citedRequiredFiles}/${requiredFiles}` },
+      { label: '角色', value: evidenceRoleStatusText(roleDistributionAudit?.status) },
+      { label: '总覆盖', value: `${coveragePercent}%` },
+      { label: '上下文缺口', value: `${uncitedContextCount}/${contextCount}` },
+      { label: '可修复', value: String(repairCandidates) },
+    ],
+    checks,
+    roleDistribution: roleDistributionAudit,
+  }
+}
+
+function claimCitationAudit(msg: QaMessage): ClaimCitationAudit | null {
+  const coverage = msg.claimCitationCoverage
+  if (!coverage) {
+    return null
+  }
+  const status = coverage.status || 'REVIEW'
+  const readyForRepair = claimCitationCoverageReadyForRepair(coverage)
+  const effectiveStatus = status === 'READY' && readyForRepair ? 'READY' : status === 'BLOCKED' ? 'BLOCKED' : 'REVIEW'
+  const roleDistribution = coverage.roleDistribution
+  const roleDistributionAudit = roleDistribution
+    ? {
+        status: roleDistribution.status || 'UNKNOWN',
+        primaryBound: Number(roleDistribution.requiredPrimaryBoundClaimCount || 0),
+        contextOnly: Number(roleDistribution.requiredContextOnlyClaimCount || 0),
+        unknownOnly: Number(roleDistribution.requiredUnknownOnlyClaimCount || 0),
+        requiredClaims: Number(roleDistribution.requiredClaimCount || coverage.requiredClaimCount || 0),
+        primaryFiles: Number(roleDistribution.requiredPrimaryFileCount || roleDistribution.primaryFileCount || 0),
+        contextFiles: Number(roleDistribution.requiredContextFileCount || roleDistribution.contextFileCount || 0),
+        roles: (roleDistribution.roles || []).map(role => {
+          const name = role.role || 'UNKNOWN'
+          return `${evidenceRoleStatusText(name)} ${role.requiredClaimCount ?? role.claimCount ?? 0}/${role.claimCount ?? 0}`
+        }),
+        files: (roleDistribution.files || []).map(file => {
+          const name = file.filePath || '-'
+          return `${name} P${file.requiredPrimaryClaimCount ?? 0}/C${file.requiredContextClaimCount ?? 0}/U${file.requiredUnknownClaimCount ?? 0}`
+        }).slice(0, 3),
+      }
+    : undefined
+  const tone: ClaimCitationAudit['tone'] = effectiveStatus === 'READY' ? 'ready' : effectiveStatus === 'BLOCKED' ? 'blocked' : 'warning'
+  const problemClaims = (coverage.claims || [])
+    .filter(claim => claim.status === 'UNCITED' || claim.status === 'INVALID')
+    .slice(0, 3)
+    .map(claim => ({
+      id: claim.claimId || '-',
+      status: claim.status || 'REVIEW',
+      text: claim.claimTextPreview || '-',
+      labels: claim.invalidSourceLabels?.length
+        ? `无效 ${claim.invalidSourceLabels.join(', ')}`
+        : claim.sourceLabels?.length
+          ? claim.sourceLabels.join(', ')
+          : '未引用',
+    }))
+
+  return {
+    tone,
+    title: effectiveStatus === 'READY' ? '主张已绑定引用' : effectiveStatus === 'BLOCKED' ? '存在无效引用标签' : '主张引用需要复核',
+    summary: coverage.readinessNote || (effectiveStatus === 'READY'
+      ? '回答中的可审计主张都绑定了当前证据标签。该信号只证明引用绑定，不证明事实语义充分。'
+      : effectiveStatus === 'BLOCKED'
+        ? '回答包含不属于当前检索证据的引用标签，需要重新生成或人工修正。'
+        : '部分代码主张没有绑定当前证据标签，进入修复候选前需要补充引用或人工确认。'),
+    metrics: [
+      { label: '主张', value: `${coverage.citedRequiredClaimCount ?? 0}/${coverage.requiredClaimCount ?? 0}` },
+      { label: '覆盖率', value: `${coverage.claimCoveragePercent ?? 0}%` },
+      { label: '修复门禁', value: coverage.readyForRepair ? 'READY' : 'REVIEW' },
+      { label: '原因码', value: coverage.readinessReason || '-' },
+      { label: '引用文件', value: String(coverage.validCitationFileCount ?? coverage.validCitationFiles?.length ?? 0) },
+      { label: '必需文件', value: String(coverage.requiredClaimCitationFileCount ?? coverage.requiredClaimCitationFiles?.length ?? 0) },
+      { label: '无效引用', value: String(coverage.invalidCitationClaimCount ?? 0) },
+      { label: '主证据主张', value: roleDistributionAudit ? `${roleDistributionAudit.primaryBound}/${roleDistributionAudit.requiredClaims}` : '-' },
+      { label: '仅上下文', value: roleDistributionAudit ? String(roleDistributionAudit.contextOnly) : '-' },
+    ],
+    roleDistribution: roleDistributionAudit,
+    problemClaims,
+  }
+}
+
+function qaCrossFileCitationSummary(msg: QaMessage): QaCrossFileCitationSummary | null {
+  const coverage = msg.citationCoverage
+  const claimCoverage = msg.claimCitationCoverage
+  if (!coverage && !claimCoverage) {
+    return null
+  }
+
+  const roleDistribution = coverage?.evidenceRoleDistribution
+  const claimRoleDistribution = claimCoverage?.roleDistribution
+  const roleStatus = roleDistribution?.status || 'NO_EVIDENCE'
+  const totalFiles = Number(roleDistribution?.totalFileCount ?? coverage?.uniqueEvidenceFileCount ?? 0)
+  const citedFiles = Number(roleDistribution?.citedFileCount ?? coverage?.citedEvidenceFileCount ?? 0)
+  const primaryFiles = Number(roleDistribution?.primaryFileCount ?? coverage?.primaryEvidenceFileCount ?? 0)
+  const citedPrimaryFiles = Number(roleDistribution?.citedPrimaryFileCount ?? coverage?.citedPrimaryEvidenceFileCount ?? 0)
+  const contextFiles = Number(roleDistribution?.contextFileCount ?? coverage?.contextEvidenceFileCount ?? 0)
+  const citedContextFiles = Number(roleDistribution?.citedContextFileCount ?? coverage?.citedContextEvidenceFileCount ?? 0)
+  const contextEvidence = Number(coverage?.contextEvidenceCount ?? 0)
+  const citedContextEvidence = Number(coverage?.citedContextEvidenceCount ?? 0)
+  const uncitedContextEvidence = Number(coverage?.uncitedContextEvidenceCount ?? Math.max(contextEvidence - citedContextEvidence, 0))
+  const uncitedContextFiles = Number(coverage?.uncitedContextEvidenceFileCount ?? Math.max(contextFiles - citedContextFiles, 0))
+  const hasContextGap = uncitedContextEvidence > 0 || uncitedContextFiles > 0
+  const requiredFiles = Number(coverage?.requiredEvidenceFileCount ?? 0)
+  const citedRequiredFiles = Number(coverage?.citedRequiredEvidenceFileCount ?? 0)
+  const requiredClaims = Number(claimCoverage?.requiredClaimCount ?? claimRoleDistribution?.requiredClaimCount ?? 0)
+  const citedRequiredClaims = Number(claimCoverage?.citedRequiredClaimCount ?? 0)
+  const requiredClaimFiles = Number(claimCoverage?.requiredClaimCitationFileCount ?? claimRoleDistribution?.requiredClaimCitationFileCount ?? 0)
+  const requiredPrimaryFiles = Number(claimRoleDistribution?.requiredPrimaryFileCount ?? 0)
+  const primaryBoundClaims = Number(claimRoleDistribution?.requiredPrimaryBoundClaimCount ?? 0)
+  const crossFileContext = totalFiles >= 2 || (primaryFiles + contextFiles) >= 2
+  const requiredFilesCovered = requiredFiles > 0 && citedRequiredFiles >= requiredFiles
+  const primaryFilesCovered = primaryFiles > 0 && citedPrimaryFiles >= primaryFiles
+  const claimPrimaryBound = claimCitationCoverageReadyForRepair(claimCoverage)
+  const sourceLineAnchored = msg.sourceEvidenceMatched === true && msg.sourceEvidenceMatchType === 'REPORT_LINE_ANCHOR'
+  const hasEvidence = totalFiles > 0 && Number(coverage?.totalEvidenceCount ?? 0) > 0
+  const requiredCoverageSatisfied = (coverage?.status === 'FULL' || coverage?.status === 'REQUIRED_FULL')
+    || (requiredFilesCovered && primaryFilesCovered)
+  const ready = hasEvidence
+    && requiredCoverageSatisfied
+    && requiredFilesCovered
+    && primaryFilesCovered
+    && claimPrimaryBound
+    && sourceLineAnchored
+  const blocked = !hasEvidence
+    || coverage?.status === 'NONE'
+    || claimCoverage?.status === 'BLOCKED'
+    || msg.groundingStatus === 'NO_EVIDENCE'
+    || msg.groundingStatus === 'UNVERIFIED'
+  const tone: QaCrossFileCitationSummary['tone'] = ready ? 'ready' : blocked ? 'blocked' : 'warning'
+  const title = ready
+    ? crossFileContext ? '跨文件引用可采信' : '单文件主证据可采信'
+    : blocked ? '跨文件引用不足' : hasContextGap ? '上下文引用可复核' : '跨文件引用待复核'
+  const summary = ready
+    ? '必需证据文件、PRIMARY 主证据和代码主张已完成结构性绑定；未引用上下文仅作为补充复核信号。该摘要只证明引用覆盖，不证明 LLM 事实语义正确。'
+    : blocked
+      ? '当前回答缺少可采信的引用闭环，不能作为自动修复或报告结论依据。'
+      : hasContextGap
+        ? 'PRIMARY 主证据已绑定，adjacent context 仍有未引用证据；这些上下文用于补充复核，不阻塞必需证据门禁。'
+        : '已有部分引用和文件分布信号，但跨文件上下文、主证据覆盖、claim 绑定或来源锚点仍需复核。'
+
+  return {
+    tone,
+    status: roleStatus,
+    title,
+    summary,
+    metrics: [
+      { label: '证据文件', value: `${citedFiles}/${totalFiles}` },
+      { label: '主证据文件', value: `${citedPrimaryFiles}/${primaryFiles}` },
+      { label: '必需文件', value: `${citedRequiredFiles}/${requiredFiles}` },
+      { label: '主张文件', value: `${requiredClaimFiles}` },
+      { label: '主证据主张', value: `${primaryBoundClaims}/${requiredClaims || '-'}` },
+      { label: '上下文文件', value: `${citedContextFiles}/${contextFiles}` },
+      { label: '未引用上下文', value: `${uncitedContextEvidence} 条 / ${uncitedContextFiles} 文件` },
+    ],
+    checks: [
+      { label: crossFileContext ? '跨文件上下文已出现' : '单文件证据路径', ok: crossFileContext },
+      { label: `必需文件 ${citedRequiredFiles}/${requiredFiles}`, ok: requiredFilesCovered },
+      { label: `PRIMARY 文件 ${citedPrimaryFiles}/${primaryFiles}`, ok: primaryFilesCovered },
+      { label: `主张 PRIMARY 绑定 ${primaryBoundClaims}/${requiredClaims || '-'}`, ok: claimPrimaryBound },
+      { label: `来源锚点 ${sourceEvidenceMatchLabel(msg.sourceEvidenceMatchType)}`, ok: sourceLineAnchored },
+      { label: `上下文缺口 ${uncitedContextEvidence} 条 / ${uncitedContextFiles} 文件`, ok: true },
+      { label: `证据角色 ${evidenceRoleStatusText(roleStatus)}`, ok: roleStatus !== 'NO_EVIDENCE' },
+      { label: `主张文件 ${requiredClaimFiles}`, ok: requiredClaimFiles > 0 && requiredPrimaryFiles > 0 },
+      { label: `主张 ${citedRequiredClaims}/${requiredClaims || '-'}`, ok: requiredClaims > 0 && citedRequiredClaims >= requiredClaims },
+    ],
+    contextGap: {
+      evidence: uncitedContextEvidence,
+      files: uncitedContextFiles,
+      visible: hasContextGap,
+    },
+  }
+}
+
+function qaTrustSummary(
+  msg: QaMessage,
+  repairGate: RepairEvidenceGate | null,
+  citationAudit: CitationCoverageAudit | null,
+  claimAudit: ClaimCitationAudit | null,
+): QaTrustSummary | null {
+  if (!msg.groundingStatus && !msg.citationCoverage && !msg.claimCitationCoverage && !msg.answerCitations?.length) {
+    return null
+  }
+
+  const coverage = msg.citationCoverage
+  const claimCoverage = msg.claimCitationCoverage
+  const roleDistribution = claimCoverage?.roleDistribution
+  const requiredCoveragePercent = coverage?.requiredEvidenceCoveragePercent ?? coverage?.coveragePercent ?? 0
+  const requiredEvidenceCount = coverage?.requiredEvidenceCount ?? coverage?.totalEvidenceCount ?? 0
+  const citedRequiredEvidenceCount = coverage?.citedRequiredEvidenceCount ?? coverage?.citedEvidenceCount ?? 0
+  const requiredClaimCount = claimCoverage?.requiredClaimCount ?? 0
+  const citedRequiredClaimCount = claimCoverage?.citedRequiredClaimCount ?? 0
+  const requiredPrimaryBoundClaimCount = roleDistribution?.requiredPrimaryBoundClaimCount ?? 0
+  const primaryBound = claimCitationCoverageReadyForRepair(claimCoverage)
+  const verified = msg.groundingStatus === 'VERIFIED'
+  const citationVerified = successfulCitationEnforcement(msg.citationEnforcementStatus)
+  const citationReason = msg.citationEnforcementReason || null
+  const claimReady = claimCitationCoverageReadyForRepair(claimCoverage)
+  const sourceLineAnchored = msg.sourceEvidenceMatchType === 'REPORT_LINE_ANCHOR'
+  const sourceMatched = msg.sourceEvidenceMatched === true
+  const gateStatus = repairGate?.status || 'REVIEW'
+  const hardBlocked = msg.groundingStatus === 'NO_EVIDENCE'
+    || msg.groundingStatus === 'UNVERIFIED'
+    || claimCoverage?.status === 'BLOCKED'
+    || gateStatus === 'BLOCKED'
+  const ready = verified
+    && citationVerified
+    && requiredCoveragePercent >= 100
+    && claimReady
+    && primaryBound
+    && sourceMatched
+    && sourceLineAnchored
+    && gateStatus === 'READY'
+  const checks = [
+    { label: `回答验证 ${groundingStatusLabel(msg.groundingStatus)}`, ok: verified },
+    { label: `引用策略 ${citationEnforcementLabel(msg.citationEnforcementStatus)}`, ok: citationVerified },
+    { label: `引用原因 ${citationEnforcementReasonLabel(citationReason)}`, ok: citationVerified || citationReason === 'NOT_APPLICABLE' },
+    { label: `必需证据 ${citedRequiredEvidenceCount}/${requiredEvidenceCount}`, ok: requiredEvidenceCount > 0 && requiredCoveragePercent >= 100 },
+    { label: `主张引用 ${citedRequiredClaimCount}/${requiredClaimCount || '-'}`, ok: claimReady && (requiredClaimCount === 0 || citedRequiredClaimCount >= requiredClaimCount) },
+    { label: `PRIMARY 主证据 ${requiredPrimaryBoundClaimCount}/${requiredClaimCount || '-'}`, ok: primaryBound },
+    { label: `来源锚点 ${sourceEvidenceMatchLabel(msg.sourceEvidenceMatchType)}`, ok: sourceLineAnchored },
+    { label: `修复门禁 ${gateStatus}`, ok: gateStatus === 'READY' },
+  ]
+
+  if (ready) {
+    return {
+      tone: 'ready',
+      title: '可采信并进入修复复核',
+      summary: '回答、必需证据、代码主张和 PRIMARY 主证据已经形成闭环。该摘要证明证据绑定成熟，不等同于 LLM 事实裁判。',
+      nextAction: '可以继续查看引用文件、生成修复候选，或把该回答纳入报告复盘。',
+      metrics: [
+        { label: '证据', value: `${requiredCoveragePercent}%` },
+        { label: '主张', value: `${citedRequiredClaimCount}/${requiredClaimCount}` },
+        { label: '主证据', value: `${requiredPrimaryBoundClaimCount}/${requiredClaimCount}` },
+        { label: '门禁', value: repairGateStatusText(gateStatus) },
+      ],
+      checks,
+    }
+  }
+
+  if (hardBlocked) {
+    return {
+      tone: 'blocked',
+      title: '不可直接采信',
+      summary: '当前回答缺少可靠引用、存在无效引用标签，或没有满足修复证据门禁。必须重新检索、重新生成或人工复核。',
+      nextAction: claimCoverage?.status === 'BLOCKED'
+        ? '优先重新生成回答，避免使用不存在的引用标签。'
+        : '先补足可引用代码证据，再继续追问或生成修复候选。',
+      metrics: [
+        { label: '证据', value: `${requiredCoveragePercent}%` },
+        { label: '主张', value: `${citedRequiredClaimCount}/${requiredClaimCount || 0}` },
+        { label: '主证据', value: `${requiredPrimaryBoundClaimCount}/${requiredClaimCount || 0}` },
+        { label: '门禁', value: repairGateStatusText(gateStatus) },
+      ],
+      checks,
+    }
+  }
+
+  return {
+    tone: 'warning',
+    title: '需要人工复核',
+    summary: citationAudit?.summary || claimAudit?.summary || '回答已有部分证据绑定，但仍缺少完整的引用覆盖、PRIMARY 主证据或来源锚点。',
+    nextAction: sourceMatched && !sourceLineAnchored
+      ? '先确认报告证据的具体行号，再决定是否生成修复候选。'
+      : '打开引用文件复核关键路径，必要时换用更具体的问题重新检索。',
+    metrics: [
+      { label: '证据', value: `${requiredCoveragePercent}%` },
+      { label: '主张', value: `${citedRequiredClaimCount}/${requiredClaimCount || 0}` },
+      { label: '主证据', value: primaryBound ? '已绑定' : evidenceRoleStatusText(roleDistribution?.status || 'REVIEW') },
+      { label: '门禁', value: repairGateStatusText(gateStatus) },
+    ],
+    checks,
+  }
+}
+
+function buildQaReadableEvidenceViewModel(msg: QaMessage): QaReadableEvidenceViewModel {
+  const repairEvidenceGate = msg.groundingStatus ? qaRepairEvidenceGate(msg) : null
+  const citationAudit = citationCoverageAudit(msg)
+  const claimAudit = claimCitationAudit(msg)
+  const trustSummary = qaTrustSummary(msg, repairEvidenceGate, citationAudit, claimAudit)
+  const crossFileSummary = qaCrossFileCitationSummary(msg)
+  const sourceEvidenceReceipt = qaAnswerSourceEvidenceReceipt(msg)
+  const sourceFileRelease = repairEvidenceGate ? qaSourceFileMatchRelease(msg, repairEvidenceGate) : null
+
+  return {
+    repairEvidenceGate,
+    citationAudit,
+    claimAudit,
+    trustSummary,
+    crossFileSummary,
+    sourceEvidenceReceipt,
+    sourceFileRelease,
+  }
+}
+
+function isLowConfidenceGrounding(status?: string | null): boolean {
+  return status === 'PARTIAL' || status === 'UNVERIFIED' || status === 'NO_EVIDENCE'
+}
+
+function qaEvidenceReviewTitle(status?: string | null): string {
+  if (status === 'NO_EVIDENCE') return '没有可用代码证据'
+  if (status === 'UNVERIFIED') return '回答未绑定证据'
+  if (status === 'PARTIAL') return '引用需要复核'
+  return '证据状态待确认'
+}
+
+function qaEvidenceReviewDescription(msg: QaMessage): string {
+  const candidateCount = Math.max(msg.answerCitations?.length || 0, msg.chunks?.length || 0)
+  if (msg.groundingStatus === 'NO_EVIDENCE') {
+    return '本次检索没有返回可引用代码切片。请换一个更具体的问题，或在重新扫描后再询问。'
+  }
+  if (msg.groundingStatus === 'UNVERIFIED') {
+    return candidateCount > 0
+      ? `回答没有可靠引用标记，下方 ${candidateCount} 条候选证据仅供人工复核。`
+      : '回答没有可靠引用标记，也没有候选证据可复核。'
+  }
+  if (msg.groundingStatus === 'PARTIAL') {
+    return candidateCount > 0
+      ? `系统找到 ${candidateCount} 条候选证据，但回答引用不完整，请人工确认后再采信。`
+      : '回答只完成了部分证据绑定，请重新提问或重新扫描后复核。'
+  }
+  return msg.citationEnforcementNote || '请先复核候选证据，再把结论用于修复或发布判断。'
+}
+
+function citationLineReference(citation: CodeQaCitation): string {
+  const filePath = citation.filePath || 'unknown'
+  const startLine = citation.startLine || 1
+  const endLine = citation.endLine && citation.endLine >= startLine ? citation.endLine : startLine
+  return `${filePath}:${startLine}-${endLine}`
+}
+
+function citationEvidenceKey(citation: CodeQaCitation): string {
+  return [
+    citation.sourceLabel || '',
+    normalizeSourceLocationPath(citation.filePath),
+    citation.startLine || 1,
+    citation.endLine && citation.endLine >= (citation.startLine || 1) ? citation.endLine : citation.startLine || 1,
+  ].join('|')
+}
+
+function chunkEvidenceKey(chunk: CodeChunkSearchItem): string {
+  return [
+    chunk.sourceLabel || '',
+    normalizeSourceLocationPath(chunk.filePath),
+    chunk.startLine || 1,
+    chunk.endLine && chunk.endLine >= (chunk.startLine || 1) ? chunk.endLine : chunk.startLine || 1,
+  ].join('|')
+}
+
+function supplementalQaChunks(msg: QaMessage): CodeChunkSearchItem[] {
+  const citedKeys = new Set((msg.answerCitations || []).map(citationEvidenceKey))
+  return (msg.chunks || []).filter(chunk => !citedKeys.has(chunkEvidenceKey(chunk)))
+}
+
+function citationEvidenceReason(citation: CodeQaCitation): string {
+  if (citation.evidenceReason) return citation.evidenceReason
+  const role = citation.contextRole === 'ADJACENT_CONTEXT' ? '上下文补充' : '主证据'
+  const score = typeof citation.relevanceScore === 'number' ? `相关分 ${citation.relevanceScore}` : '相关分 -'
+  const type = citation.evidenceType || 'OTHER'
+  return `${role} · ${type} · ${score}`
+}
+
+function qaCitationRepairTargetDesc(citation: CodeQaCitation, question: string): string {
+  return [
+    `请基于 Project QA 已验证引用 ${redactSensitiveText(citation.sourceLabel || 'C?')} 生成最小修复候选。`,
+    `证据位置：${redactSensitiveText(citationLineReference(citation))}`,
+    question ? `原始问题：${redactSensitiveText(question)}` : '',
+    `证据说明：${redactSensitiveText(citationEvidenceReason(citation))}`,
+  ].filter(Boolean).join('\n')
+}
+
+function appendSourceEvidenceParams(
+  params: URLSearchParams,
+  sourceEvidenceRef?: CodeQaEvidenceRef | null,
+  sourceEvidenceMatched?: boolean | null,
+  sourceEvidenceMatchType?: string | null,
+) {
+  if (!sourceEvidenceRef) return
+  const safeEvidenceRef = redactedEvidenceRefForOutput(sourceEvidenceRef)
+  if (safeEvidenceRef.category) params.set('sourceEvidenceCategory', safeEvidenceRef.category)
+  if (safeEvidenceRef.source) params.set('sourceEvidenceSource', safeEvidenceRef.source)
+  if (safeEvidenceRef.title) params.set('sourceEvidenceTitle', safeEvidenceRef.title)
+  if (safeEvidenceRef.filePath) params.set('sourceEvidenceFilePath', safeEvidenceRef.filePath)
+  const sourceLineLabel = evidenceLineLabel(safeEvidenceRef)
+  if (sourceLineLabel) params.set('sourceEvidenceLineNumber', sourceLineLabel)
+  if (sourceEvidenceMatched !== undefined && sourceEvidenceMatched !== null) params.set('sourceEvidenceMatched', String(sourceEvidenceMatched))
+  if (sourceEvidenceMatchType) params.set('sourceEvidenceMatchType', sourceEvidenceMatchType)
 }
 
 function buildChunkEvidenceProfile(items: CodeChunkSearchItem[]): ChunkEvidenceProfile {
@@ -1509,6 +3480,123 @@ function buildChunkEvidenceProfile(items: CodeChunkSearchItem[]): ChunkEvidenceP
   }
 }
 
+function buildChunkEvidenceCombination(items: CodeChunkSearchItem[]): ChunkEvidenceCombination | null {
+  if (!items.length) return null
+
+  const primaryItems = items.filter(item => !isContextChunk(item))
+  const contextItems = items.filter(isContextChunk)
+  const topChunk = [...(primaryItems.length > 0 ? primaryItems : items)]
+    .sort((a, b) => (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0))[0]
+  const uniqueFiles = Array.from(new Set(items.map(item => item.filePath).filter(Boolean)))
+  const embeddedCount = items.filter(item => item.hasEmbedding).length
+  const rolePath = [
+    primaryItems.length > 0 ? `主证据 ${primaryItems.length}` : '',
+    contextItems.length > 0 ? `上下文 ${contextItems.length}` : '',
+    uniqueFiles.length > 1 ? `跨文件 ${uniqueFiles.length}` : '单文件路径',
+  ].filter(Boolean)
+
+  const tone: QaSignalTone = primaryItems.length > 0 && uniqueFiles.length > 1 && embeddedCount > 0
+    ? 'ready'
+    : primaryItems.length > 0 && embeddedCount > 0
+      ? 'ready'
+      : primaryItems.length > 0
+        ? 'warning'
+        : 'idle'
+
+  const label = tone === 'ready'
+    ? uniqueFiles.length > 1 ? '跨文件复核路径' : '主证据路径'
+    : tone === 'warning'
+      ? '主证据待复核'
+      : '上下文线索'
+
+  const topReference = topChunk ? chunkLineReference(topChunk) : '-'
+  const topSourceLabel = topChunk?.sourceLabel || (topChunk ? 'C1' : '-')
+  const fileCoverage = uniqueFiles.slice(0, 4).map(filePath => compactPath(filePath))
+  const summary = primaryItems.length > 0
+    ? `${topSourceLabel} 是当前阅读入口，${contextItems.length > 0 ? '结合相邻上下文复核调用链' : '先确认主证据职责与边界'}；覆盖 ${uniqueFiles.length} 个文件，${embeddedCount}/${items.length} 条含向量证据。`
+    : `当前结果主要是上下文线索；覆盖 ${uniqueFiles.length} 个文件，建议补充类名、方法名或 file:line 后重新检索。`
+  const nextAction = primaryItems.length > 0
+    ? `先阅读 ${topSourceLabel}，再按文件覆盖顺序复核 ${fileCoverage.join(' / ') || '当前文件'}。`
+    : '换用更具体的类名、方法名或报告证据行号重新检索。'
+  const nextQuestions = primaryItems.length > 0
+    ? [
+        `解释 ${topSourceLabel} 的职责和关键分支`,
+        contextItems.length > 0 ? '把主证据和相邻上下文串成调用链' : '补充搜索同名 Service / Repository 上下游',
+        uniqueFiles.length > 1 ? '对比跨文件证据是否支持同一个结论' : '用 file:line 继续定位同文件相邻代码',
+      ]
+    : [
+        '换用更具体的类名或方法名重新检索',
+        '粘贴报告里的 file:line 作为证据锚点',
+        '先查看最新成功扫描是否已生成 code_chunks',
+      ]
+
+  return {
+    tone,
+    label,
+    summary,
+    nextAction,
+    primaryCount: primaryItems.length,
+    contextCount: contextItems.length,
+    uniqueFiles: uniqueFiles.length,
+    embeddedCount,
+    topSourceLabel,
+    topReference,
+    fileCoverage,
+    rolePath,
+    nextQuestions,
+  }
+}
+
+function classifyCodeUnderstandingQuery(query: string): CodeUnderstandingQuerySignal {
+  const trimmed = query.trim()
+  if (!trimmed) {
+    return {
+      kind: 'IDLE',
+      label: '等待定位',
+      title: '粘贴代码锚点开始定位',
+      hint: '支持 file:line、Class#method 和 Java/browser stack frame，定位结果仍以当前扫描 code_chunks 为准。',
+    }
+  }
+
+  const hasStackFrame = trimmed.split(/\r?\n/).some(line => /^\s*at\s+\S+/.test(line))
+    || /\bat\s+\S+[\s\S]*\([^()]+:\d+(?::\d+)?\)/.test(trimmed)
+    || /\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?@(?:[a-z][a-z0-9+.-]*:\/\/)?[^\s)]+\.(?:java|kt|tsx|ts|jsx|js|vue|py|go|rs)(?:[?#][^\s):]*)?:\d+(?::\d+)?/.test(trimmed)
+  if (hasStackFrame) {
+    return {
+      kind: 'STACK_TRACE',
+      label: '栈帧定位',
+      title: '按栈帧回查代码位置',
+      hint: '只展示命中的文件、行号、证据角色和召回状态，不把原始栈帧写入证据 marker。',
+    }
+  }
+
+  if (/(?:^|\s)[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*#[A-Za-z_$][\w$]*(?:\s|$|\()/.test(trimmed)
+    || /\b[A-Z][A-Za-z0-9_$]*(?:Controller|Service|Repository|Mapper|Config)?\.[A-Za-z_$][\w$]*\s*\(/.test(trimmed)) {
+    return {
+      kind: 'METHOD_ANCHOR',
+      label: '方法锚点',
+      title: '按类名与方法名定位',
+      hint: '适合从 Class#method 或异常栈里的 handler method 进入主证据。',
+    }
+  }
+
+  if (/(?:^|\s|[("'])[^()\s"']+\.[A-Za-z0-9]+:\d+(?::\d+)?(?:\s|$|[)"'])/.test(trimmed)) {
+    return {
+      kind: 'FILE_LINE',
+      label: '文件行号',
+      title: '按 file:line 定位',
+      hint: '适合从报告风险、日志或 IDE 跳转位置回到当前扫描证据。',
+    }
+  }
+
+  return {
+    kind: 'GENERAL',
+    label: '关键词检索',
+    title: '按关键词理解代码',
+    hint: '建议补充类名、方法名、文件路径或行号，让证据闭环更稳定。',
+  }
+}
+
 function chunkAdoptionSignal(chunk: CodeChunkSearchItem): { tone: 'ready' | 'warning' | 'idle'; text: string } {
   if (isContextChunk(chunk)) {
     return { tone: 'idle', text: '相邻代码上下文，用于补全类成员、方法前后文和调用链，不单独作为结论依据。' }
@@ -1546,6 +3634,104 @@ function ProjectFlowStage({
         <div className="sl-project-flow-meta">{meta}</div>
       </div>
     </div>
+  )
+}
+
+function ProjectTrustedLoopPanel({ steps }: { steps: ProjectTrustedLoopStep[] }) {
+  return (
+    <section className="sl-project-trusted-loop" aria-label="项目可信工程闭环">
+      <div className="sl-project-trusted-loop-head">
+        <div>
+          <span>Trusted Engineering Loop</span>
+          <h2>项目主链路闭环</h2>
+        </div>
+        <p>把项目从仓库接入、源码理解、修复候选到安全审计串成一条可追踪流程，避免用户在功能页之间迷路。</p>
+      </div>
+      <div className="sl-project-trusted-loop-grid">
+        {steps.map(step => (
+          <article className={`sl-project-trusted-loop-step sl-project-trusted-loop-step-${step.tone}`} key={step.key}>
+            <div className="sl-project-trusted-loop-index">{step.index}</div>
+            <div className="sl-project-trusted-loop-copy">
+              <div className="sl-project-trusted-loop-meta">
+                <span>{step.owner}</span>
+                <Tag color={step.tone === 'ready' ? 'success' : step.tone === 'attention' ? 'warning' : 'default'}>{step.value}</Tag>
+              </div>
+              <strong>{step.title}</strong>
+              <p>{step.description}</p>
+              <ActionButton size="small" icon={<ArrowActionIcon tone={step.tone} />} onClick={step.onAction} label={step.actionLabel} />
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function ArrowActionIcon({ tone }: { tone: ProjectTrustedLoopStep['tone'] }) {
+  if (tone === 'ready') return <CheckCircleOutlined />
+  if (tone === 'attention') return <SearchOutlined />
+  return <ScheduleOutlined />
+}
+
+function ProjectWorkspaceNextActionRail({
+  action,
+  primaryLoading,
+  onPrimary,
+  onSecondary,
+}: {
+  action: ProjectWorkspaceNextAction
+  primaryLoading: boolean
+  onPrimary: () => void
+  onSecondary: () => void
+}) {
+  return (
+    <section
+      className={`sl-project-next-action sl-project-next-action-${action.tone}`}
+      aria-label="项目下一步行动"
+      data-sl-action-key={action.key}
+      data-sl-primary-count="1"
+    >
+      <div className="sl-project-next-action-main">
+        <div className="sl-project-next-action-icon">{action.primaryIcon}</div>
+        <div className="sl-project-next-action-copy">
+          <div className="sl-project-next-action-label">Next action</div>
+          <h2>{action.title}</h2>
+          <p>{action.summary}</p>
+          <div className="sl-project-next-action-tags">
+            <Tag color={analysisReadinessColor(action.tone)}>{action.evidenceMaturity}</Tag>
+            <Tag color={action.tone === 'danger' ? 'red' : action.tone === 'warning' ? 'gold' : 'green'}>{action.blocker}</Tag>
+          </div>
+        </div>
+      </div>
+
+      <div className="sl-project-next-action-actions">
+        <ActionButton
+          type="primary"
+          icon={action.primaryIcon}
+          loading={primaryLoading}
+          disabled={action.primaryDisabled}
+          onClick={onPrimary}
+          label={action.primaryLabel}
+        />
+        {action.secondaryLabel && action.secondaryIcon && (
+          <ActionButton
+            icon={action.secondaryIcon}
+            disabled={action.secondaryDisabled}
+            onClick={onSecondary}
+            label={action.secondaryLabel}
+          />
+        )}
+      </div>
+
+      <div className="sl-project-next-action-checks" aria-label="项目下一步证据检查">
+        {action.checks.map(check => (
+          <div className={`sl-project-next-action-check ${check.ready ? 'sl-project-next-action-check-ready' : 'sl-project-next-action-check-gap'}`} key={check.label}>
+            <span>{check.label}</span>
+            <strong>{check.value}</strong>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -1598,18 +3784,10 @@ function AnalysisReadinessPanel({
           <span>{signal.nextAction}</span>
         </div>
         <Space wrap>
-          <Button icon={<DatabaseOutlined />} disabled={signal.coreReadyCount === 0} onClick={onOpenArtifacts}>
-            产物证据
-          </Button>
-          <Button icon={<SendOutlined />} disabled={signal.tone === 'idle'} onClick={onOpenQa}>
-            代码问答
-          </Button>
-          <Button icon={<BranchesOutlined />} disabled={signal.tone === 'idle'} onClick={onOpenGraph}>
-            依赖图谱
-          </Button>
-          <Button icon={<FileTextOutlined />} disabled={signal.tone === 'idle'} onClick={onOpenScan}>
-            扫描详情
-          </Button>
+          <ActionButton icon={<DatabaseOutlined />} disabled={signal.coreReadyCount === 0} onClick={onOpenArtifacts} label="产物证据" />
+          <ActionButton icon={<SendOutlined />} disabled={signal.tone === 'idle'} onClick={onOpenQa} label="代码问答" />
+          <ActionButton icon={<BranchesOutlined />} disabled={signal.tone === 'idle'} onClick={onOpenGraph} label="依赖图谱" />
+          <ActionButton icon={<FileTextOutlined />} disabled={signal.tone === 'idle'} onClick={onOpenScan} label="扫描详情" />
         </Space>
       </div>
     </section>
@@ -1623,6 +3801,152 @@ function ScanSummary({ label, value }: { label: string; value: number | string }
       <strong>{value}</strong>
     </div>
   )
+}
+
+function buildProjectWorkspaceNextAction({
+  activeScanCount,
+  analysisReadiness,
+  codeKnowledgeStatus,
+  latestScan,
+  latestSuccessScan,
+  primaryRepo,
+  repos,
+  scans,
+  staleRefreshError,
+}: {
+  activeScanCount: number
+  analysisReadiness: AnalysisReadinessSignal
+  codeKnowledgeStatus: ProjectCodeKnowledgeStatus
+  latestScan?: ScanTask
+  latestSuccessScan?: ScanTask
+  primaryRepo: Repository | null
+  repos: Repository[]
+  scans: ScanTask[]
+  staleRefreshError?: string | null
+}): ProjectWorkspaceNextAction {
+  const repositoryReady = Boolean(primaryRepo)
+  const hasSuccessfulScan = Boolean(latestSuccessScan)
+  const hasCodeChunks = codeKnowledgeStatus.totalChunks > 0
+  const coreReady = analysisReadiness.coreReadyCount
+  const coreTotal = analysisReadiness.coreTotalCount
+  const repoLabel = primaryRepo ? `${primaryRepo.owner}/${primaryRepo.name}` : '未接入'
+  const checks = [
+    { label: '仓库', value: repoLabel, ready: repositoryReady },
+    { label: '扫描', value: hasSuccessfulScan ? `成功 #${latestSuccessScan?.id}` : latestScan ? formatStatusLabel(latestScan.status) : '无记录', ready: hasSuccessfulScan },
+    { label: 'code_chunks', value: codeKnowledgeStatus.value, ready: codeKnowledgeStatus.tone !== 'danger' && hasCodeChunks },
+    { label: '核心产物', value: `${coreReady}/${coreTotal}`, ready: coreReady === coreTotal && coreTotal > 0 },
+  ]
+  const evidenceMaturity = `${coreReady}/${coreTotal} 核心证据`
+
+  if (staleRefreshError) {
+    return {
+      key: 'STALE_REFRESH',
+      tone: 'danger',
+      title: '先重新同步项目数据',
+      summary: `当前保留的是上次可信快照，本次核心数据刷新失败：${staleRefreshError}`,
+      blocker: '数据非最新',
+      evidenceMaturity,
+      primaryLabel: '重新同步',
+      primaryIcon: <ReloadOutlined />,
+      checks,
+    }
+  }
+
+  if (!repositoryReady || repos.length === 0) {
+    return {
+      key: 'ADD_REPOSITORY',
+      tone: 'idle',
+      title: '先接入一个公开仓库',
+      summary: '没有仓库时，扫描、code_chunks、报告和代码问答都没有可信输入源。',
+      blocker: '缺少仓库',
+      evidenceMaturity,
+      primaryLabel: '添加仓库',
+      primaryIcon: <PlusOutlined />,
+      secondaryLabel: '查看仓库入口',
+      secondaryIcon: <FolderOutlined />,
+      checks,
+    }
+  }
+
+  if (!latestScan || scans.length === 0) {
+    return {
+      key: 'START_SCAN',
+      tone: 'warning',
+      title: '触发第一次仓库扫描',
+      summary: `${repoLabel} 已接入，下一步应生成扫描任务和基础产物。`,
+      blocker: '缺少扫描',
+      evidenceMaturity,
+      primaryLabel: '触发扫描',
+      primaryIcon: <SearchOutlined />,
+      secondaryLabel: '查看仓库',
+      secondaryIcon: <FolderOutlined />,
+      checks,
+    }
+  }
+
+  if (activeScanCount > 0 && latestScan.status !== 'SUCCESS') {
+    return {
+      key: 'WATCH_SCAN',
+      tone: 'warning',
+      title: '等待当前扫描完成',
+      summary: `Scan #${latestScan.id} 当前为${formatStatusLabel(latestScan.status)}，报告和代码问答必须等任务闭环后再判断。`,
+      blocker: '扫描运行中',
+      evidenceMaturity,
+      primaryLabel: '查看扫描进度',
+      primaryIcon: <ScheduleOutlined />,
+      secondaryLabel: '查看扫描列表',
+      secondaryIcon: <SearchOutlined />,
+      checks,
+    }
+  }
+
+  if (!hasSuccessfulScan || latestScan.status === 'FAILED') {
+    return {
+      key: 'REVIEW_FAILED_SCAN',
+      tone: 'danger',
+      title: '先复盘失败扫描',
+      summary: latestScan.errorMessage || `Scan #${latestScan.id} 没有形成可用报告，需要先定位失败步骤。`,
+      blocker: '扫描失败',
+      evidenceMaturity,
+      primaryLabel: '打开失败详情',
+      primaryIcon: <FileTextOutlined />,
+      secondaryLabel: '重新扫描',
+      secondaryIcon: <ReloadOutlined />,
+      checks,
+    }
+  }
+
+  if (analysisReadiness.tone !== 'ready' || codeKnowledgeStatus.tone !== 'ready') {
+    return {
+      key: 'OPEN_ARTIFACTS',
+      tone: analysisReadiness.tone === 'danger' || codeKnowledgeStatus.tone === 'danger' ? 'danger' : 'warning',
+      title: '补齐报告和代码证据',
+      summary: analysisReadiness.nextAction || codeKnowledgeStatus.nextAction,
+      blocker: analysisReadiness.tone === 'danger' || codeKnowledgeStatus.tone === 'danger' ? '证据缺口' : '需要复核',
+      evidenceMaturity,
+      primaryLabel: '打开产物证据',
+      primaryIcon: <DatabaseOutlined />,
+      primaryDisabled: !latestSuccessScan,
+      secondaryLabel: '查看最新报告',
+      secondaryIcon: <FileTextOutlined />,
+      secondaryDisabled: !latestSuccessScan,
+      checks,
+    }
+  }
+
+  return {
+    key: 'OPEN_QA',
+    tone: 'ready',
+    title: '进入代码问答复核',
+    summary: '仓库、成功扫描、code_chunks 和核心报告证据已经就绪，可以开始带引用的代码理解和报告复盘。',
+    blocker: '无阻塞',
+    evidenceMaturity,
+    primaryLabel: '进入代码问答',
+    primaryIcon: <SendOutlined />,
+    secondaryLabel: '打开最新报告',
+    secondaryIcon: <FileTextOutlined />,
+    checks,
+  }
 }
 
 function buildProjectCodeKnowledgeStatus(
@@ -1919,6 +4243,8 @@ function InsightMetric({ label, value }: { label: string; value: string }) {
 
 function CodeQaTab({
   projectId,
+  repositories,
+  scanTasks,
   scanTaskId,
   knowledgeStatus,
   knowledgeLoading,
@@ -1926,13 +4252,17 @@ function CodeQaTab({
   initialQuestion,
 }: {
   projectId: number
+  repositories: Repository[]
+  scanTasks: ScanTask[]
   scanTaskId?: number | null
   knowledgeStatus: CodeChunkSearchResponse | null
   knowledgeLoading: boolean
   knowledgeError: string | null
   initialQuestion?: string | null
 }) {
+  const navigate = useNavigate()
   const initialQuestionText = useMemo(() => (initialQuestion || '').trim(), [initialQuestion])
+  const [qaSearchParams, setQaSearchParams] = useSearchParams()
   const [messages, setMessages] = useState<QaMessage[]>([
     { role: 'assistant', content: '您好！我是您的代码库智能助手。您已开启本地 RAG 问答，我可以基于本项目已扫描的代码文件为您解答关于架构设计、实现细节或开发建议的问题。请问有什么我可以帮您的？' }
   ])
@@ -1942,6 +4272,20 @@ function CodeQaTab({
   const [searchLoading, setSearchLoading] = useState(false)
   const [searchResult, setSearchResult] = useState<CodeChunkSearchResponse | null>(null)
   const [searchError, setSearchError] = useState<string | null>(null)
+  const [searchFailedQuery, setSearchFailedQuery] = useState<string | null>(null)
+  const [qaRequestError, setQaRequestError] = useState<{ question: string; message: string } | null>(null)
+  const [manualCopyText, setManualCopyText] = useState<{ title: string; text: string } | null>(null)
+  const evidenceRef = useMemo(() => normalizeEvidenceRef({
+    category: qaSearchParams.get('evidenceCategory') || undefined,
+    source: qaSearchParams.get('evidenceSource') || undefined,
+    title: qaSearchParams.get('evidenceTitle') || undefined,
+    summary: qaSearchParams.get('evidenceSummary') || undefined,
+    filePath: qaSearchParams.get('evidenceFile') || undefined,
+    lineNumber: qaSearchParams.get('evidenceLine') || undefined,
+    startLine: parsePositiveInt(qaSearchParams.get('evidenceStartLine')),
+    endLine: parsePositiveInt(qaSearchParams.get('evidenceEndLine')),
+  }), [qaSearchParams])
+  const evidenceRefLineInfo = useMemo(() => evidenceLineInfo(evidenceRef), [evidenceRef])
 
   const executeChunkSearch = useCallback(async (queryText: string, silent = false) => {
     if (!queryText) {
@@ -1954,9 +4298,11 @@ function CodeQaTab({
       const res = await codeChunkApi.search(projectId, { query: queryText, scanTaskId: scanTaskId || undefined, limit: 8 })
       setSearchResult(res.data.data)
       setSearchQuery(queryText)
+      setSearchFailedQuery(null)
     } catch (error) {
       const errMsg = formatApiError(error, '代码切片检索失败')
       setSearchError(errMsg)
+      setSearchFailedQuery(queryText)
       if (!silent) showApiError(error, '代码切片检索失败')
     } finally {
       setSearchLoading(false)
@@ -1975,25 +4321,37 @@ function CodeQaTab({
     void executeChunkSearch(initialQuestionText, true)
   }, [executeChunkSearch, initialQuestionText])
 
-  const handleSend = async () => {
-    if (!question.trim() || loading) return
-    const curQuestion = question.trim()
+  const submitQuestion = async (overrideQuestion?: string) => {
+    const curQuestion = (overrideQuestion ?? question).trim()
+    if (!curQuestion || loading) return
     setQuestion('')
+    setQaRequestError(null)
     setMessages(prev => [...prev, { role: 'user', content: curQuestion }])
     setLoading(true)
     void runChunkSearch(curQuestion, true)
 
     try {
-      const res = await projectApi.codeQa(projectId, curQuestion, scanTaskId)
+      const res = await projectApi.codeQa(projectId, curQuestion, scanTaskId, evidenceRef)
       const qa = res.data.data
       const answer = qa?.answer || '未获取到有效回答'
       const chunks = qa?.retrievedChunks || []
+      setQaRequestError(null)
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: answer,
         chunks,
+        answerCitations: qa?.answerCitations || [],
         scanTaskId: qa?.scanTaskId,
         retrievalMode: qa?.retrievalMode,
+        groundingStatus: qa?.groundingStatus,
+        citationEnforcementStatus: qa?.citationEnforcementStatus,
+        citationEnforcementReason: qa?.citationEnforcementReason,
+        citationEnforcementNote: qa?.citationEnforcementNote,
+        citationCoverage: qa?.citationCoverage,
+        claimCitationCoverage: qa?.claimCitationCoverage,
+        sourceEvidenceRef: qa?.sourceEvidenceRef,
+        sourceEvidenceMatched: qa?.sourceEvidenceMatched,
+        sourceEvidenceMatchType: qa?.sourceEvidenceMatchType,
         evidenceProfile: qa?.evidenceProfile,
       }])
       if (qa) {
@@ -2014,14 +4372,24 @@ function CodeQaTab({
       }
     } catch (error) {
       const errMsg = formatApiError(error, '请求失败，请检查大模型配置或网络连接。')
+      setQaRequestError({ question: curQuestion, message: errMsg })
       setMessages(prev => [...prev, { role: 'assistant', content: `问答请求发生错误：${errMsg}` }])
     } finally {
       setLoading(false)
     }
   }
 
+  const handleSend = () => {
+    void submitQuestion()
+  }
+
   const baselineKnowledge = searchResult || knowledgeStatus
   const activeSourceScanTaskId = baselineKnowledge?.scanTaskId ?? scanTaskId ?? null
+  const evidenceBridgeScanTaskId = activeSourceScanTaskId || scanTaskId || null
+  const evidenceBridgeQuery = useMemo(
+    () => buildEvidenceBridgeSearchQuery(evidenceRef, searchQuery || initialQuestionText || question),
+    [evidenceRef, initialQuestionText, question, searchQuery]
+  )
   const resultCount = searchResult?.resultCount ?? searchResult?.items.length ?? 0
   const matchedCount = searchResult?.total ?? resultCount
   const displayedMatchedCount = Math.max(matchedCount, resultCount)
@@ -2036,6 +4404,14 @@ function CodeQaTab({
       ? toChunkEvidenceProfile(serverEvidenceProfile)
       : buildChunkEvidenceProfile(searchResult?.items || []),
     [searchResult?.items, serverEvidenceProfile]
+  )
+  const evidenceCombination = useMemo(
+    () => buildChunkEvidenceCombination(searchResult?.items || []),
+    [searchResult?.items]
+  )
+  const displayEvidenceRef = useMemo(
+    () => evidenceRef ? redactedEvidenceRefForOutput(evidenceRef) : null,
+    [evidenceRef]
   )
   const ragQuality = buildRagQualitySignal({
     retrievalMode,
@@ -2090,23 +4466,167 @@ function CodeQaTab({
     void runChunkSearch(prompt, true)
   }
 
-  const copyChunkCitation = async (chunk: CodeChunkSearchItem) => {
+  const openEvidenceBridgeScanReport = () => {
+    if (!evidenceBridgeScanTaskId) return
+    navigate(`/scan-tasks/${evidenceBridgeScanTaskId}`)
+  }
+
+  const refreshEvidenceBridgeSearch = () => {
+    const nextQuery = evidenceBridgeQuery.trim()
+    if (!nextQuery) {
+      message.warning('暂无可复用的证据检索上下文')
+      return
+    }
+    setSearchQuery(nextQuery)
+    void runChunkSearch(nextQuery, true)
+  }
+
+  const copyEvidenceBridgeReference = async () => {
+    if (!evidenceRef) return
+    const copyText = buildEvidenceBridgeCopyText(evidenceBridgeScanTaskId, evidenceRef)
     try {
-      const citation = [
-        `${chunk.filePath}:${chunk.startLine}-${chunk.endLine}`,
-        evidenceReason(chunk),
-        '',
-        chunk.contentPreview || chunk.content,
-      ].join('\n')
-      await navigator.clipboard.writeText(citation)
+      await copyTextToClipboard(copyText)
+      message.success('已复制证据引用')
+    } catch {
+      setManualCopyText({ title: '手动复制证据引用', text: copyText })
+      message.warning('浏览器阻止自动复制，请在弹窗中手动复制')
+    }
+  }
+
+  const setQaEvidenceUrlState = useCallback((nextQuestion: string, sourceScanTaskId?: number | null) => {
+    const nextParams = new URLSearchParams(qaSearchParams)
+    nextParams.set('tab', 'qa')
+    if (nextQuestion.trim()) {
+      nextParams.set('question', nextQuestion.trim())
+    } else {
+      nextParams.delete('question')
+    }
+    if (sourceScanTaskId) {
+      nextParams.set('scanTaskId', String(sourceScanTaskId))
+    } else {
+      nextParams.delete('scanTaskId')
+    }
+    setQaSearchParams(nextParams, { replace: true })
+  }, [qaSearchParams, setQaSearchParams])
+
+  const copyChunkCitation = async (chunk: CodeChunkSearchItem) => {
+    const citation = [
+      chunkLineReference(chunk),
+      evidenceReason(chunk),
+      '',
+      redactedChunkPreview(chunk),
+    ].join('\n')
+    try {
+      await copyTextToClipboard(citation)
       message.success('已复制代码证据引用')
     } catch {
-      message.error('复制失败')
+      setManualCopyText({ title: '手动复制代码证据引用', text: citation })
+      message.warning('浏览器阻止自动复制，请在弹窗中手动复制')
     }
+  }
+
+  const copyQaCitation = async (citation: CodeQaCitation) => {
+    const citationText = [
+      `${citation.sourceLabel || 'C?'} ${citationLineReference(citation)}`,
+      `scanTaskId: ${citation.scanTaskId ?? '-'}`,
+      redactSensitiveText(citationEvidenceReason(citation)),
+    ].join('\n')
+    try {
+      await copyTextToClipboard(citationText)
+      message.success('已复制回答引用')
+    } catch {
+      setManualCopyText({ title: '手动复制回答引用', text: citationText })
+      message.warning('浏览器阻止自动复制，请在弹窗中手动复制')
+    }
+  }
+
+  const qaCitationAutoRepairUrl = (
+    citation: CodeQaCitation,
+    question: string,
+    groundingStatus?: string,
+    citationEnforcementStatus?: string,
+    citationEnforcementReason?: string,
+    sourceEvidenceRef?: CodeQaEvidenceRef | null,
+    sourceEvidenceMatched?: boolean | null,
+    sourceEvidenceMatchType?: string | null,
+  ) => {
+    const citationScanTaskId = citation.scanTaskId || activeSourceScanTaskId
+    const sourceScan = citationScanTaskId ? scanTasks.find(scan => scan.id === citationScanTaskId) : null
+    const draftRepositoryId = sourceScan?.repositoryId || repositories[0]?.id
+    if (!citation.citedByAnswer || !citation.filePath || !citationScanTaskId || !draftRepositoryId) {
+      return ''
+    }
+    const params = new URLSearchParams()
+    params.set('projectId', String(projectId))
+    params.set('openCreate', '1')
+    params.set('repositoryId', String(draftRepositoryId))
+    params.set('scanTaskId', String(citationScanTaskId))
+    params.set('filePath', citation.filePath)
+    params.set('targetDesc', qaCitationRepairTargetDesc(citation, question))
+    params.set('source', 'Project QA verified citation')
+    params.set('sourceType', 'PROJECT_QA_VERIFIED_CITATION')
+    if (citation.citationId) params.set('citationId', citation.citationId)
+    if (citation.chunkId) params.set('chunkId', String(citation.chunkId))
+    if (citation.sourceLabel) params.set('sourceLabel', citation.sourceLabel)
+    if (citation.startLine) params.set('startLine', String(citation.startLine))
+    if (citation.endLine) params.set('endLine', String(citation.endLine))
+    params.set('citedByAnswer', String(Boolean(citation.citedByAnswer)))
+    if (groundingStatus) params.set('groundingStatus', groundingStatus)
+    if (citationEnforcementStatus) params.set('citationEnforcementStatus', citationEnforcementStatus)
+    if (citationEnforcementReason) params.set('citationEnforcementReason', citationEnforcementReason)
+    if (citation.evidenceType) params.set('evidenceType', citation.evidenceType)
+    if (citation.evidenceReason) params.set('evidenceReason', redactSensitiveText(citation.evidenceReason))
+    appendSourceEvidenceParams(params, sourceEvidenceRef, sourceEvidenceMatched, sourceEvidenceMatchType)
+    return `/auto-repairs?${params.toString()}`
+  }
+
+  const copyChunkDeepLink = async (chunk: CodeChunkSearchItem) => {
+    const link = buildChunkDeepLink(projectId, chunk)
+    try {
+      await copyTextToClipboard(link)
+      message.success('已复制证据深链')
+    } catch {
+      setManualCopyText({ title: '手动复制证据深链', text: link })
+      message.warning('浏览器阻止自动复制，请在弹窗中手动复制')
+    }
+  }
+
+  const locateChunkEvidence = (chunk: CodeChunkSearchItem) => {
+    const nextQuery = chunkLineReference(chunk)
+    setSearchQuery(nextQuery)
+    setQaEvidenceUrlState(nextQuery, chunk.scanTaskId || activeSourceScanTaskId)
+    void runChunkSearch(nextQuery)
+  }
+
+  const askAboutChunkEvidence = (chunk: CodeChunkSearchItem) => {
+    const nextQuestion = buildChunkFollowupQuestion(chunk)
+    setSearchQuery(nextQuestion)
+    setQaEvidenceUrlState(nextQuestion, chunk.scanTaskId || activeSourceScanTaskId)
+    void submitQuestion(nextQuestion)
+  }
+
+  const handoffChunkToAgent = (chunk: CodeChunkSearchItem, querySignal: CodeUnderstandingQuerySignal) => {
+    navigate(buildCodeUnderstandingAgentHandoffUrl(projectId, chunk, querySignal, activeSourceScanTaskId))
   }
 
   return (
     <div className="sl-qa-workbench">
+      <Modal
+        title={manualCopyText?.title || '手动复制'}
+        open={Boolean(manualCopyText)}
+        onCancel={() => setManualCopyText(null)}
+        footer={<ActionButton type="primary" onClick={() => setManualCopyText(null)} label="关闭" />}
+      >
+        <Typography.Paragraph type="secondary">
+          当前浏览器环境阻止自动写入剪贴板。
+        </Typography.Paragraph>
+        <Input.TextArea
+          value={manualCopyText?.text || ''}
+          readOnly
+          autoSize={{ minRows: 4, maxRows: 8 }}
+          onFocus={(event) => event.currentTarget.select()}
+        />
+      </Modal>
       <section className="sl-qa-workbench-head">
         <div className="sl-qa-workbench-copy">
           <div className="sl-kicker">Code Intelligence Workbench</div>
@@ -2127,15 +4647,58 @@ function CodeQaTab({
           className="sl-section-card sl-qa-panel"
           title={<span className="sl-card-title"><SendOutlined /> RAG 对话</span>}
           extra={
-            <Button icon={<ReloadOutlined />} size="small" onClick={() => setMessages([{ role: 'assistant', content: '对话已重置。请问有什么关于本项目代码的问题需要解答？' }])}>
-              清空历史
-            </Button>
+            <ActionButton icon={<ReloadOutlined />} size="small" onClick={() => setMessages([{ role: 'assistant', content: '对话已重置。请问有什么关于本项目代码的问题需要解答？' }])} label="清空历史" />
           }
         >
           <div className="sl-qa-subhead">
-            <Typography.Text type="secondary">最新成功扫描</Typography.Text>
+            <Typography.Text type="secondary">证据扫描</Typography.Text>
             {activeSourceScanTaskId ? <Tag color="blue">#{activeSourceScanTaskId}</Tag> : <Tag>等待提问</Tag>}
           </div>
+          {displayEvidenceRef && (
+            <div className="sl-qa-evidence-ref" aria-label="报告证据上下文">
+              <div className="sl-qa-evidence-ref-head">
+                <div>
+                  <span>报告证据来源桥</span>
+                  <strong>{displayEvidenceRef.title || displayEvidenceRef.filePath || displayEvidenceRef.source || '证据引用'}</strong>
+                </div>
+                {evidenceBridgeScanTaskId ? <Tag color="blue">Scan #{evidenceBridgeScanTaskId}</Tag> : <Tag>Scan -</Tag>}
+              </div>
+              {displayEvidenceRef.summary && (
+                <Typography.Paragraph className="sl-qa-evidence-ref-summary">
+                  {displayEvidenceRef.summary}
+                </Typography.Paragraph>
+              )}
+              <Space className="sl-qa-evidence-ref-tags" wrap size={[6, 6]}>
+                {displayEvidenceRef.category && <Tag>{displayEvidenceRef.category}</Tag>}
+                {displayEvidenceRef.source && <Tag>{displayEvidenceRef.source}</Tag>}
+                {displayEvidenceRef.filePath && <Tag color="blue" className="sl-qa-evidence-ref-long-tag">{displayEvidenceRef.filePath}</Tag>}
+                {evidenceRefLineInfo.label && <Tag>{evidenceRefLineInfo.tagLabel}</Tag>}
+              </Space>
+              <Space className="sl-qa-evidence-ref-actions" wrap size={[6, 6]}>
+                <ActionButton
+                  size="small"
+                  icon={<FileTextOutlined />}
+                  onClick={openEvidenceBridgeScanReport}
+                  disabled={!evidenceBridgeScanTaskId}
+                  label="回到扫描报告"
+                />
+                <ActionButton
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  loading={searchLoading}
+                  onClick={refreshEvidenceBridgeSearch}
+                  disabled={!evidenceBridgeQuery || searchLoading}
+                  label="重新检索证据"
+                />
+                <ActionButton
+                  size="small"
+                  icon={<CopyOutlined />}
+                  onClick={() => void copyEvidenceBridgeReference()}
+                  label="复制证据引用"
+                />
+              </Space>
+            </div>
+          )}
 
           <div className={`sl-qa-playbook sl-qa-playbook-${playbookTone}`}>
             <div className="sl-qa-playbook-head">
@@ -2171,6 +4734,26 @@ function CodeQaTab({
           <div className="sl-chat-thread">
             {messages.map((msg, index) => {
               const isUser = msg.role === 'user'
+              const lowConfidenceGrounding = !isUser && isLowConfidenceGrounding(msg.groundingStatus)
+              const noEvidenceGrounding = msg.groundingStatus === 'NO_EVIDENCE'
+              const readableEvidence = !isUser ? buildQaReadableEvidenceViewModel(msg) : null
+              const repairEvidenceGate = readableEvidence?.repairEvidenceGate || null
+              const citationAudit = readableEvidence?.citationAudit || null
+              const claimAudit = readableEvidence?.claimAudit || null
+              const trustSummary = readableEvidence?.trustSummary || null
+              const supplementalChunks = !isUser ? supplementalQaChunks(msg) : []
+              const duplicateChunkCount = !isUser ? Math.max(0, (msg.chunks?.length || 0) - supplementalChunks.length) : 0
+              const previousUserQuestion = messages.slice(0, index).reverse().find(item => item.role === 'user')?.content || ''
+              const primaryRepairCitation = !isUser
+                ? msg.answerCitations?.find(citation => citation.citedByAnswer && citation.filePath)
+                : undefined
+              const primaryAutoRepairUrl = primaryRepairCitation
+                && msg.groundingStatus === 'VERIFIED'
+                && !lowConfidenceGrounding
+                && repairEvidenceGate?.status === 'READY'
+                && trustSummary?.tone === 'ready'
+                ? qaCitationAutoRepairUrl(primaryRepairCitation, previousUserQuestion, msg.groundingStatus || undefined, msg.citationEnforcementStatus || undefined, msg.citationEnforcementReason || undefined, msg.sourceEvidenceRef, msg.sourceEvidenceMatched, msg.sourceEvidenceMatchType)
+                : ''
               return (
                 <div key={index} className={`sl-chat-row ${isUser ? 'sl-chat-row-user' : 'sl-chat-row-assistant'}`}>
                   <div className={`sl-chat-bubble ${isUser ? 'sl-chat-bubble-user' : 'sl-chat-bubble-assistant'}`}>
@@ -2182,22 +4765,235 @@ function CodeQaTab({
                         </small>
                       )}
                     </div>
-                    <div className="sl-chat-content">{msg.content}</div>
+                    {!isUser && msg.groundingStatus && (
+                      <div className="sl-answer-grounding">
+                        <Tag color={groundingStatusColor(msg.groundingStatus)}>{groundingStatusLabel(msg.groundingStatus)}</Tag>
+                        {msg.citationEnforcementStatus && (
+                          <Tag color={citationEnforcementColor(msg.citationEnforcementStatus)}>
+                            {citationEnforcementLabel(msg.citationEnforcementStatus)}
+                          </Tag>
+                        )}
+                        {msg.citationEnforcementReason && (
+                          <Tag color={citationEnforcementReasonColor(msg.citationEnforcementReason)}>
+                            原因码 {msg.citationEnforcementReason}
+                          </Tag>
+                        )}
+                        {msg.citationCoverage && (
+                          <>
+                            <Tag color={citationCoverageColor(msg.citationCoverage)}>
+                              {citationCoverageLabel(msg.citationCoverage)}
+                            </Tag>
+                            <Tag color={msg.citationCoverage.repairCandidateCount ? 'green' : 'default'}>
+                              {citationRepairCandidateLabel(msg.citationCoverage)}
+                            </Tag>
+                          </>
+                        )}
+                        {msg.scanTaskId && <Tag color="blue">Scan #{msg.scanTaskId}</Tag>}
+                      </div>
+                    )}
+                    <div className="sl-chat-content">{redactSensitiveText(msg.content)}</div>
+                    {readableEvidence && (
+                      <QaReadableEvidenceSection
+                        evidence={readableEvidence}
+                        previousUserQuestion={previousUserQuestion}
+                        primaryRepairUrl={primaryAutoRepairUrl}
+                        primaryCitation={primaryRepairCitation}
+                        loading={loading}
+                        hasSourceScan={Boolean(activeSourceScanTaskId)}
+                        onRetryQuestion={(nextQuestion) => void submitQuestion(nextQuestion)}
+                        onPrepareQuestion={(nextQuestion) => {
+                          setQuestion(nextQuestion)
+                          setSearchQuery(nextQuestion)
+                        }}
+                        onRefreshEvidence={(nextQuestion) => void runChunkSearch(nextQuestion, true)}
+                        onCopyCitation={(citation) => void copyQaCitation(citation)}
+                        onOpenRepair={(nextUrl) => navigate(nextUrl)}
+                      />
+                    )}
+                    <QaDetailedEvidenceAuditSection
+                      citationAudit={citationAudit}
+                      claimAudit={claimAudit}
+                      repairEvidenceGate={repairEvidenceGate}
+                    />
+                    {lowConfidenceGrounding && (
+                      <Alert
+                        type={noEvidenceGrounding ? 'error' : 'warning'}
+                        showIcon
+                        aria-label="QA 低置信度证据状态"
+                        message={qaEvidenceReviewTitle(msg.groundingStatus)}
+                        description={
+                          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                            <Typography.Text>{qaEvidenceReviewDescription(msg)}</Typography.Text>
+                            {msg.citationEnforcementNote && (
+                              <Typography.Text type="secondary">{msg.citationEnforcementNote}</Typography.Text>
+                            )}
+                            <Space wrap size={[6, 6]}>
+                              <Tag color="gold">低置信度</Tag>
+                              {noEvidenceGrounding ? <Tag color="red">无证据</Tag> : <Tag color="orange">候选证据需复核</Tag>}
+                              {msg.citationEnforcementReason && (
+                                <Tag color={citationEnforcementReasonColor(msg.citationEnforcementReason)}>
+                                  引用原因：{citationEnforcementReasonLabel(msg.citationEnforcementReason)}
+                                </Tag>
+                              )}
+                              <Tag>下一步：重试此问题</Tag>
+                              <Tag>换问题</Tag>
+                              <Tag>重新检索证据</Tag>
+                            </Space>
+                            <Space wrap size={[6, 6]}>
+                              <ActionButton
+                                size="small"
+                                icon={<ReloadOutlined />}
+                                onClick={() => previousUserQuestion && void submitQuestion(previousUserQuestion)}
+                                disabled={!previousUserQuestion || loading}
+                                label="重试此问题"
+                              />
+                              <ActionButton
+                                size="small"
+                                icon={<SearchOutlined />}
+                                onClick={() => {
+                                  setQuestion(previousUserQuestion)
+                                  setSearchQuery(previousUserQuestion)
+                                }}
+                                disabled={!previousUserQuestion}
+                                label="换问题"
+                              />
+                              <ActionButton
+                                size="small"
+                                icon={<ReloadOutlined />}
+                                onClick={() => activeSourceScanTaskId && void runChunkSearch(previousUserQuestion || searchQuery, true)}
+                                disabled={!activeSourceScanTaskId || loading}
+                                label="重新检索证据"
+                              />
+                            </Space>
+                          </Space>
+                        }
+                      />
+                    )}
+                    {!isUser && msg.answerCitations && msg.answerCitations.length > 0 && (
+                      <div className="sl-answer-citations" aria-label="回答引用证据">
+                        <Typography.Text type="secondary" className="sl-evidence-title">{lowConfidenceGrounding ? '候选证据 / 引用复核' : '回答引用'}</Typography.Text>
+                        <div className="sl-answer-citation-list">
+                          {msg.answerCitations.map((citation, citationIndex) => {
+                            const autoRepairUrl = msg.groundingStatus === 'VERIFIED' && !lowConfidenceGrounding && repairEvidenceGate?.status === 'READY' && trustSummary?.tone === 'ready'
+                              ? qaCitationAutoRepairUrl(citation, previousUserQuestion, msg.groundingStatus || undefined, msg.citationEnforcementStatus || undefined, msg.citationEnforcementReason || undefined, msg.sourceEvidenceRef, msg.sourceEvidenceMatched, msg.sourceEvidenceMatchType)
+                              : ''
+                            const citationSourceLabel = citation.sourceLabel || `C${citationIndex + 1}`
+                            const citationRef = citationLineReference(citation)
+                            return (
+                              <article
+                                className={`sl-answer-citation-card ${citation.citedByAnswer ? 'sl-answer-citation-card-cited' : 'sl-answer-citation-card-uncited'}`}
+                                key={`${citation.sourceLabel || 'citation'}-${citation.chunkId || citationIndex}`}
+                                aria-label={`引用证据卡片 ${citationSourceLabel}`}
+                              >
+                                <div className="sl-answer-citation-head">
+                                  <span className="sl-answer-citation-source">{citationSourceLabel}</span>
+                                  <strong className="sl-answer-citation-line" title={citationRef}>{citationRef}</strong>
+                                </div>
+                                <div className="sl-answer-citation-tags">
+                                  {citation.scanTaskId && <Tag color="blue">Scan #{citation.scanTaskId}</Tag>}
+                                  <Tag color={citation.citedByAnswer ? 'green' : 'default'}>{citation.citedByAnswer ? '回答已引用' : '候选证据'}</Tag>
+                                  {citation.contextRole && <Tag>{citation.contextRole === 'ADJACENT_CONTEXT' ? '相邻上下文' : '主证据'}</Tag>}
+                                  {citation.evidenceType && <Tag>{citation.evidenceType}</Tag>}
+                                  {typeof citation.relevanceScore === 'number' && <Tag>相关分 {citation.relevanceScore}</Tag>}
+                                </div>
+                                <div className="sl-answer-citation-reason">
+                                  <span>证据说明</span>
+                                  <p>{redactSensitiveText(citationEvidenceReason(citation))}</p>
+                                </div>
+                                <Space wrap size={[6, 6]}>
+                                  <ActionButton
+                                    className="sl-answer-citation-action"
+                                    size="small"
+                                    type="link"
+                                    icon={<LinkOutlined />}
+                                    onClick={() => copyQaCitation(citation)}
+                                    label="复制引用"
+                                  />
+                                  {autoRepairUrl && (
+                                    <ActionButton
+                                      className="sl-answer-citation-action"
+                                      size="small"
+                                      icon={<BranchesOutlined />}
+                                      data-sl-target-url={autoRepairUrl}
+                                      onClick={() => navigate(autoRepairUrl)}
+                                      label="生成修复候选"
+                                    />
+                                  )}
+                                </Space>
+                              </article>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
                     {!isUser && msg.chunks && msg.chunks.length > 0 && (
                       <div className="sl-evidence-block">
-                        <Typography.Text type="secondary" className="sl-evidence-title">引用依据</Typography.Text>
-                        <div className="sl-evidence-tags">
-                          <Space size={[6, 6]} wrap>
-                            {msg.chunks.map((chunk, chunkIndex) => (
-                              <span className="sl-evidence-chip" title={evidenceReason(chunk)} key={`${chunk.id}-${chunkIndex}`}>
-                                <Tag color={contextRoleColor(chunk)}>{contextRoleLabel(chunk)}</Tag>
-                                <Tag color={evidenceColor(chunk.evidenceType)}>{evidenceLabel(chunk.evidenceType)}</Tag>
-                                <Tag color="blue">Score {chunk.relevanceScore ?? 0}</Tag>
-                                <span>[C{chunkIndex + 1}] {compactPath(chunk.filePath)}:{chunk.startLine}-{chunk.endLine}</span>
-                              </span>
-                            ))}
-                          </Space>
-                        </div>
+                        <Typography.Text type="secondary" className="sl-evidence-title">
+                          {lowConfidenceGrounding ? '候选代码切片' : `补充 code_chunks ${supplementalChunks.length} 条`}
+                        </Typography.Text>
+                        {duplicateChunkCount > 0 && (
+                          <div className="sl-evidence-dedupe-note" aria-label="回答证据去重说明">
+                            已引用证据 {duplicateChunkCount} 条不再重复展示为代码切片卡片。
+                          </div>
+                        )}
+                        {supplementalChunks.length > 0 && (
+                          <div className="sl-evidence-tags">
+                            <div className="sl-evidence-chip-list">
+                              {supplementalChunks.map((chunk, chunkIndex) => {
+                              const chunkSourceLabel = chunk.sourceLabel || `C${chunkIndex + 1}`
+                              const chunkRef = chunkLineReference(chunk)
+                              return (
+                                <article className="sl-evidence-chip" title={evidenceReason(chunk)} key={`${chunk.id}-${chunkIndex}`} aria-label={`代码切片证据 ${chunkSourceLabel}`}>
+                                  <div className="sl-evidence-chip-head">
+                                    <strong>{chunkSourceLabel}</strong>
+                                    <span className="sl-evidence-chip-ref" title={chunkRef}>{chunkRef}</span>
+                                  </div>
+                                  <div className="sl-evidence-chip-badges">
+                                    {chunk.scanTaskId && <Tag color="blue">Scan #{chunk.scanTaskId}</Tag>}
+                                    <Tag color={contextRoleColor(chunk)}>{contextRoleLabel(chunk)}</Tag>
+                                    <Tag color={evidenceColor(chunk.evidenceType)}>{evidenceLabel(chunk.evidenceType)}</Tag>
+                                    <Tag color="blue">Score {chunk.relevanceScore ?? 0}</Tag>
+                                    <Tag color={chunk.hasEmbedding ? 'green' : 'default'}>{chunk.hasEmbedding ? '已向量化' : '未向量化'}</Tag>
+                                  </div>
+                                  <p className="sl-evidence-chip-reason">{evidenceReason(chunk)}</p>
+                                  <div className="sl-evidence-chip-actions">
+                                    <ActionButton
+                                      className="sl-evidence-chip-action"
+                                      size="small"
+                                      type="link"
+                                      onClick={() => locateChunkEvidence(chunk)}
+                                      label="定位"
+                                    />
+                                    <ActionButton
+                                      className="sl-evidence-chip-action"
+                                      size="small"
+                                      type="link"
+                                      onClick={() => askAboutChunkEvidence(chunk)}
+                                      disabled={loading}
+                                      label="追问"
+                                    />
+                                    <ActionButton
+                                      className="sl-evidence-chip-action"
+                                      size="small"
+                                      type="link"
+                                      onClick={() => copyChunkCitation(chunk)}
+                                      label="复制引用"
+                                    />
+                                    <ActionButton
+                                      className="sl-evidence-chip-action"
+                                      size="small"
+                                      type="link"
+                                      icon={<LinkOutlined />}
+                                      onClick={() => copyChunkDeepLink(chunk)}
+                                      label="链接"
+                                    />
+                                  </div>
+                                </article>
+                              )
+                              })}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -2208,7 +5004,7 @@ function CodeQaTab({
               <div className="sl-chat-row sl-chat-row-assistant">
                 <div className="sl-chat-bubble sl-chat-bubble-assistant">
                   <Space size={8}>
-                    <Spin size="small" />
+                    <ReloadOutlined spin />
                     <span>正在检索代码库并生成解答...</span>
                   </Space>
                 </div>
@@ -2216,18 +5012,44 @@ function CodeQaTab({
             )}
           </div>
 
+          {qaRequestError && (
+            <StateBlock
+              compact
+              tone="error"
+              title="代码问答请求失败"
+              description={qaRequestError.message}
+              action={
+                <Space wrap size={[6, 6]}>
+                  <ActionButton
+                    size="small"
+                    icon={<ReloadOutlined />}
+                    onClick={() => void submitQuestion(qaRequestError.question)}
+                    disabled={loading}
+                    label="重试此问题"
+                  />
+                  <ActionButton
+                    size="small"
+                    onClick={() => {
+                      setQuestion(qaRequestError.question)
+                      setSearchQuery(qaRequestError.question)
+                    }}
+                    label="恢复到输入框"
+                  />
+                </Space>
+              }
+            />
+          )}
+
           <div className="sl-qa-composer">
             <Input
-              placeholder="请输入您对本项目代码的提问"
+              placeholder="输入问题，或粘贴 AuthService.java:85、Class#method、at fetchUser (.../auth-store.ts:85:13)"
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               onPressEnter={handleSend}
               disabled={loading}
               size="large"
             />
-            <Button type="primary" icon={<SendOutlined />} onClick={handleSend} loading={loading} size="large">
-              发送
-            </Button>
+            <ActionButton type="primary" icon={<SendOutlined />} onClick={handleSend} loading={loading} disabled={!question.trim() || loading} size="large" label="发送" />
           </div>
         </Card>
 
@@ -2237,19 +5059,40 @@ function CodeQaTab({
         >
           <Space.Compact style={{ width: '100%', marginBottom: 14 }}>
             <Input
-              placeholder="搜索类名、函数名、路径或关键词"
+              placeholder="搜索类名、函数名、路径、file:line 或浏览器 stack trace"
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.target.value)}
               onPressEnter={() => runChunkSearch()}
             />
-            <Button icon={<SearchOutlined />} loading={searchLoading} onClick={() => runChunkSearch()}>
-              检索
-            </Button>
+            <ActionButton icon={<SearchOutlined />} loading={searchLoading} onClick={() => runChunkSearch()} label="检索" />
           </Space.Compact>
-          {searchError && (
-            <div className="sl-search-error" aria-live="polite">
-              <Typography.Text type="danger">{searchError}</Typography.Text>
-            </div>
+          <CodeUnderstandingLensPanel
+            query={searchQuery}
+            result={searchResult}
+            activeSourceScanTaskId={activeSourceScanTaskId}
+            retrievalMode={retrievalMode}
+            loading={loading || searchLoading}
+            onLocate={locateChunkEvidence}
+            onAsk={askAboutChunkEvidence}
+            onAgentHandoff={handoffChunkToAgent}
+            onCopy={(chunk) => void copyChunkCitation(chunk)}
+          />
+          {searchError && searchResult && (
+            <StateBlock
+              compact
+              tone="error"
+              title="证据检索刷新失败，已保留上次成功结果"
+              description={searchError}
+              action={
+                <ActionButton
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  loading={searchLoading}
+                  onClick={() => runChunkSearch(searchFailedQuery || searchQuery)}
+                  label="重新检索证据"
+                />
+              }
+            />
           )}
           {!searchResult && knowledgeError && (
             <div className="sl-search-error" aria-live="polite">
@@ -2259,9 +5102,25 @@ function CodeQaTab({
 
           <div className="sl-chunk-results">
             {searchLoading ? (
-              <div style={{ padding: 40, textAlign: 'center' }}><Spin /></div>
+              <StateBlock compact tone="loading" title="正在检索代码切片" description="系统正在按关键词、路径和证据质量排序 code_chunks。" />
+            ) : searchError && !searchResult ? (
+              <StateBlock
+                compact
+                tone="error"
+                title="证据检索失败"
+                description={searchError}
+                action={
+                  <ActionButton
+                    size="small"
+                    icon={<ReloadOutlined />}
+                    loading={searchLoading}
+                    onClick={() => runChunkSearch(searchFailedQuery || searchQuery)}
+                    label="重新检索证据"
+                  />
+                }
+              />
             ) : !searchResult ? (
-              <Empty description="输入关键词后查看最新扫描生成的 code_chunks" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              <StateBlock compact title="输入关键词开始检索" description="可以搜索类名、函数名、文件路径或报告证据引用。" />
             ) : (
               <Space direction="vertical" size={12} style={{ width: '100%' }}>
                 <div className="sl-search-summary">
@@ -2293,56 +5152,231 @@ function CodeQaTab({
                   <div className="sl-rag-quality-next">{ragQuality.nextAction}</div>
                 </div>
                 <ChunkEvidenceProfileCard profile={evidenceProfile} totalResults={searchResult.items.length} />
+                {evidenceCombination && <ChunkEvidenceCombinationCard combination={evidenceCombination} />}
                 {searchResult.items.length === 0 ? (
-                  <Empty description={searchResult.scanTaskId ? '没有匹配的代码切片' : '暂无成功扫描，无法检索代码切片'} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                  <StateBlock
+                    compact
+                    title={searchResult.scanTaskId ? '没有匹配的代码切片' : '暂无成功扫描'}
+                    description={searchResult.scanTaskId ? '请换用更具体的类名、方法名或文件路径重新检索。' : '成功扫描完成后才能检索 code_chunks。'}
+                  />
                 ) : (
-                  searchResult.items.map((item) => (
-                    <div key={item.id} className="sl-search-result-card">
-                      <div className="sl-search-result-head">
-                        <div className="sl-search-result-title">
-                          <Typography.Text strong ellipsis style={{ maxWidth: 320 }} title={item.filePath}>
-                            {item.filePath}
-                          </Typography.Text>
-                          <span>{compactPath(item.filePath)}:{item.startLine}-{item.endLine}</span>
+                  searchResult.items.map((item, itemIndex) => {
+                    const itemSourceLabel = item.sourceLabel || `C${itemIndex + 1}`
+                    const lineRange = `${item.startLine}-${item.endLine}`
+                    const itemLineRef = `${item.filePath}:${lineRange}`
+                    const matchedTerms = (item.matchedTerms || []).filter(Boolean)
+                    const adoptionSignal = chunkAdoptionSignal(item)
+                    const displayPreview = redactedChunkPreview(item)
+                    return (
+                      <article key={item.id} className="sl-search-result-card" aria-label={`code_chunks 证据卡片 ${itemSourceLabel}`}>
+                        <div className="sl-search-result-head">
+                          <div className="sl-search-result-title">
+                            <span className="sl-search-result-source">{itemSourceLabel}</span>
+                            <div className="sl-search-result-primary">
+                              <strong className="sl-search-result-path" title={item.filePath}>{item.filePath}</strong>
+                              <span className="sl-search-result-line-ref" title={itemLineRef}>{itemLineRef}</span>
+                            </div>
+                          </div>
+                          <div className="sl-search-result-badges">
+                            <Tag color={contextRoleColor(item)}>{contextRoleLabel(item)}</Tag>
+                            <Tag color={evidenceColor(item.evidenceType)}>{evidenceLabel(item.evidenceType)}</Tag>
+                            <Tag color={(item.relevanceScore ?? 0) >= 80 ? 'green' : (item.relevanceScore ?? 0) >= 45 ? 'gold' : 'default'}>
+                              相关分 {item.relevanceScore ?? 0}
+                            </Tag>
+                            <Tag color={item.hasEmbedding ? 'green' : 'default'}>
+                              {item.hasEmbedding ? '已向量化' : '未向量化'}
+                            </Tag>
+                          </div>
                         </div>
-                        <Space size={[6, 6]} wrap className="sl-search-result-badges">
-                          <Tag color={contextRoleColor(item)}>{contextRoleLabel(item)}</Tag>
-                          <Tag color={evidenceColor(item.evidenceType)}>{evidenceLabel(item.evidenceType)}</Tag>
-                          <Tag color={(item.relevanceScore ?? 0) >= 80 ? 'green' : (item.relevanceScore ?? 0) >= 45 ? 'gold' : 'default'}>
-                            Score {item.relevanceScore ?? 0}
-                          </Tag>
-                          <Tag color={item.hasEmbedding ? 'green' : 'default'}>
-                            {item.hasEmbedding ? '已向量化' : '未向量化'}
-                          </Tag>
-                        </Space>
-                      </div>
-                      <div className={`sl-search-adoption sl-search-adoption-${chunkAdoptionSignal(item).tone}`}>
-                        <CheckCircleOutlined />
-                        <span>{chunkAdoptionSignal(item).text}</span>
-                      </div>
-                      <div className="sl-search-evidence-reason">{evidenceReason(item)}</div>
-                      <Space wrap size={[6, 6]} className="sl-search-tags">
-                        <Tag>Lines {item.startLine}-{item.endLine}</Tag>
-                        {item.matchedTerms.map(term => <Tag color="gold" key={`${item.id}-${term}`}>{term}</Tag>)}
-                        <Button size="small" onClick={() => copyChunkCitation(item)}>复制引用</Button>
-                      </Space>
-                      <div className="sl-search-result-meta-grid">
-                        <div><span>文件</span><strong>{compactPath(item.filePath)}</strong></div>
-                        <div><span>跨度</span><strong>{Math.max(item.endLine - item.startLine + 1, 1)} 行</strong></div>
-                        <div><span>上下文角色</span><strong>{contextRoleLabel(item)}</strong></div>
-                        <div><span>向量</span><strong>{item.hasEmbedding ? '可语义召回' : '关键词召回'}</strong></div>
-                      </div>
-                      <pre className="sl-code-block" style={{ maxHeight: 220, fontSize: 12 }}>
-                        {item.contentPreview || item.content}
-                      </pre>
-                    </div>
-                  ))
+                        <div className={`sl-search-adoption sl-search-adoption-${adoptionSignal.tone}`}>
+                          <CheckCircleOutlined />
+                          <span>{adoptionSignal.text}</span>
+                        </div>
+                        <div className="sl-search-evidence-reason">
+                          <span>证据说明</span>
+                          <p>{evidenceReason(item)}</p>
+                        </div>
+                        <div className="sl-search-matched-terms">
+                          <span>命中词</span>
+                          <div>
+                            {matchedTerms.length > 0
+                              ? matchedTerms.map(term => <Tag color="gold" key={`${item.id}-${term}`}>{term}</Tag>)
+                              : <Tag>无显式关键词命中</Tag>}
+                          </div>
+                        </div>
+                        <div className="sl-search-actions">
+                          <ActionButton size="small" icon={<SearchOutlined />} onClick={() => locateChunkEvidence(item)} label="定位检索" />
+                          <ActionButton size="small" type="primary" icon={<SendOutlined />} onClick={() => askAboutChunkEvidence(item)} disabled={loading} label="追问此处" />
+                          <ActionButton size="small" onClick={() => copyChunkCitation(item)} label="复制引用" />
+                          <ActionButton size="small" icon={<LinkOutlined />} onClick={() => copyChunkDeepLink(item)} label="复制链接" />
+                        </div>
+                        <div className="sl-search-result-meta-grid">
+                          <div><span>证据编号</span><strong>{itemSourceLabel}</strong></div>
+                          <div><span>文件路径</span><strong title={item.filePath}>{item.filePath}</strong></div>
+                          <div><span>行号范围</span><strong>第 {lineRange} 行</strong></div>
+                          <div><span>证据角色</span><strong>{contextRoleLabel(item)}</strong></div>
+                          <div><span>证据类型</span><strong>{evidenceLabel(item.evidenceType)}</strong></div>
+                          <div><span>相关分</span><strong>{item.relevanceScore ?? 0}</strong></div>
+                          <div><span>召回方式</span><strong>{item.hasEmbedding ? '可语义召回' : '关键词召回'}</strong></div>
+                        </div>
+                        <pre className="sl-code-block sl-search-code-preview sl-search-code-preview-redacted" aria-label="脱敏 code chunk 搜索结果预览">
+                          {displayPreview}
+                        </pre>
+                      </article>
+                    )
+                  })
                 )}
               </Space>
             )}
           </div>
         </Card>
       </div>
+    </div>
+  )
+}
+
+function CodeUnderstandingLensPanel({
+  query,
+  result,
+  activeSourceScanTaskId,
+  retrievalMode,
+  loading,
+  onLocate,
+  onAsk,
+  onCopy,
+  onAgentHandoff,
+}: {
+  query: string
+  result: CodeChunkSearchResponse | null
+  activeSourceScanTaskId?: number | null
+  retrievalMode?: string | null
+  loading: boolean
+  onLocate: (chunk: CodeChunkSearchItem) => void
+  onAsk: (chunk: CodeChunkSearchItem) => void
+  onCopy: (chunk: CodeChunkSearchItem) => void
+  onAgentHandoff: (chunk: CodeChunkSearchItem, querySignal: CodeUnderstandingQuerySignal) => void
+}) {
+  const querySignal = classifyCodeUnderstandingQuery(query)
+  const primaryChunk = result?.items.find(item => !isContextChunk(item)) || result?.items[0]
+  const sourceLabel = primaryChunk?.sourceLabel || (primaryChunk ? 'C1' : '-')
+  const readiness = result?.evidenceProfile?.readiness || (primaryChunk ? 'RESULT' : 'WAITING')
+  const resultRetrievalMode = result?.retrievalMode || retrievalMode || '-'
+  const sameScan = Boolean(primaryChunk?.scanTaskId && activeSourceScanTaskId && primaryChunk.scanTaskId === activeSourceScanTaskId)
+  const primaryRole = Boolean(primaryChunk && !isContextChunk(primaryChunk))
+  const readyForExplanation = Boolean(primaryChunk && sameScan && primaryRole && !loading)
+  const tone: QaSignalTone = primaryChunk && sameScan && primaryRole
+    ? 'ready'
+    : primaryChunk
+      ? 'warning'
+      : querySignal.kind === 'IDLE'
+        ? 'idle'
+        : 'warning'
+  const title = primaryChunk
+    ? `${querySignal.title}：${sourceLabel}`
+    : querySignal.title
+  const summary = primaryChunk
+    ? `已从当前检索结果选出 ${sourceLabel} 作为阅读入口，先确认文件行号、证据角色和召回状态，再决定是否进入解释。`
+    : querySignal.hint
+  const location = primaryChunk ? chunkLineReference(primaryChunk) : '等待检索结果'
+  const actionDisabled = !primaryChunk || loading
+  const explainDisabledReason = !primaryChunk
+    ? '等待主证据后可解释'
+    : !sameScan
+      ? '请先重新定位当前扫描证据'
+      : !primaryRole
+        ? '上下文线索不能直接交接'
+        : loading
+          ? '检索刷新中'
+          : undefined
+
+  return (
+    <section className={`sl-code-understanding-lens sl-code-understanding-lens-${tone}`} aria-label="代码理解定位入口">
+      <div className="sl-code-understanding-lens-head">
+        <div>
+          <span>代码理解入口</span>
+          <strong>{title}</strong>
+        </div>
+        <Tag color={tone === 'ready' ? 'green' : tone === 'warning' ? 'gold' : 'default'}>{querySignal.label}</Tag>
+      </div>
+      <p>{summary}</p>
+      <div className="sl-code-understanding-lens-grid">
+        <div><span>当前扫描</span><strong>{activeSourceScanTaskId ? `Scan #${activeSourceScanTaskId}` : '-'}</strong></div>
+        <div><span>主证据位置</span><strong title={location}>{location}</strong></div>
+        <div><span>证据编号</span><strong>{sourceLabel}</strong></div>
+        <div><span>证据角色</span><strong>{primaryChunk ? contextRoleLabel(primaryChunk) : '-'}</strong></div>
+        <div><span>证据类型</span><strong>{primaryChunk ? evidenceLabel(primaryChunk.evidenceType) : '-'}</strong></div>
+        <div><span>相关分</span><strong>{primaryChunk?.relevanceScore ?? '-'}</strong></div>
+        <div><span>召回模式</span><strong>{resultRetrievalMode === '-' ? '-' : retrievalModeLabel(resultRetrievalMode)}</strong></div>
+        <div><span>Readiness</span><strong>{readiness}</strong></div>
+      </div>
+      <div className="sl-code-understanding-lens-checks">
+        <Tag color={sameScan ? 'green' : primaryChunk ? 'gold' : 'default'}>{sameScan ? '当前扫描已绑定' : primaryChunk ? '扫描需复核' : '等待扫描证据'}</Tag>
+        <Tag color={primaryRole ? 'green' : primaryChunk ? 'gold' : 'default'}>{primaryRole ? 'PRIMARY 主证据' : primaryChunk ? '上下文线索' : '等待主证据'}</Tag>
+        <Tag color={primaryChunk?.hasEmbedding ? 'green' : 'default'}>{primaryChunk?.hasEmbedding ? '含向量证据' : '关键词/结构证据'}</Tag>
+        <Tag color={readyForExplanation ? 'green' : primaryChunk ? 'gold' : 'default'}>{readyForExplanation ? '可交给 Agent' : explainDisabledReason}</Tag>
+      </div>
+      <div
+        className={`sl-code-understanding-lens-gate ${readyForExplanation ? 'sl-code-understanding-lens-gate-ready' : 'sl-code-understanding-lens-gate-blocked'}`}
+        role="note"
+        aria-label="Agent 交接门禁说明"
+      >
+        <span>{readyForExplanation ? 'Agent 交接门禁已开放' : 'Agent 交接门禁未开放'}</span>
+        <strong>{readyForExplanation ? '当前扫描、PRIMARY 主证据和检索状态均满足交接条件。' : explainDisabledReason}</strong>
+      </div>
+      <div className="sl-code-understanding-lens-contract" aria-label="Agent 交接合约">
+        <div>
+          <span>交接字段</span>
+          <strong>扫描 / 文件 / 行号 / 证据角色</strong>
+        </div>
+        <div>
+          <span>不会携带</span>
+          <strong>源码正文 / raw prompt / stack</strong>
+        </div>
+        <div>
+          <span>执行方式</span>
+          <strong>进入 AgentChat 后手动发送</strong>
+        </div>
+      </div>
+      <div className="sl-code-understanding-lens-actions">
+        <ActionButton size="small" icon={<SearchOutlined />} disabled={actionDisabled} onClick={() => primaryChunk && onLocate(primaryChunk)} label="定位检索" />
+        <ActionButton size="small" type="primary" icon={<SendOutlined />} disabled={!readyForExplanation} title={explainDisabledReason} onClick={() => primaryChunk && readyForExplanation && onAsk(primaryChunk)} label="解释此处" />
+        <ActionButton size="small" icon={<RobotOutlined />} disabled={!readyForExplanation} title={explainDisabledReason} onClick={() => primaryChunk && readyForExplanation && onAgentHandoff(primaryChunk, querySignal)} label="交给 Agent" />
+        <ActionButton size="small" icon={<CopyOutlined />} disabled={!primaryChunk} onClick={() => primaryChunk && onCopy(primaryChunk)} label="复制引用" />
+      </div>
+    </section>
+  )
+}
+
+function ChunkEvidenceCombinationCard({ combination }: { combination: ChunkEvidenceCombination }) {
+  return (
+    <div className={`sl-qa-evidence-combination sl-qa-evidence-combination-${combination.tone}`} aria-label="证据组合路径">
+      <div className="sl-qa-evidence-combination-head">
+        <div>
+          <span>证据组合路径</span>
+          <strong>{combination.label}</strong>
+        </div>
+        <Tag color={combination.tone === 'ready' ? 'green' : combination.tone === 'warning' ? 'gold' : 'default'}>
+          {combination.topSourceLabel}
+        </Tag>
+      </div>
+      <p>{combination.summary}</p>
+      <div className="sl-qa-evidence-combination-grid">
+        <div><span>主证据阅读起点</span><strong>{combination.topReference}</strong></div>
+        <div><span>相邻上下文</span><strong>{combination.contextCount} 条</strong></div>
+        <div><span>文件覆盖</span><strong>{combination.uniqueFiles} 个文件</strong></div>
+        <div><span>向量证据</span><strong>{combination.embeddedCount} 条</strong></div>
+      </div>
+      <div className="sl-qa-evidence-combination-path">
+        {combination.rolePath.map(role => <Tag key={role}>{role}</Tag>)}
+        {combination.fileCoverage.map(file => <Tag color="blue" key={file}>{file}</Tag>)}
+      </div>
+      <div className="sl-qa-evidence-combination-next">
+        <span>下一步追问 / 复核方向</span>
+        <ul>
+          {combination.nextQuestions.map(question => <li key={question}>{question}</li>)}
+        </ul>
+      </div>
+      <div className="sl-qa-evidence-combination-action">{combination.nextAction}</div>
     </div>
   )
 }
@@ -2388,6 +5422,550 @@ function ChunkEvidenceProfileCard({
             <div key={file.filePath}>
               <span>{compactPath(file.filePath)}</span>
               <strong>{file.count} 条 / Score {file.bestScore}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CitationCoverageAuditPanel({ audit }: { audit: CitationCoverageAudit }) {
+  return (
+    <div className={`sl-citation-coverage-audit sl-citation-coverage-audit-${audit.tone}`} aria-label="引用覆盖审计">
+      <div className="sl-citation-coverage-audit-head">
+        <div>
+          <span>引用覆盖审计</span>
+          <strong>{audit.title}</strong>
+        </div>
+        <Tag color={audit.tone === 'ready' ? 'green' : audit.tone === 'warning' ? 'gold' : 'red'}>
+          {qaAuditTagText(audit.tone)}
+        </Tag>
+      </div>
+      <p>{audit.summary}</p>
+      <div className="sl-citation-coverage-audit-metrics">
+        {audit.metrics.map(metric => (
+          <div key={metric.label}>
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+          </div>
+        ))}
+      </div>
+      <div className="sl-citation-coverage-audit-checks">
+        {audit.checks.map(check => (
+          <Tag key={check.label} color={check.ok ? 'green' : 'gold'}>
+            {qaCheckText(check.ok)} · {check.label}
+          </Tag>
+        ))}
+      </div>
+      {audit.roleDistribution ? (
+        <div className="sl-citation-role-distribution" aria-label="证据角色分布">
+          <div className="sl-citation-role-distribution-title">
+            <span>证据角色分布</span>
+            <Tag color={audit.roleDistribution.status === 'PRIMARY_CROSS_FILE' ? 'blue' : audit.roleDistribution.status === 'MIXED_PRIMARY_CONTEXT' ? 'gold' : 'default'}>
+              {evidenceRoleStatusText(audit.roleDistribution.status)}
+            </Tag>
+          </div>
+          <div className="sl-citation-role-distribution-grid">
+            <div>
+              <span>角色</span>
+              {audit.roleDistribution.roles.length ? audit.roleDistribution.roles.map(role => <strong key={role}>{role}</strong>) : <strong>-</strong>}
+            </div>
+            <div>
+              <span>文件</span>
+              {audit.roleDistribution.files.length ? audit.roleDistribution.files.map(file => <strong key={file}>{file}</strong>) : <strong>-</strong>}
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function QaAnswerSourceEvidenceReceiptPanel({ receipt }: { receipt: QaAnswerSourceEvidenceReceipt }) {
+  return (
+    <section
+      className={`sl-qa-source-receipt ${receipt.matched ? 'sl-qa-source-receipt-ready' : 'sl-qa-source-receipt-review'}`}
+      aria-label="QA 回答报告证据凭证"
+    >
+      <div className="sl-qa-source-receipt-head">
+        <div>
+          <span>回答来源凭证</span>
+          <strong>{receipt.title}</strong>
+        </div>
+        <Tag color={receipt.matched ? 'green' : 'gold'}>{receipt.matchType}</Tag>
+      </div>
+      <Space className="sl-qa-source-receipt-tags" wrap size={[6, 6]}>
+        <Tag color="blue">{receipt.scanLabel}</Tag>
+        <Tag>{receipt.source}</Tag>
+        <Tag>{receipt.category}</Tag>
+        <Tag color="cyan">{receipt.lineKindLabel}</Tag>
+        <Tag color={receipt.matched ? 'green' : 'gold'}>{receipt.matchLabel}</Tag>
+      </Space>
+      <div className="sl-qa-source-receipt-ref">
+        <FileTextOutlined />
+        <span>{receipt.fileReference}</span>
+      </div>
+      <QaSourceLocationConfidencePanel confidence={receipt.locationConfidence} />
+    </section>
+  )
+}
+
+function QaSourceLocationConfidencePanel({ confidence }: { confidence: QaSourceLocationConfidence }) {
+  const tagText = confidence.tone === 'ready' ? '已绑定' : confidence.tone === 'warning' ? '需复核' : '已阻断'
+  const tagColor = confidence.tone === 'ready' ? 'green' : confidence.tone === 'warning' ? 'gold' : 'red'
+  return (
+    <div className={`sl-qa-source-location-confidence sl-qa-source-location-confidence-${confidence.tone}`} aria-label="来源定位可信度">
+      <div className="sl-qa-source-location-confidence-head">
+        <div>
+          <span>来源定位可信度</span>
+          <strong>{confidence.title}</strong>
+        </div>
+        <Tag color={tagColor}>{tagText}</Tag>
+      </div>
+      <p>{confidence.summary}</p>
+      <div className="sl-qa-source-location-confidence-metrics">
+        {confidence.metrics.map(metric => (
+          <div key={metric.label}>
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+          </div>
+        ))}
+      </div>
+      <div className="sl-qa-source-location-confidence-checks">
+        {confidence.checks.map(check => (
+          <Tag key={check.label} color={check.ok ? 'green' : 'gold'}>
+            {qaCheckText(check.ok)} · {check.label}
+          </Tag>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function QaSourceFileMatchReleasePanel({ release }: { release: QaSourceFileMatchRelease }) {
+  const tagColor = release.tone === 'ready' ? 'green' : release.tone === 'warning' ? 'gold' : 'red'
+  const tagText = qaAuditTagText(release.tone)
+  return (
+    <section className={`sl-qa-source-match-release sl-qa-source-match-release-${release.tone}`} aria-label="来源文件匹配说明">
+      <div className="sl-qa-source-match-release-head">
+        <div>
+          <span>修复候选放行条件</span>
+          <strong>{release.title}</strong>
+        </div>
+        <Tag color={tagColor}>{tagText}</Tag>
+      </div>
+      <p>{release.summary}</p>
+      <div className="sl-qa-source-match-release-grid">
+        <div>
+          <span>报告目标</span>
+          <strong>{release.targetReference}</strong>
+        </div>
+        <div>
+          <span>已引用切片</span>
+          <strong>{release.citedReference}</strong>
+        </div>
+        <div>
+          <span>匹配结论</span>
+          <strong>{release.matchLabel}</strong>
+        </div>
+        <div>
+          <span>风险提示</span>
+          <strong>{release.riskLabel}</strong>
+        </div>
+      </div>
+      <div className="sl-qa-source-match-release-checks">
+        {release.checks.map(check => (
+          <div key={check.label} className={check.ok ? 'sl-qa-source-match-check-ok' : 'sl-qa-source-match-check-gap'}>
+            {check.ok ? <CheckCircleOutlined /> : <StopOutlined />}
+            <div>
+              <strong>{check.ok ? `已满足：${check.label}` : `未满足：${check.label}`}</strong>
+              <span>{check.detail}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="sl-qa-source-match-release-next">{release.nextAction}</div>
+    </section>
+  )
+}
+
+function QaReadableEvidenceSection({
+  evidence,
+  previousUserQuestion,
+  primaryRepairUrl,
+  primaryCitation,
+  loading,
+  hasSourceScan,
+  onRetryQuestion,
+  onPrepareQuestion,
+  onRefreshEvidence,
+  onCopyCitation,
+  onOpenRepair,
+}: QaReadableEvidenceSectionProps) {
+  const {
+    trustSummary,
+    crossFileSummary,
+    sourceEvidenceReceipt,
+    sourceFileRelease,
+  } = evidence
+  const hasReadableEvidence = Boolean(trustSummary || crossFileSummary || sourceEvidenceReceipt || sourceFileRelease)
+  if (!hasReadableEvidence) return null
+
+  const tone = trustSummary?.tone || crossFileSummary?.tone || sourceFileRelease?.tone || 'warning'
+  const tagColor = tone === 'ready' ? 'green' : tone === 'warning' ? 'gold' : 'red'
+
+  return (
+    <section className={`sl-qa-readable-evidence sl-qa-readable-evidence-${tone}`} aria-label="QA 可信证据">
+      <div className="sl-qa-readable-evidence-head">
+        <div>
+          <span>QA Evidence</span>
+          <strong>QA 可信证据</strong>
+        </div>
+        <Tag color={tagColor}>{qaSummaryTagText(tone)}</Tag>
+      </div>
+      <div className="sl-qa-readable-evidence-flow">
+        {trustSummary && <QaTrustSummaryPanel summary={trustSummary} />}
+        {crossFileSummary && <QaCrossFileCitationSummaryPanel summary={crossFileSummary} />}
+        {sourceEvidenceReceipt && <QaAnswerSourceEvidenceReceiptPanel receipt={sourceEvidenceReceipt} />}
+        {sourceFileRelease && <QaSourceFileMatchReleasePanel release={sourceFileRelease} />}
+        {trustSummary && (
+          <QaNextActionRail
+            summary={trustSummary}
+            previousUserQuestion={previousUserQuestion}
+            primaryRepairUrl={primaryRepairUrl}
+            primaryCitation={primaryCitation}
+            loading={loading}
+            hasSourceScan={hasSourceScan}
+            onRetryQuestion={onRetryQuestion}
+            onPrepareQuestion={onPrepareQuestion}
+            onRefreshEvidence={onRefreshEvidence}
+            onCopyCitation={onCopyCitation}
+            onOpenRepair={onOpenRepair}
+          />
+        )}
+      </div>
+    </section>
+  )
+}
+
+function QaTrustSummaryPanel({ summary }: { summary: QaTrustSummary }) {
+  const tagText = qaSummaryTagText(summary.tone)
+  const tagColor = summary.tone === 'ready' ? 'green' : summary.tone === 'warning' ? 'gold' : 'red'
+  return (
+    <section className={`sl-qa-trust-summary sl-qa-trust-summary-${summary.tone}`} aria-label="QA 可信度摘要">
+      <div className="sl-qa-trust-summary-head">
+        <div>
+          <span>可信度结论</span>
+          <strong>{summary.title}</strong>
+        </div>
+        <Tag color={tagColor}>{tagText}</Tag>
+      </div>
+      <p>{summary.summary}</p>
+      <div className="sl-qa-trust-summary-metrics">
+        {summary.metrics.map(metric => (
+          <div key={metric.label}>
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+          </div>
+        ))}
+      </div>
+      <div className="sl-qa-trust-summary-checks">
+        {summary.checks.map(check => (
+          <Tag key={check.label} color={check.ok ? 'green' : 'gold'}>
+            {qaCheckText(check.ok)} · {check.label}
+          </Tag>
+        ))}
+      </div>
+      <div className="sl-qa-trust-summary-next">
+        <CheckCircleOutlined />
+        <span>{summary.nextAction}</span>
+      </div>
+    </section>
+  )
+}
+
+function QaCrossFileCitationSummaryPanel({ summary }: { summary: QaCrossFileCitationSummary }) {
+  const tagText = qaBindingTagText(summary.tone)
+  const tagColor = summary.tone === 'ready' ? 'green' : summary.tone === 'warning' ? 'gold' : 'red'
+  return (
+    <section className={`sl-qa-cross-file-summary sl-qa-cross-file-summary-${summary.tone}`} aria-label="跨文件引用摘要">
+      <div className="sl-qa-cross-file-summary-head">
+        <div>
+          <span>跨文件引用结论</span>
+          <strong>{summary.title}</strong>
+        </div>
+        <Tag color={tagColor}>{tagText}</Tag>
+      </div>
+      <p>{summary.summary}</p>
+      <div className="sl-qa-cross-file-summary-metrics">
+        {summary.metrics.map(metric => (
+          <div key={metric.label}>
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+          </div>
+        ))}
+      </div>
+      <div className="sl-qa-cross-file-summary-checks">
+        {summary.checks.map(check => (
+          <Tag key={check.label} color={check.ok ? 'green' : 'gold'}>
+            {qaCheckText(check.ok)} · {check.label}
+          </Tag>
+        ))}
+      </div>
+      <div className="sl-qa-cross-file-summary-status">
+        <span>证据角色</span>
+        <strong>{summary.status}</strong>
+      </div>
+      {summary.contextGap.visible && (
+        <div className="sl-qa-cross-file-summary-status sl-qa-cross-file-summary-gap" aria-label="上下文引用缺口">
+          <span>上下文引用缺口</span>
+          <strong>{summary.contextGap.evidence} 条 / {summary.contextGap.files} 文件</strong>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function QaDetailedEvidenceAuditSection({
+  citationAudit,
+  claimAudit,
+  repairEvidenceGate,
+}: QaDetailedEvidenceAuditSectionProps) {
+  const hasAuditEvidence = Boolean(citationAudit || claimAudit || repairEvidenceGate)
+  if (!hasAuditEvidence) return null
+
+  const blocked = repairEvidenceGate?.status === 'BLOCKED' || citationAudit?.tone === 'blocked' || claimAudit?.tone === 'blocked'
+  const warning = repairEvidenceGate?.status === 'REVIEW' || citationAudit?.tone === 'warning' || claimAudit?.tone === 'warning'
+  const tone: 'ready' | 'warning' | 'blocked' = blocked ? 'blocked' : warning ? 'warning' : 'ready'
+  const tagColor = tone === 'ready' ? 'green' : tone === 'warning' ? 'gold' : 'red'
+  const summaryItems = [
+    {
+      key: 'citation',
+      label: '引用覆盖',
+      tone: citationAudit?.tone || 'warning',
+      value: citationAudit?.title || '未提供引用覆盖',
+      detail: citationAudit ? qaAuditTagText(citationAudit.tone) : '缺失',
+    },
+    {
+      key: 'claim',
+      label: '主张质量',
+      tone: claimAudit?.tone || 'warning',
+      value: claimAudit?.title || '未提供主张审计',
+      detail: claimAudit ? qaAuditTagText(claimAudit.tone) : '缺失',
+    },
+    {
+      key: 'gate',
+      label: '修复门禁',
+      tone: repairEvidenceGate?.status === 'READY' ? 'ready' : repairEvidenceGate?.status === 'BLOCKED' ? 'blocked' : 'warning',
+      value: repairEvidenceGate?.label || '未提供门禁',
+      detail: repairEvidenceGate?.status || '-',
+    },
+  ]
+
+  return (
+    <section className={`sl-qa-detailed-audit sl-qa-detailed-audit-${tone}`} aria-label="QA 底层审计证据">
+      <div className="sl-qa-detailed-audit-head">
+        <div>
+          <span>Audit Evidence</span>
+          <strong>QA 底层审计证据</strong>
+        </div>
+        <Tag color={tagColor}>{qaAuditTagText(tone)}</Tag>
+      </div>
+      <div className="sl-qa-detailed-audit-summary" aria-label="QA 底层审计摘要">
+        {summaryItems.map(item => (
+          <div key={item.key} className={`sl-qa-detailed-audit-summary-item sl-qa-detailed-audit-summary-item-${item.tone}`}>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+            <small>{item.detail}</small>
+          </div>
+        ))}
+      </div>
+      <div className="sl-qa-detailed-audit-flow">
+        {citationAudit && <CitationCoverageAuditPanel audit={citationAudit} />}
+        {claimAudit && <ClaimCitationAuditPanel audit={claimAudit} />}
+        {repairEvidenceGate && <QaRepairEvidenceGatePanel gate={repairEvidenceGate} />}
+      </div>
+    </section>
+  )
+}
+
+function QaRepairEvidenceGatePanel({ gate }: { gate: RepairEvidenceGate }) {
+  return (
+    <div className={`sl-qa-repair-gate sl-qa-repair-gate-${gate.status.toLowerCase()}`} aria-label="修复证据门禁">
+      <div className="sl-qa-repair-gate-head">
+        <span>修复证据门禁</span>
+        <Tag color={gate.color}>{gate.label}</Tag>
+      </div>
+      <p>{gate.summary}</p>
+      <Space wrap size={[6, 6]}>
+        {gate.checks.map(check => (
+          <Tag key={check}>{check}</Tag>
+        ))}
+      </Space>
+    </div>
+  )
+}
+
+function QaNextActionRail({
+  summary,
+  previousUserQuestion,
+  primaryRepairUrl,
+  primaryCitation,
+  loading,
+  hasSourceScan,
+  onRetryQuestion,
+  onPrepareQuestion,
+  onRefreshEvidence,
+  onCopyCitation,
+  onOpenRepair,
+}: QaNextActionRailProps) {
+  const normalizedQuestion = previousUserQuestion.trim()
+  const canRetry = Boolean(normalizedQuestion) && !loading
+  const canRefreshEvidence = Boolean(normalizedQuestion) && hasSourceScan && !loading
+  const tagText = qaSummaryTagText(summary.tone)
+  const tagColor = summary.tone === 'ready' ? 'green' : summary.tone === 'warning' ? 'gold' : 'red'
+
+  return (
+    <section className={`sl-qa-next-action-rail sl-qa-next-action-rail-${summary.tone}`} aria-label="QA 下一步动作">
+      <div className="sl-qa-next-action-rail-copy">
+        <span>下一步动作</span>
+        <strong>{summary.nextAction}</strong>
+      </div>
+      <Tag color={tagColor}>{tagText}</Tag>
+      <div className="sl-qa-next-action-rail-actions">
+        {summary.tone === 'ready' ? (
+          <>
+            <ActionButton
+              type="primary"
+              icon={<BranchesOutlined />}
+              disabled={!primaryRepairUrl}
+              data-sl-target-url={primaryRepairUrl}
+              onClick={() => primaryRepairUrl && onOpenRepair(primaryRepairUrl)}
+              label="生成修复候选"
+            />
+            <ActionButton
+              icon={<LinkOutlined />}
+              disabled={!primaryCitation}
+              onClick={() => primaryCitation && onCopyCitation(primaryCitation)}
+              label="复制首条引用"
+            />
+            <ActionButton
+              icon={<SearchOutlined />}
+              disabled={!canRefreshEvidence}
+              onClick={() => normalizedQuestion && onRefreshEvidence(normalizedQuestion)}
+              label="重新检索证据"
+            />
+          </>
+        ) : summary.tone === 'warning' ? (
+          <>
+            <ActionButton
+              type="primary"
+              icon={<SearchOutlined />}
+              disabled={!canRefreshEvidence}
+              onClick={() => normalizedQuestion && onRefreshEvidence(normalizedQuestion)}
+              label="重新检索证据"
+            />
+            <ActionButton
+              icon={<ReloadOutlined />}
+              disabled={!canRetry}
+              onClick={() => normalizedQuestion && onRetryQuestion(normalizedQuestion)}
+              label="重试此问题"
+            />
+            <ActionButton
+              icon={<SendOutlined />}
+              disabled={!normalizedQuestion}
+              onClick={() => normalizedQuestion && onPrepareQuestion(normalizedQuestion)}
+              label="恢复到输入框"
+            />
+          </>
+        ) : (
+          <>
+            <ActionButton
+              type="primary"
+              icon={<ReloadOutlined />}
+              disabled={!canRetry}
+              onClick={() => normalizedQuestion && onRetryQuestion(normalizedQuestion)}
+              label="重试此问题"
+            />
+            <ActionButton
+              icon={<SendOutlined />}
+              disabled={!normalizedQuestion}
+              onClick={() => normalizedQuestion && onPrepareQuestion(normalizedQuestion)}
+              label="恢复到输入框"
+            />
+            <ActionButton
+              icon={<SearchOutlined />}
+              disabled={!canRefreshEvidence}
+              onClick={() => normalizedQuestion && onRefreshEvidence(normalizedQuestion)}
+              label="重新检索证据"
+            />
+          </>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function ClaimCitationAuditPanel({ audit }: { audit: ClaimCitationAudit }) {
+  return (
+    <div className={`sl-claim-citation-audit sl-claim-citation-audit-${audit.tone}`} aria-label="主张引用质量">
+      <div className="sl-claim-citation-audit-head">
+        <div>
+          <span>主张引用质量</span>
+          <strong>{audit.title}</strong>
+        </div>
+        <Tag color={audit.tone === 'ready' ? 'green' : audit.tone === 'warning' ? 'gold' : 'red'}>
+          {qaAuditTagText(audit.tone)}
+        </Tag>
+      </div>
+      <p>{audit.summary}</p>
+      <div className="sl-claim-citation-audit-metrics">
+        {audit.metrics.map(metric => (
+          <div key={metric.label}>
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+          </div>
+        ))}
+      </div>
+      {audit.roleDistribution ? (
+        <div className="sl-citation-role-distribution" aria-label="主张证据角色分布">
+          <div className="sl-citation-role-distribution-title">
+            <span>主张证据角色</span>
+            <Tag color={audit.roleDistribution.status === 'PRIMARY_BOUND' ? 'blue' : audit.roleDistribution.status === 'CONTEXT_ONLY' ? 'gold' : 'default'}>
+              {evidenceRoleStatusText(audit.roleDistribution.status)}
+            </Tag>
+          </div>
+          <div className="sl-citation-role-distribution-grid">
+            <div>
+              <span>主张</span>
+              <strong>主证据 {audit.roleDistribution.primaryBound}/{audit.roleDistribution.requiredClaims}</strong>
+              <strong>上下文 {audit.roleDistribution.contextOnly}</strong>
+              {audit.roleDistribution.unknownOnly > 0 && <strong>未知 {audit.roleDistribution.unknownOnly}</strong>}
+            </div>
+            <div>
+              <span>文件</span>
+              <strong>主证据 {audit.roleDistribution.primaryFiles}</strong>
+              <strong>上下文 {audit.roleDistribution.contextFiles}</strong>
+            </div>
+            <div>
+              <span>角色明细</span>
+              {audit.roleDistribution.roles.length ? audit.roleDistribution.roles.map(role => <strong key={role}>{role}</strong>) : <strong>-</strong>}
+            </div>
+            <div>
+              <span>文件明细</span>
+              {audit.roleDistribution.files.length ? audit.roleDistribution.files.map(file => <strong key={file}>{file}</strong>) : <strong>-</strong>}
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {audit.problemClaims.length > 0 && (
+        <div className="sl-claim-citation-audit-list">
+          {audit.problemClaims.map(claim => (
+            <div key={`${claim.id}-${claim.status}`}>
+              <Tag color={claim.status === 'INVALID' ? 'red' : 'gold'}>{claimProblemStatusText(claim.status)}</Tag>
+              <span>{claim.text}</span>
+              <em>{claim.labels}</em>
             </div>
           ))}
         </div>

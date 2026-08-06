@@ -31,13 +31,15 @@ public class AuditLogController {
             @PathVariable Long projectId,
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "20") int pageSize,
+            @RequestParam(required = false) Long auditLogId,
             @RequestParam(required = false) String resourceType,
+            @RequestParam(required = false) Long resourceId,
             @RequestParam(required = false) String action,
             @RequestParam(required = false) String status,
             @RequestAttribute("userId") Long userId) {
         projectService.verifyOwnership(projectId, userId);
         Page<AuditLog> records = auditLogService.listByProject(projectId, page, pageSize,
-                resourceType, action, status);
+                auditLogId, resourceType, resourceId, action, status);
         return Result.ok(PageResult.of(records.getRecords(), page, pageSize, records.getTotal()));
     }
 }

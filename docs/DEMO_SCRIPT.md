@@ -1,5 +1,7 @@
 # SourceLens 演示脚本
 
+> AIOS v2.3 状态：`LEGACY DEMO / FROZEN`。该十分钟产品演示不证明第一年可信 Agent 闭环；P4 前不得把它作为当前产品成功标准。
+
 ## 演示目标
 
 在 10 分钟内完整展示 SourceLens 从注册到 PR 风险审查的主链路。

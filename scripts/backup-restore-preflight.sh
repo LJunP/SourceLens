@@ -210,6 +210,55 @@ require_any_cmd() {
   record_fail "one of [$*] is required for $purpose"
 }
 
+is_safe_docker_container_name() {
+  local value="$1"
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]
+}
+
+backup_toolchain_executor() {
+  local value
+  value="$(config_value SOURCELENS_BACKUP_TOOLCHAIN_EXECUTOR)"
+  if [[ -z "$value" ]]; then
+    printf 'host\n'
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+check_host_mysql_toolchain() {
+  require_cmd mysqldump "database backup"
+  require_cmd mysql "restore dry run and manual restore verification"
+}
+
+check_docker_mysql_toolchain() {
+  local executor="$1"
+  local container="${executor#docker:}"
+  if [[ -z "$container" ]] || ! is_safe_docker_container_name "$container"; then
+    record_fail "SOURCELENS_BACKUP_TOOLCHAIN_EXECUTOR docker executor must use docker:<safe-container-name>"
+    return
+  fi
+  require_cmd docker "containerized backup toolchain"
+  if ! command -v docker >/dev/null 2>&1; then
+    return
+  fi
+  if docker inspect "$container" >/dev/null 2>&1; then
+    record_ok "backup toolchain Docker container is available: $container"
+  else
+    record_fail "SOURCELENS_BACKUP_TOOLCHAIN_EXECUTOR Docker container is not available: $container"
+    return
+  fi
+  if docker exec "$container" sh -lc 'command -v mysqldump >/dev/null 2>&1'; then
+    record_ok "mysqldump is available inside backup toolchain container"
+  else
+    record_fail "mysqldump is required inside backup toolchain container: $container"
+  fi
+  if docker exec "$container" sh -lc 'command -v mysql >/dev/null 2>&1'; then
+    record_ok "mysql is available inside backup toolchain container"
+  else
+    record_fail "mysql is required inside backup toolchain container: $container"
+  fi
+}
+
 require_config() {
   local key="$1"
   local purpose="$2"
@@ -564,8 +613,21 @@ check_env_file() {
 check_toolchain() {
   echo
   echo "== Backup toolchain =="
-  require_cmd mysql "restore dry run and manual restore verification"
-  require_cmd mysqldump "database backup"
+  local executor
+  executor="$(backup_toolchain_executor)"
+  case "$executor" in
+    host)
+      record_ok "SOURCELENS_BACKUP_TOOLCHAIN_EXECUTOR=host"
+      check_host_mysql_toolchain
+      ;;
+    docker:*)
+      record_ok "SOURCELENS_BACKUP_TOOLCHAIN_EXECUTOR=$executor"
+      check_docker_mysql_toolchain "$executor"
+      ;;
+    *)
+      record_fail "SOURCELENS_BACKUP_TOOLCHAIN_EXECUTOR must be host or docker:<container>, got $executor"
+      ;;
+  esac
   require_cmd tar "workspace and artifact backup"
   require_cmd gzip "compressed backup artifacts"
   require_any_cmd "backup checksum generation" sha256sum shasum

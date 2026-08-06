@@ -2,6 +2,7 @@ package com.sourcelens;
 
 import com.sourcelens.common.config.SecurityStartupValidator;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.DefaultApplicationArguments;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.env.PropertySource;
@@ -9,13 +10,20 @@ import org.springframework.core.io.FileSystemResource;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SecurityStartupValidatorTest {
+
+    @TempDir
+    Path tempDir;
 
     @Test
     void devProfileAllowsDevelopmentDefaults() {
@@ -41,6 +49,30 @@ class SecurityStartupValidatorTest {
         SecurityStartupValidator validator = new SecurityStartupValidator(environment);
 
         assertThrows(IllegalStateException.class, () -> validator.run(new DefaultApplicationArguments()));
+    }
+
+    @Test
+    void prodProfileRejectsDevProfileMix() {
+        MockEnvironment environment = validProdEnvironment();
+        environment.setActiveProfiles("prod", "dev");
+
+        SecurityStartupValidator validator = new SecurityStartupValidator(environment);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> validator.run(new DefaultApplicationArguments()));
+        assertTrue(error.getMessage().contains("development profile enabled: dev"));
+    }
+
+    @Test
+    void prodProfileRejectsTestProfileMix() {
+        MockEnvironment environment = validProdEnvironment();
+        environment.setActiveProfiles("prod", "test");
+
+        SecurityStartupValidator validator = new SecurityStartupValidator(environment);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> validator.run(new DefaultApplicationArguments()));
+        assertTrue(error.getMessage().contains("development profile enabled: test"));
     }
 
     @Test
@@ -151,6 +183,70 @@ class SecurityStartupValidatorTest {
     }
 
     @Test
+    void prodProfileRejectsMissingArtifactWorkspace() {
+        MockEnvironment environment = validProdEnvironment()
+                .withProperty("sourcelens.workspace.base-path", tempDir.resolve("missing-workspace").toString());
+
+        SecurityStartupValidator validator = new SecurityStartupValidator(environment);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> validator.run(new DefaultApplicationArguments()));
+        assertTrue(error.getMessage().contains("existing directory"));
+    }
+
+    @Test
+    void prodProfileRejectsSymlinkArtifactWorkspace() throws Exception {
+        Path realWorkspace = createPrivateDirectory("real-workspace");
+        Path workspaceLink = tempDir.resolve("workspace-link");
+        createSymbolicLinkOrSkip(workspaceLink, realWorkspace);
+        MockEnvironment environment = validProdEnvironment()
+                .withProperty("sourcelens.workspace.base-path", workspaceLink.toString());
+
+        SecurityStartupValidator validator = new SecurityStartupValidator(environment);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> validator.run(new DefaultApplicationArguments()));
+        assertTrue(error.getMessage().contains("must not be a symlink"));
+    }
+
+    @Test
+    void prodProfileRejectsSymlinkArtifactRoot() throws Exception {
+        Path workspace = createPrivateDirectory("workspace-with-root-link");
+        Path outsideArtifactRoot = createPrivateDirectory("outside-artifacts");
+        createSymbolicLinkOrSkip(workspace.resolve("artifacts"), outsideArtifactRoot);
+        MockEnvironment environment = validProdEnvironment()
+                .withProperty("sourcelens.workspace.base-path", workspace.toString());
+
+        SecurityStartupValidator validator = new SecurityStartupValidator(environment);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> validator.run(new DefaultApplicationArguments()));
+        assertTrue(error.getMessage().contains("must not be a symlink"));
+    }
+
+    @Test
+    void prodProfileRejectsGroupWritableArtifactWorkspace() throws Exception {
+        Path workspace = createPrivateDirectory("group-writable-workspace");
+        try {
+            Files.setPosixFilePermissions(workspace, Set.of(
+                    PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.OWNER_EXECUTE,
+                    PosixFilePermission.GROUP_WRITE));
+        } catch (UnsupportedOperationException e) {
+            return;
+        }
+        MockEnvironment environment = validProdEnvironment()
+                .withProperty("sourcelens.workspace.base-path", workspace.toString());
+
+        SecurityStartupValidator validator = new SecurityStartupValidator(environment);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> validator.run(new DefaultApplicationArguments()));
+        assertTrue(error.getMessage().contains("must not be group/world writable"));
+    }
+
+    @Test
     void prodProfileAcceptsActualYamlWhenOnlyExternalSecretsAreProvided() throws IOException {
         MockEnvironment environment = prodYamlEnvironment();
 
@@ -161,6 +257,8 @@ class SecurityStartupValidatorTest {
         assertEquals("256", environment.getProperty("sourcelens.sandbox.docker.pids-limit"));
         assertEquals("true", environment.getProperty("sourcelens.sandbox.docker.read-only-root"));
         assertEquals("/tmp:rw,noexec,nosuid,size=64m", environment.getProperty("sourcelens.sandbox.docker.tmpfs"));
+        assertTrue(Path.of(environment.getProperty("sourcelens.workspace.base-path")).isAbsolute());
+        assertTrue(Files.isDirectory(Path.of(environment.getProperty("sourcelens.workspace.base-path"))));
 
         SecurityStartupValidator validator = new SecurityStartupValidator(environment);
 
@@ -189,7 +287,8 @@ class SecurityStartupValidatorTest {
                 .withProperty("sourcelens.sandbox.docker.cpus", "1.0")
                 .withProperty("sourcelens.sandbox.docker.pids-limit", "256")
                 .withProperty("sourcelens.sandbox.docker.user", "1000:1000")
-                .withProperty("sourcelens.sandbox.docker.tmpfs", "/tmp:rw,noexec,nosuid,size=64m");
+                .withProperty("sourcelens.sandbox.docker.tmpfs", "/tmp:rw,noexec,nosuid,size=64m")
+                .withProperty("sourcelens.workspace.base-path", createPrivateWorkspace().toString());
         environment.setActiveProfiles("prod");
         return environment;
     }
@@ -213,7 +312,8 @@ class SecurityStartupValidatorTest {
                 .withProperty("REDIS_PORT", "6379")
                 .withProperty("JWT_SECRET", "prod-jwt-secret-0123456789abcdef0123456789abcdef")
                 .withProperty("ENCRYPT_PASSWORD", "prod-encrypt-password-0123456789")
-                .withProperty("ENCRYPT_SALT", "prod-salt-012345");
+                .withProperty("ENCRYPT_SALT", "prod-salt-012345")
+                .withProperty("SOURCELENS_WORKSPACE", createPrivateWorkspace().toString());
         environment.setActiveProfiles("prod");
         addYamlAfterMockProperties(environment, "application.yml");
         addYamlAfterMockProperties(environment, "application-prod.yml");
@@ -225,6 +325,35 @@ class SecurityStartupValidatorTest {
         FileSystemResource resource = new FileSystemResource(Path.of("src/main/resources", resourceName));
         for (PropertySource<?> propertySource : loader.load(resourceName, resource)) {
             environment.getPropertySources().addAfter("mockProperties", propertySource);
+        }
+    }
+
+    private Path createPrivateWorkspace() {
+        return createPrivateDirectory("workspace");
+    }
+
+    private Path createPrivateDirectory(String prefix) {
+        try {
+            Path directory = Files.createTempDirectory(tempDir, prefix);
+            try {
+                Files.setPosixFilePermissions(directory, Set.of(
+                        PosixFilePermission.OWNER_READ,
+                        PosixFilePermission.OWNER_WRITE,
+                        PosixFilePermission.OWNER_EXECUTE));
+            } catch (UnsupportedOperationException ignored) {
+                // The validator will fail closed on platforms where POSIX permissions cannot be checked.
+            }
+            return directory;
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to create test workspace", e);
+        }
+    }
+
+    private void createSymbolicLinkOrSkip(Path link, Path target) throws IOException {
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException | SecurityException e) {
+            return;
         }
     }
 }

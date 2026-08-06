@@ -112,6 +112,27 @@ CREATE TABLE IF NOT EXISTS scan_artifacts (
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS code_chunks (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    scan_task_id    BIGINT       NOT NULL,
+    file_path       VARCHAR(512) NOT NULL,
+    workspace_root  VARCHAR(255) DEFAULT NULL,
+    module_root     VARCHAR(255) DEFAULT NULL,
+    content         CLOB         NOT NULL,
+    start_line      INT          NOT NULL,
+    end_line        INT          NOT NULL,
+    content_hash    VARCHAR(64)  DEFAULT NULL,
+    embedding       CLOB         DEFAULT NULL,
+    embedding_model VARCHAR(120) DEFAULT NULL,
+    created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_chunks_scan_module_root
+    ON code_chunks (scan_task_id, module_root, file_path);
+
+CREATE INDEX IF NOT EXISTS idx_code_chunks_scan_workspace_root
+    ON code_chunks (scan_task_id, workspace_root, file_path);
+
 CREATE TABLE IF NOT EXISTS agent_tool_calls (
     id               BIGINT AUTO_INCREMENT PRIMARY KEY,
     conversation_id  BIGINT       DEFAULT NULL,

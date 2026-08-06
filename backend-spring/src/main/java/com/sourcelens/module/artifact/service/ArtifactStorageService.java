@@ -13,13 +13,17 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
+import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -78,8 +82,8 @@ public class ArtifactStorageService {
             throw BizException.badRequest("artifact 写入路径非法");
         }
         try {
-            Files.createDirectories(target.getParent());
-            Files.write(target, payload);
+            createArtifactDirectoriesNoFollow(root, target.getParent());
+            writeBytesNoFollow(target, payload);
         } catch (IOException e) {
             throw BizException.internal("artifact 写入失败: " + e.getMessage());
         }
@@ -132,17 +136,15 @@ public class ArtifactStorageService {
         try {
             target = validateReadablePath(record);
         } catch (BizException e) {
-            byte[] legacyBytes = legacyScanArtifactBytes(record);
-            if (legacyBytes != null) {
-                return legacyBytes;
+            if (shouldAttemptLegacyScanArtifactFallback(record)) {
+                byte[] legacyBytes = legacyScanArtifactBytes(record);
+                if (legacyBytes != null) {
+                    return legacyBytes;
+                }
             }
             throw e;
         }
-        try {
-            return Files.readAllBytes(target);
-        } catch (IOException e) {
-            throw BizException.internal("artifact 读取失败: " + e.getMessage());
-        }
+        return readAllBytesNoFollow(target);
     }
 
     public PreviewContent readPreview(ArtifactRecord record) {
@@ -153,35 +155,15 @@ public class ArtifactStorageService {
         try {
             target = validateReadablePath(record);
         } catch (BizException e) {
-            byte[] legacyBytes = legacyScanArtifactBytes(record);
-            if (legacyBytes != null) {
-                return previewFromBytes(legacyBytes);
+            if (shouldAttemptLegacyScanArtifactFallback(record)) {
+                byte[] legacyBytes = legacyScanArtifactBytes(record);
+                if (legacyBytes != null) {
+                    return previewFromBytes(legacyBytes);
+                }
             }
             throw e;
         }
-        try {
-            long size = Files.size(target);
-            int limit = (int) Math.min(size, MAX_PREVIEW_BYTES);
-            byte[] bytes = new byte[limit];
-            try (var input = Files.newInputStream(target, StandardOpenOption.READ)) {
-                int offset = 0;
-                while (offset < limit) {
-                    int read = input.read(bytes, offset, limit - offset);
-                    if (read < 0) {
-                        break;
-                    }
-                    offset += read;
-                }
-                if (offset < limit) {
-                    byte[] exact = new byte[offset];
-                    System.arraycopy(bytes, 0, exact, 0, offset);
-                    bytes = exact;
-                }
-            }
-            return new PreviewContent(new String(bytes, StandardCharsets.UTF_8), size > MAX_PREVIEW_BYTES, bytes.length);
-        } catch (IOException e) {
-            throw BizException.internal("artifact 预览读取失败: " + e.getMessage());
-        }
+        return readPreviewNoFollow(target);
     }
 
     private PreviewContent previewFromBytes(byte[] payload) {
@@ -190,6 +172,35 @@ public class ArtifactStorageService {
         byte[] preview = new byte[limit];
         System.arraycopy(bytes, 0, preview, 0, limit);
         return new PreviewContent(new String(preview, StandardCharsets.UTF_8), bytes.length > MAX_PREVIEW_BYTES, preview.length);
+    }
+
+    private byte[] readAllBytesNoFollow(Path target) {
+        try (var input = Files.newInputStream(target, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            return input.readAllBytes();
+        } catch (IOException e) {
+            throw BizException.internal("artifact 读取失败: " + e.getMessage());
+        }
+    }
+
+    private PreviewContent readPreviewNoFollow(Path target) {
+        try (var channel = Files.newByteChannel(target, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            long size = channel.size();
+            int limit = (int) Math.min(size, MAX_PREVIEW_BYTES);
+            byte[] bytes = new byte[limit];
+            ByteBuffer buffer = ByteBuffer.wrap(bytes);
+            while (buffer.hasRemaining()) {
+                int read = channel.read(buffer);
+                if (read < 0) {
+                    break;
+                }
+            }
+            if (buffer.position() < limit) {
+                bytes = Arrays.copyOf(bytes, buffer.position());
+            }
+            return new PreviewContent(new String(bytes, StandardCharsets.UTF_8), size > MAX_PREVIEW_BYTES, bytes.length);
+        } catch (IOException e) {
+            throw BizException.internal("artifact 预览读取失败: " + e.getMessage());
+        }
     }
 
     public Map<String, Object> readJsonMapArtifactsByOwner(String ownerType, Long ownerId) {
@@ -276,14 +287,70 @@ public class ArtifactStorageService {
         return Path.of(workspaceBasePath, "artifacts").toAbsolutePath().normalize();
     }
 
+    private void createArtifactDirectoriesNoFollow(Path root, Path parent) throws IOException {
+        if (parent == null || !parent.startsWith(root)) {
+            throw BizException.badRequest("artifact 写入路径非法");
+        }
+        Path workspaceBase = root.getParent();
+        if (workspaceBase == null) {
+            throw BizException.badRequest("artifact 写入路径非法");
+        }
+        Files.createDirectories(workspaceBase);
+        ensureDirectoryNoFollow(workspaceBase, "写入");
+        ensureDirectoryNoFollow(root, "写入");
+        Path cursor = root;
+        Path relativeParent = root.relativize(parent);
+        for (Path part : relativeParent) {
+            cursor = cursor.resolve(part);
+            ensureDirectoryNoFollow(cursor, "写入");
+        }
+    }
+
+    private void ensureDirectoryNoFollow(Path directory, String action) throws IOException {
+        if (Files.exists(directory, LinkOption.NOFOLLOW_LINKS)) {
+            if (Files.isSymbolicLink(directory) || !Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+                throw BizException.badRequest("artifact " + action + "路径非法");
+            }
+            return;
+        }
+        try {
+            Files.createDirectory(directory);
+        } catch (FileAlreadyExistsException ignored) {
+            if (Files.isSymbolicLink(directory) || !Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+                throw BizException.badRequest("artifact " + action + "路径非法");
+            }
+        }
+    }
+
+    private void writeBytesNoFollow(Path target, byte[] payload) throws IOException {
+        if (Files.isSymbolicLink(target)) {
+            throw BizException.badRequest("artifact 写入路径非法");
+        }
+        try (var channel = Files.newByteChannel(target,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE,
+                LinkOption.NOFOLLOW_LINKS)) {
+            ByteBuffer buffer = ByteBuffer.wrap(payload);
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
+        }
+    }
+
     private Path validateReadablePath(ArtifactRecord record) {
         if (record == null || record.getStoragePath() == null || record.getStoragePath().isBlank()) {
             throw BizException.badRequest("artifact 存储路径为空");
         }
         Path target = validatePathInsideRoot(record.getStoragePath(), "读取");
-        if (!Files.isRegularFile(target)) {
+        if (Files.isSymbolicLink(target)) {
+            validateRealPathInsideRoot(target, "读取");
+            throw BizException.badRequest("artifact 读取路径非法");
+        }
+        if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
             throw BizException.notFound("artifact file");
         }
+        validateRealPathInsideRoot(target, "读取");
         return target;
     }
 
@@ -294,6 +361,20 @@ public class ArtifactStorageService {
             throw BizException.badRequest("artifact " + action + "路径非法");
         }
         return target;
+    }
+
+    private void validateRealPathInsideRoot(Path target, String action) {
+        try {
+            Path root = artifactRoot().toRealPath();
+            Path realTarget = target.toRealPath();
+            if (!realTarget.startsWith(root)) {
+                throw BizException.badRequest("artifact " + action + "路径非法");
+            }
+        } catch (BizException e) {
+            throw e;
+        } catch (IOException e) {
+            throw BizException.internal("artifact " + action + "路径解析失败: " + e.getMessage());
+        }
     }
 
     private boolean isTextPreviewSupported(ArtifactRecord record) {
@@ -313,6 +394,33 @@ public class ArtifactStorageService {
     private boolean isJsonContent(ArtifactRecord record) {
         String contentType = record.getContentType();
         return contentType != null && contentType.toLowerCase(Locale.ROOT).contains("json");
+    }
+
+    private boolean shouldAttemptLegacyScanArtifactFallback(ArtifactRecord record) {
+        if (record == null || record.getStoragePath() == null || record.getStoragePath().isBlank()) {
+            return false;
+        }
+        Path root = artifactRoot();
+        Path target = Path.of(record.getStoragePath()).toAbsolutePath().normalize();
+        if (target.startsWith(root)) {
+            return false;
+        }
+        return resemblesLegacyScanArtifactPath(target, record);
+    }
+
+    private boolean resemblesLegacyScanArtifactPath(Path target, ArtifactRecord record) {
+        if (record.getOwnerId() == null) {
+            return false;
+        }
+        int count = target.getNameCount();
+        for (int index = 0; index <= count - 3; index++) {
+            if ("artifacts".equals(target.getName(index).toString())
+                    && "scan_task".equals(target.getName(index + 1).toString())
+                    && record.getOwnerId().toString().equals(target.getName(index + 2).toString())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private byte[] legacyScanArtifactBytes(ArtifactRecord record) {

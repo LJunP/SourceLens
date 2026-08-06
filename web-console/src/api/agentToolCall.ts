@@ -22,6 +22,7 @@ export interface AgentToolCallQuery {
   page?: number
   pageSize?: number
   toolName?: string
+  conversationId?: number
   scanTaskId?: number
   success?: boolean
 }

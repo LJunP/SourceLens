@@ -33,8 +33,9 @@ export const artifactApi = {
     client.get<Result<ArtifactRecord>>(`/projects/${projectId}/artifacts/${artifactId}`),
   preview: (projectId: number, artifactId: number) =>
     client.get<Result<ArtifactPreviewResponse>>(`/projects/${projectId}/artifacts/${artifactId}/preview`),
-  download: (projectId: number, artifactId: number) =>
+  download: (projectId: number, artifactId: number, rawDownloadAcknowledged = false) =>
     client.get<Blob>(`/projects/${projectId}/artifacts/${artifactId}/download`, {
+      params: { rawDownloadAcknowledged },
       responseType: 'blob',
     }),
 }

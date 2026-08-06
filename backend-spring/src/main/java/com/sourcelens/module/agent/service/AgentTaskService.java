@@ -1,6 +1,7 @@
 package com.sourcelens.module.agent.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -86,15 +87,17 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
     /**
      * 创建 Agent 任务。
      * - 如果未指定 scanTaskId，自动查找该项目最近一次已完成的扫描
-     * - 自动创建一个对话，预置任务类型的 system prompt
+     * - 如果指定 conversationId，绑定到已有对话；否则自动创建一个对话
      */
     @Transactional
     public AgentTask create(CreateAgentTaskRequest req, Long userId) {
         Long scanTaskId = resolveCreateScanTaskId(req.getProjectId(), req.getScanTaskId());
+        Conversation existingConversation = resolveCreateConversation(req, userId);
 
         AgentTask task = AgentTask.builder()
                 .projectId(req.getProjectId())
                 .scanTaskId(scanTaskId)
+                .conversationId(existingConversation != null ? existingConversation.getId() : null)
                 .taskType(req.getTaskType())
                 .title(req.getTitle())
                 .description(req.getDescription())
@@ -105,26 +108,65 @@ public class AgentTaskService extends ServiceImpl<AgentTaskMapper, AgentTask> {
                 .build();
         save(task);
 
-        // 自动创建对话，预置任务类型 system prompt
-        String systemPrompt = buildTaskSystemPrompt(req.getTaskType(), req.getTitle());
-        Conversation conv = Conversation.builder()
-                .projectId(req.getProjectId())
-                .agentTaskId(task.getId())
-                .title(req.getTitle())
-                .systemPrompt(systemPrompt)
-                .status("ACTIVE")
-                .createdBy(userId)
-                .build();
-        conversationMapper.insert(conv);
+        Conversation conversation;
+        if (existingConversation != null) {
+            conversation = existingConversation;
+            Conversation update = new Conversation();
+            update.setId(existingConversation.getId());
+            update.setAgentTaskId(task.getId());
+            int updated = conversationMapper.update(update, new LambdaUpdateWrapper<Conversation>()
+                    .eq(Conversation::getId, existingConversation.getId())
+                    .isNull(Conversation::getAgentTaskId));
+            if (updated == 0) {
+                throw BizException.conflict("指定对话已绑定 Agent 任务");
+            }
+            conversation.setAgentTaskId(task.getId());
+        } else {
+            // 自动创建对话，预置任务类型 system prompt
+            String systemPrompt = buildTaskSystemPrompt(req.getTaskType(), req.getTitle());
+            conversation = Conversation.builder()
+                    .projectId(req.getProjectId())
+                    .agentTaskId(task.getId())
+                    .title(req.getTitle())
+                    .systemPrompt(systemPrompt)
+                    .status("ACTIVE")
+                    .createdBy(userId)
+                    .build();
+            conversationMapper.insert(conversation);
 
-        // 关联回任务
-        task.setConversationId(conv.getId());
-        updateById(task);
+            // 关联回任务
+            task.setConversationId(conversation.getId());
+            updateById(task);
+        }
+
         executionTaskService.create(task.getProjectId(), null, "AGENT",
                 "AGENT_TASK", task.getId(), userId);
 
-        log.info("创建 Agent 任务: id={}, type={}, title={}, conversationId={}", task.getId(), task.getTaskType(), task.getTitle(), conv.getId());
+        log.info("创建 Agent 任务: id={}, type={}, title={}, conversationId={}", task.getId(), task.getTaskType(), task.getTitle(), conversation.getId());
         return task;
+    }
+
+    private Conversation resolveCreateConversation(CreateAgentTaskRequest req, Long userId) {
+        if (req.getConversationId() == null) {
+            return null;
+        }
+        Conversation conversation = conversationMapper.selectById(req.getConversationId());
+        if (conversation == null) {
+            throw BizException.badRequest("指定对话不存在");
+        }
+        if (!req.getProjectId().equals(conversation.getProjectId())) {
+            throw BizException.badRequest("指定对话不属于当前项目");
+        }
+        if (!userId.equals(conversation.getCreatedBy())) {
+            throw BizException.badRequest("指定对话不属于当前用户");
+        }
+        if (!"ACTIVE".equals(conversation.getStatus())) {
+            throw BizException.badRequest("指定对话不是可绑定状态");
+        }
+        if (conversation.getAgentTaskId() != null) {
+            throw BizException.conflict("指定对话已绑定 Agent 任务");
+        }
+        return conversation;
     }
 
     /**

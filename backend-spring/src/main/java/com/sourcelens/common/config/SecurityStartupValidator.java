@@ -8,8 +8,13 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Fails fast when production starts with development or missing security settings.
@@ -32,7 +37,11 @@ public class SecurityStartupValidator implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
-        if (!isProdProfile()) {
+        boolean prodProfileActive = isProfileActive("prod");
+        if (prodProfileActive) {
+            rejectProdWithDevelopmentProfiles();
+        }
+        if (!prodProfileActive) {
             return;
         }
 
@@ -46,10 +55,19 @@ public class SecurityStartupValidator implements ApplicationRunner {
         requireProdAgentBoundary();
         requireProdSandboxBoundary();
         requireProdGithubAppBoundary();
+        requireProdArtifactWorkspaceBoundary();
     }
 
-    private boolean isProdProfile() {
-        return Arrays.asList(environment.getActiveProfiles()).contains("prod");
+    private boolean isProfileActive(String expectedProfile) {
+        return Arrays.asList(environment.getActiveProfiles()).contains(expectedProfile);
+    }
+
+    private void rejectProdWithDevelopmentProfiles() {
+        for (String profile : environment.getActiveProfiles()) {
+            if ("dev".equals(profile) || "test".equals(profile)) {
+                throw new IllegalStateException("Production must not run with development profile enabled: " + profile);
+            }
+        }
     }
 
     private void requirePresent(String propertyName) {
@@ -105,6 +123,41 @@ public class SecurityStartupValidator implements ApplicationRunner {
     private void requireProdGithubAppBoundary() {
         if (getBoolean("sourcelens.autorepair.submit-pr-enabled")) {
             requireGithubAppConfigured("sourcelens.autorepair.submit-pr-enabled");
+        }
+    }
+
+    private void requireProdArtifactWorkspaceBoundary() {
+        String basePath = environment.getProperty("sourcelens.workspace.base-path");
+        if (!StringUtils.hasText(basePath)) {
+            throw new IllegalStateException("Production artifact workspace path is missing: sourcelens.workspace.base-path");
+        }
+        Path workspace = Path.of(basePath).toAbsolutePath().normalize();
+        requirePrivateDirectory(workspace, "sourcelens.workspace.base-path");
+
+        Path artifactRoot = workspace.resolve("artifacts").normalize();
+        if (Files.exists(artifactRoot, LinkOption.NOFOLLOW_LINKS)) {
+            requirePrivateDirectory(artifactRoot, "sourcelens.workspace.base-path/artifacts");
+        }
+    }
+
+    private void requirePrivateDirectory(Path directory, String propertyName) {
+        if (Files.isSymbolicLink(directory)) {
+            throw new IllegalStateException("Production artifact workspace must not be a symlink: " + propertyName);
+        }
+        if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalStateException("Production artifact workspace must be an existing directory: " + propertyName);
+        }
+        Set<PosixFilePermission> permissions;
+        try {
+            permissions = Files.getPosixFilePermissions(directory, LinkOption.NOFOLLOW_LINKS);
+        } catch (UnsupportedOperationException e) {
+            throw new IllegalStateException("Production artifact workspace permissions are not checkable: " + propertyName, e);
+        } catch (Exception e) {
+            throw new IllegalStateException("Production artifact workspace permissions cannot be read: " + propertyName, e);
+        }
+        if (permissions.contains(PosixFilePermission.GROUP_WRITE)
+                || permissions.contains(PosixFilePermission.OTHERS_WRITE)) {
+            throw new IllegalStateException("Production artifact workspace must not be group/world writable: " + propertyName);
         }
     }
 
