@@ -20,6 +20,9 @@ class GitServiceTest {
 
     private final GitService gitService = new GitService();
 
+    /**
+     * 哪些 git 报错算网络抖动可以重试，哪些（比如“仓库不存在”）不许重试
+     */
     @Test
     void isRetryableGitTransportError_shouldRecognizeTransientCloneFailures() {
         assertTrue(gitService.isRetryableGitTransportError("Premature EOF"));
@@ -32,6 +35,9 @@ class GitServiceTest {
         assertFalse(gitService.isRetryableGitTransportError("Authentication failed"));
     }
 
+    /**
+     * 克隆命令长什么样：强制 HTTP/1.1、浅克隆、清空凭据助手、askpass 路径
+     */
     @Test
     void buildNativeGitCloneCommand_shouldUseHttp11ShallowSingleBranchClone() {
         File targetDir = new File("/tmp/sourcelens/repo");
@@ -41,6 +47,7 @@ class GitServiceTest {
                 "main",
                 targetDir);
 
+        String expectedAskPass = gitService.askPassExecutable();
         assertEquals(List.of(
                 "git",
                 "-c",
@@ -48,7 +55,7 @@ class GitServiceTest {
                 "-c",
                 "credential.helper=",
                 "-c",
-                "core.askPass=/bin/false",
+                "core.askPass=" + expectedAskPass,
                 "clone",
                 "--depth",
                 "1",
@@ -60,6 +67,9 @@ class GitServiceTest {
         ), command);
     }
 
+    /**
+     * 环境隔离：禁止交互输密码、隔离 HOME、禁读系统级 git 配置
+     */
     @Test
     void applyNativeGitEnvironment_shouldDisableAmbientCredentialsAndGlobalConfig() {
         Map<String, String> environment = new HashMap<>();
@@ -68,8 +78,9 @@ class GitServiceTest {
         gitService.applyNativeGitEnvironment(environment, isolatedHome);
 
         assertEquals("0", environment.get("GIT_TERMINAL_PROMPT"));
-        assertEquals("/bin/false", environment.get("GIT_ASKPASS"));
-        assertEquals("/bin/false", environment.get("SSH_ASKPASS"));
+        String expectedAskPass = gitService.askPassExecutable();
+        assertEquals(expectedAskPass, environment.get("GIT_ASKPASS"));
+        assertEquals(expectedAskPass, environment.get("SSH_ASKPASS"));
         assertEquals("Never", environment.get("GCM_INTERACTIVE"));
         assertEquals("1", environment.get("GIT_CONFIG_NOSYSTEM"));
         assertEquals(isolatedHome.resolve(".gitconfig").toString(), environment.get("GIT_CONFIG_GLOBAL"));
@@ -77,6 +88,9 @@ class GitServiceTest {
         assertEquals(isolatedHome.resolve(".config").toString(), environment.get("XDG_CONFIG_HOME"));
     }
 
+    /**
+     * git 不存在时，要报一个“人能看懂”的错误
+     */
     @Test
     void runNativeGitClone_shouldReportActionableErrorWhenGitCliIsMissing() {
         GitService missingGitService = new GitService() {
@@ -97,6 +111,9 @@ class GitServiceTest {
         assertTrue(ex.getMessage().contains("install git in the backend runtime"));
     }
 
+    /**
+     * git 的错误信息出进程前先脱敏——防止把访问令牌带进日志
+     */
     @Test
     void sanitizeGitError_shouldRedactCredentialsBeforePropagation() {
         String sanitized = gitService.sanitizeGitError(
@@ -108,6 +125,9 @@ class GitServiceTest {
         assertTrue(sanitized.contains("****"));
     }
 
+    /**
+     * 配置关闭时，拒绝本地 file:// 仓库（防越权读本地文件）
+     */
     @Test
     void ensureLocal_shouldRejectLocalFileRepositoryWhenConfigIsClosed() {
         BizException ex = assertThrows(BizException.class, () -> gitService.ensureLocal(
@@ -119,6 +139,9 @@ class GitServiceTest {
         assertEquals("BAD_REQUEST", ex.getCode());
     }
 
+    /**
+     * 只有匿名公开仓库才走系统 git，别的路径还是走 JGit
+     */
     @Test
     void shouldUseNativeGitForAnonymousGitHub_shouldOnlyApplyToPublicGitHubClone() {
         assertTrue(gitService.shouldUseNativeGitForAnonymousGitHub(

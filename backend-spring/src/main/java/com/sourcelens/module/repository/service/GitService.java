@@ -47,11 +47,12 @@ public class GitService {
 
     /**
      * 确保仓库本地可用：存在则 pull，否则 clone
+     *
      * @return 本地仓库目录绝对路径
      */
     public String ensureLocal(Long projectId, String repoUrl, String branch, String token) {
-        RepositoryUrlPolicy.ParsedRepository parsed =
-                RepositoryUrlPolicy.parseAndValidate(repoUrl, allowLocalFileRepositories);
+        RepositoryUrlPolicy.ParsedRepository parsed = RepositoryUrlPolicy.parseAndValidate(repoUrl,
+                allowLocalFileRepositories);
         String normalizedRepoUrl = parsed.normalizedUrl();
         String normalizedBranch = RepositoryUrlPolicy.validateBranch(branch);
         if ("LOCAL".equals(parsed.provider())) {
@@ -169,7 +170,8 @@ public class GitService {
             String msg = sanitizeGitError(e.getMessage());
             // 有 token 时的认证失败 → 提示 token 无效
             if (TokenEncryptor.isValidToken(token)) {
-                throw BizException.internal("Git clone 认证失败: GitHub PAT Token 无效或无权限, 请检查 Token 是否正确且拥有 repo 权限。错误: " + msg);
+                throw BizException
+                        .internal("Git clone 认证失败: GitHub PAT Token 无效或无权限, 请检查 Token 是否正确且拥有 repo 权限。错误: " + msg);
             }
             if (shouldFallbackToNativeGit(url, token, msg)) {
                 log.warn("JGit clone 传输失败, 尝试系统 git fallback: {}", msg);
@@ -238,7 +240,7 @@ public class GitService {
         command.add("-c");
         command.add("credential.helper=");
         command.add("-c");
-        command.add("core.askPass=/bin/false");
+        command.add("core.askPass=" + askPassExecutable());
         command.add("clone");
         command.add("--depth");
         command.add("1");
@@ -252,6 +254,22 @@ public class GitService {
 
     String nativeGitExecutable() {
         return "git";
+    }
+
+    /**
+     * 凭据隔离用的 no-op askpass 路径按平台解析：Linux 容器运行时为 /bin/false，
+     * macOS 宿主机上该路径不存在（实际为 /usr/bin/false），硬编码会导致匿名
+     * 公开仓库克隆在凭据质询时以 "cannot run /bin/false" 失败。运行时探测
+     */
+    static final String[] ASK_PASS_CANDIDATES = { "/bin/false", "/usr/bin/false" };
+
+    String askPassExecutable() {
+        for (String candidate : ASK_PASS_CANDIDATES) {
+            if (new File(candidate).canExecute()) {
+                return candidate;
+            }
+        }
+        return "/bin/false";
     }
 
     void runNativeGitClone(String url, String branch, File targetDir, Duration timeout) throws Exception {
@@ -289,8 +307,8 @@ public class GitService {
 
     void applyNativeGitEnvironment(java.util.Map<String, String> environment, Path isolatedHome) {
         environment.put("GIT_TERMINAL_PROMPT", "0");
-        environment.put("GIT_ASKPASS", "/bin/false");
-        environment.put("SSH_ASKPASS", "/bin/false");
+        environment.put("GIT_ASKPASS", askPassExecutable());
+        environment.put("SSH_ASKPASS", askPassExecutable());
         environment.put("GCM_INTERACTIVE", "Never");
         environment.put("GIT_CONFIG_NOSYSTEM", "1");
         environment.put("GIT_CONFIG_GLOBAL", isolatedHome.resolve(".gitconfig").toString());
@@ -386,7 +404,8 @@ public class GitService {
                 if (parent != null) {
                     Files.createDirectories(parent);
                 }
-                Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+                Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.COPY_ATTRIBUTES);
             }
         } catch (Exception e) {
             throw new RuntimeException("复制文件失败: " + sourcePath + ", " + e.getMessage(), e);
